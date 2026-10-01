@@ -1,7 +1,8 @@
 // Random lines across the board, and the reference answer the CA must match.
 // Neither is part of the automaton: they set it up and check it.
 
-import { Board, borderRing, coordsOf, hexDistance, isBorder } from './hex.js';
+import { Event } from './ca.js';
+import { Board, borderRing, coordsOf, hexDistance, indexOf, isBorder } from './hex.js';
 
 /** mulberry32: small, seedable, good enough for test fields. */
 export function rng(seed: number): () => number {
@@ -22,27 +23,8 @@ export interface LineOptions {
   wiggle?: number;
 }
 
-/**
- * A random line from one border cell to another, through the interior.
- *
- * Guarantees what the automaton assumes of a line:
- *   - it touches the border at its two ends (the feet) and nowhere else;
- *   - it is an *induced* path: no two cells of it are neighbours unless they
- *     are consecutive, so it never pinches off a pocket;
- *   - both arcs of the ring between the feet have at least one cell.
- *
- * Built as a cheapest path under random, smoothly varying cell costs: a
- * cheapest path with positive node costs is always induced (any shortcut
- * would be cheaper). Returns null if the blocked cells leave no way across.
- */
-export function randomLine(board: Board, rand: () => number, opts: LineOptions = {}): number[] | null {
-  const blocked = opts.blocked ?? new Set<number>();
-  const wiggle = opts.wiggle ?? 1;
-  const ring = borderRing(board);
-  const n = ring.length;
-  if (n < 4) return null;
-
-  // Smooth random cost field: a few random bumps.
+/** Smooth random cell costs (a few random bumps): cheapest paths through it wander. */
+function costField(board: Board, rand: () => number, wiggle: number): Float64Array {
   const cost = new Float64Array(board.size);
   const R = board.radius;
   const bumps = Array.from({ length: 6 + Math.floor(rand() * 6) }, () => ({
@@ -60,10 +42,29 @@ export function randomLine(board: Board, rand: () => number, opts: LineOptions =
     }
     cost[i] = 1 + wiggle * 12 * Math.max(0, v + 0.3) ** 2 + rand() * 0.5;
   }
+  return cost;
+}
 
+/**
+ * A random bridge: a line from one border cell to another, through the
+ * interior, in drawing order.
+ *
+ * It touches the border at its two ends and nowhere else, and it is an
+ * *induced* path (no two cells are neighbours unless consecutive), so drawn
+ * cell by cell it never closes a circuit on the way. Built as a cheapest path
+ * under random, smoothly varying costs: with positive costs a cheapest path is
+ * always induced (any shortcut would be cheaper). Returns null if the blocked
+ * cells leave no way across.
+ */
+export function randomLine(board: Board, rand: () => number, opts: LineOptions = {}): number[] | null {
+  const blocked = opts.blocked ?? new Set<number>();
+  const ring = borderRing(board);
+  const n = ring.length;
+  if (n < 4) return null;
+  const cost = costField(board, rand, opts.wiggle ?? 1);
   for (let attempt = 0; attempt < 40; attempt++) {
     const a = Math.floor(rand() * n);
-    // The other foot at least a sixth of the way round either way.
+    // The other end at least a sixth of the way round either way.
     const gap = Math.floor(n / 6) + Math.floor(rand() * (n - 2 * Math.floor(n / 6)));
     const b = (a + Math.max(2, Math.min(n - 2, gap))) % n;
     const A = ring[a];
@@ -73,6 +74,91 @@ export function randomLine(board: Board, rand: () => number, opts: LineOptions =
     if (path && path.length >= 3) return path;
   }
   return null;
+}
+
+/**
+ * A random circuit: a loop in drawing order, closing when its last cell
+ * lands next to its first. It goes round a random centre: the first cell sits
+ * on a ray cut from the centre to the edge, and the rest is a cheapest path
+ * from one side of the cut round to the other, so it can't touch itself
+ * early. Clockwise or counter-clockwise at random. Stays off the border.
+ */
+export function randomLoop(board: Board, rand: () => number, opts: LineOptions = {}): number[] | null {
+  const blocked = opts.blocked ?? new Set<number>();
+  const R = board.radius;
+  if (R < 4) return null;
+  const cost = costField(board, rand, opts.wiggle ?? 1);
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const span = Math.max(1, Math.floor(R * 0.6));
+    const qc = Math.floor((rand() * 2 - 1) * span);
+    const rc = Math.floor((rand() * 2 - 1) * span);
+    if (hexDistance(qc, rc) > R - 3) continue;
+    const core = Math.floor(rand() * Math.min(3, R / 4));
+    // The cut: the row through the centre, from the centre east to the edge.
+    const cut = new Set<number>();
+    for (let q = qc; hexDistance(q, rc) <= R; q++) cut.add(indexOf(board, q, rc));
+    const start = indexOf(board, qc + core + 1, rc); // on the cut, just outside the core
+    const [sq, sr] = coordsOf(board, start);
+    if (hexDistance(sq, sr) > R - 2) continue;
+    const up = [indexOf(board, sq, sr - 1), indexOf(board, sq + 1, sr - 1)];
+    const down = [indexOf(board, sq - 1, sr + 1), indexOf(board, sq, sr + 1)];
+    const a = up[Math.floor(rand() * 2)];
+    const b = down[Math.floor(rand() * 2)];
+    // Keep the start's other neighbours free, so the loop only meets its start at the two ends.
+    const shut = new Set([...up, ...down].filter((c) => c !== a && c !== b));
+    const coreCells = new Set<number>();
+    for (const i of board.cells) {
+      const [q, r] = coordsOf(board, i);
+      if (hexDistance(q - qc, r - rc) <= core) coreCells.add(i);
+    }
+    const ok = (i: number) =>
+      !cut.has(i) && !shut.has(i) && !coreCells.has(i) && !blocked.has(i) && !isBorder(board, i);
+    if (blocked.has(start) || !ok(a) || !ok(b)) continue;
+    const path = cheapestPath(board, cost, a, b, ok);
+    if (!path || path.length < 4) continue;
+    const loop = [start, ...path];
+    return rand() < 0.5 ? loop : [start, ...path.reverse()];
+  }
+  return null;
+}
+
+/**
+ * A random scribble, the way a person might drag: a wandering walk with
+ * momentum that may hug the border, turn sharply, run into itself (a circuit),
+ * reach the border again (a bridge) or just stop (an open line).
+ */
+export function randomScribble(board: Board, rand: () => number, opts: LineOptions & { maxLength?: number } = {}): number[] {
+  const blocked = opts.blocked ?? new Set<number>();
+  const free = board.cells.filter((i) => !blocked.has(i));
+  const start = free[Math.floor(rand() * free.length)];
+  const walk = [start];
+  const used = new Set(walk);
+  let dir = Math.floor(rand() * 6);
+  const max = opts.maxLength ?? board.radius * 6;
+  while (walk.length < max) {
+    const h = walk[walk.length - 1];
+    const options: Array<[number, number]> = [];
+    for (const t of [0, 1, -1, 2, -2]) {
+      const d = (dir + t + 6) % 6;
+      const j = board.neighbours[h * 6 + d];
+      if (j < 0 || !board.inside[j] || used.has(j) || blocked.has(j)) continue;
+      options.push([d, t === 0 ? 6 : Math.abs(t) === 1 ? 2.5 : 0.6]);
+    }
+    if (!options.length) break;
+    let x = rand() * options.reduce((s, o) => s + o[1], 0);
+    let pick = options[0][0];
+    for (const [d, w] of options) {
+      if ((x -= w) <= 0) {
+        pick = d;
+        break;
+      }
+    }
+    dir = pick;
+    const j = board.neighbours[h * 6 + pick];
+    walk.push(j);
+    used.add(j);
+  }
+  return walk;
 }
 
 function cheapestPath(
@@ -138,42 +224,89 @@ function cheapestPath(
   return path.reverse();
 }
 
-export interface Expected {
-  /** Cells on each arc between the feet (border cells not on the line). */
-  arcs: [number[], number[]];
-  /** Index into `arcs` of the shorter one, or -1 on a tie. */
-  shorter: number;
+export interface Outcome {
+  event: Event;
+  /** How many cells of the drawing the line took before it closed. */
+  drawn: number;
+  /** For a bridge: the cells of the arc on each side of the head (border cells not on the line). */
+  arcs?: [number[], number[]];
+  /** For a circuit: the loop's cells, anchor first. */
+  loop?: number[];
   /** The cells the flood should cover. */
   fill: Set<number>;
 }
 
 /**
- * The reference answer, computed globally: walk the ring, split it at the
- * line's feet, take the shorter arc, breadth-first fill from it without
- * crossing the line.
+ * The reference answer, computed globally: replay the drawing to find where
+ * the line closes, then
+ *   - circuit: every cell that can't reach the border without crossing the line;
+ *   - bridge: walk the ring from the head both ways to the line, take the
+ *     shorter arc, and fill from it without crossing the line.
  */
-export function expectedFill(board: Board, line: readonly number[]): Expected {
-  const onLine = new Set(line);
-  const ring = borderRing(board);
-  const feet = ring.map((c, k) => (onLine.has(c) ? k : -1)).filter((k) => k >= 0);
-  if (feet.length !== 2) throw new Error(`line touches the border ${feet.length} times, expected 2`);
-  const [a, b] = feet;
-  const arc0 = ring.slice(a + 1, b);
-  const arc1 = [...ring.slice(b + 1), ...ring.slice(0, a)];
-  const shorter = arc0.length < arc1.length ? 0 : arc1.length < arc0.length ? 1 : -1;
-  const fill = new Set<number>();
-  if (shorter >= 0) {
-    const queue = [...(shorter === 0 ? arc0 : arc1)];
-    for (const c of queue) fill.add(c);
-    for (let k = 0; k < queue.length; k++) {
-      const v = queue[k];
-      for (let d = 0; d < 6; d++) {
-        const w = board.neighbours[v * 6 + d];
-        if (w < 0 || !board.inside[w] || onLine.has(w) || fill.has(w)) continue;
-        fill.add(w);
-        queue.push(w);
-      }
+export function expectedOutcome(board: Board, drawing: readonly number[]): Outcome {
+  const line: number[] = [];
+  const onLine = new Set<number>();
+  const anch: number[] = []; // 1 free, 2 left, 3 on (as Anch)
+  const pos = new Map<number, number>();
+  for (const c of drawing) {
+    const k = line.length;
+    const border = isBorder(board, c);
+    const a = border ? 3 : k === 0 ? 1 : anch[k - 1] === 1 ? 1 : 2;
+    const touched = neighboursOf(board, c).filter((j) => onLine.has(j) && j !== line[k - 1] && j !== line[k - 2]);
+    line.push(c);
+    onLine.add(c);
+    anch.push(a);
+    pos.set(c, k);
+    if (touched.length) {
+      const anchorAt = Math.max(...touched.map((j) => pos.get(j)!));
+      const fill = floodFrom(board, onLine, borderRing(board).filter((j) => !onLine.has(j)));
+      const inside = new Set(board.cells.filter((i) => !onLine.has(i) && !fill.has(i)));
+      return { event: Event.Circuit, drawn: line.length, loop: line.slice(anchorAt), fill: inside };
+    }
+    if (a === 3 && k > 0 && anch[k - 1] === 2) {
+      const ring = borderRing(board);
+      const at = ring.indexOf(c);
+      const arc = (step: number) => {
+        const out: number[] = [];
+        for (let i = (at + step + ring.length) % ring.length; !onLine.has(ring[i]); i = (i + step + ring.length) % ring.length) {
+          out.push(ring[i]);
+        }
+        return out;
+      };
+      const arcs: [number[], number[]] = [arc(1), arc(-1)];
+      const [s0, s1] = [arcs[0].length, arcs[1].length];
+      const fill = s0 === s1 ? new Set<number>() : floodFrom(board, onLine, s0 < s1 ? arcs[0] : arcs[1]);
+      return { event: Event.Bridge, drawn: line.length, arcs, fill };
     }
   }
-  return { arcs: [arc0, arc1], shorter, fill };
+  return { event: Event.None, drawn: line.length, fill: new Set() };
+}
+
+function neighboursOf(board: Board, i: number): number[] {
+  const out: number[] = [];
+  for (let d = 0; d < 6; d++) {
+    const j = board.neighbours[i * 6 + d];
+    if (j >= 0 && board.inside[j]) out.push(j);
+  }
+  return out;
+}
+
+/** Breadth-first fill from `seeds` through every inside cell not in `wall`. */
+function floodFrom(board: Board, wall: ReadonlySet<number>, seeds: readonly number[]): Set<number> {
+  const fill = new Set<number>();
+  const queue: number[] = [];
+  for (const c of seeds) {
+    if (!wall.has(c) && !fill.has(c)) {
+      fill.add(c);
+      queue.push(c);
+    }
+  }
+  for (let k = 0; k < queue.length; k++) {
+    for (const w of neighboursOf(board, queue[k])) {
+      if (wall.has(w) || fill.has(w)) continue;
+      fill.add(w);
+      queue.push(w);
+    }
+  }
+  return fill;
 }
