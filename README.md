@@ -24,24 +24,37 @@ order they were painted in or when.
 
 ### The rule
 
-The only input is each cell's `wall` bit. Everything else is a handful of
-integers per cell, updated every step, synchronously, by the same rule. Every
-field below is one formula that reads only the cell and its six neighbours
-(the hex kernel). N is the number of cells, P the number of border cells.
+The state is a stack of integer **layers**, one value per cell per layer.
+Each step, for every cell at once:
 
-| Field | Kernel | Values |
+1. **Perceive.** Every layer is read through the same kernel bank: the cell
+   itself and its six neighbours (taps E, NE, NW, W, SW, SE). These seven taps
+   per layer are all a cell ever sees.
+2. **Update.** One rule maps that perception to the cell's new value in every
+   layer.
+
+`src/engine.ts` is the generic engine: it holds the layers, applies the kernel
+bank and calls the rule, and knows nothing about walls or fills. Cells past
+the edge hold fixed values. The host may write only the rule's input layers.
+`src/inside.ts` is the rule: the layer list and the update.
+
+The only input is the `wall` layer and the output is `fill`; the rest are
+hidden layers. N is the number of cells, P the number of border cells.
+
+| Layer | Update, from the kernel taps | Values |
 |---|---|---|
-| `next`, `prev` | On the border, worked out from which neighbours are outside: the neighbour just past them going anticlockwise, and the one just before them. Not stored; recomputed every step. | direction |
-| `idx` | 0 at the east corner, else `idx(prev) + 1`. The cell's position round the border. | 0…P |
+| `out` | Fixed: 1 past the edge, 0 on the board. A border cell reads its `out` taps to find `prev`, the tap just before its run of outside neighbours going anticlockwise. | bit |
+| `wall` | Input: written by the host, never by the rule. | bit |
+| `idx` | 0 at the east corner (outside exactly at taps 5, 0, 1), else `idx(prev) + 1`. The cell's position round the border. | 0…P |
 | `cnt` | `open + cnt(prev)`, restarting at the east corner. Open border cells so far. | 0…P |
 | `tot` | At the east corner `cnt(prev)`, which is the total T; elsewhere `tot(prev)`. | 0…P |
-| `lab`, `d` | Lexicographic min-plus: `min( (idx, 0) if an open border cell, (lab_k, d_k + 1) over non-wall neighbours k )`, with `d` capped at N. | 0…P or none; 0…N |
-| `par` | The first neighbour with the same label and `d − 1`. | direction or none |
-| `s` | `open + Σ s(children)`, where children are the neighbours whose `par` points here. Open border cells in my subtree. | 0…P |
+| `lab`, `d` | Lexicographic min-plus: `min( (idx, 0) if an open border cell, (lab_k, d_k + 1) over non-wall taps k )`, with `d` capped at N. | 0…P or none; 0…N |
+| `par` | The first tap with the same label and `d − 1`. | tap or none |
+| `s` | `open + Σ s(k)` over taps k whose `par` points back here. Open border cells in my subtree. | 0…P |
 | `v` | At the root (`d = 0`), `2·s < tot`; elsewhere `v(par)`. | bit |
-| fill | `not wall and (lab = none or v)` | bit |
+| `fill` | `not wall and (lab = none or v)` | bit |
 
-**What each field is for:**
+**What each layer is for:**
 - `lab` names a region by its smallest border position, and `d` is the
   distance to that cell. Together they also detect a walled-in region: a label
   whose source has been cut off has no cell holding `d = 0`, so its `d` counts
@@ -51,8 +64,8 @@ field below is one formula that reads only the cell and its six neighbours
 - `v` is the root's verdict, copied down the tree to every cell in the region.
 
 **Is it a cellular automaton?** Yes: it is uniform, synchronous,
-deterministic and uses radius-1 neighbourhoods. The input is a single bit per
-cell, and the host never touches any other field.
+deterministic, and reads only radius-1 kernel taps. The input is one layer,
+and the host never writes any other.
 
 - **Absolute directions.** They appear in exactly two places: the east corner
   anchors the border numbering, and `par` breaks ties by lowest direction.
@@ -67,10 +80,11 @@ cell, and the host never touches any other field.
 
 ### Settling
 
-Each field is a fixed point of its formula, given the fields it reads. So the
-whole automaton settles to the same answer from **any** starting state, and a
-wall painted or erased mid-way is simply absorbed. "Scramble state" in the demo
-fills every field with garbage to show it.
+Each hidden layer is a fixed point of its update, given the layers above it
+in the table. So the stack settles to the same answer from **any** starting
+state, and a wall painted or erased mid-way is simply absorbed. "Scramble
+state" in the demo fills every hidden layer with garbage to show it, and the
+layer picker shows any single layer as a heat map.
 
 After the last change, settling takes:
 
@@ -104,7 +118,8 @@ it to GitHub Pages. Pull requests run the same checks without deploying.
 
 ```
 src/hex.ts     hexagon board, axial coords, direction-indexed neighbours, border ring (for checks only)
-src/ca.ts      the cell state, the rule, the synchronous stepper; setWall() is the only input
+src/engine.ts  the generic layered CA: layers, the hex kernel bank, one update per cell
+src/inside.ts  the rule: the layer list and the update (input `wall`, output `fill`)
 src/lines.ts   random walls (bridges, loops, scribbles, specks) and the reference fill
 tests/         vitest
 web/           the demo page (page.html + main.ts), bundled by scripts/build-web.ts

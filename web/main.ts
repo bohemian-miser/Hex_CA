@@ -1,7 +1,11 @@
 // The demo page: paint and erase walls, watch the automaton settle, and
 // check the settled fill against the reference.
 
-import { Automaton, Cell, NONE, filled } from '../src/ca.js';
+import { Automaton } from '../src/engine.js';
+import {
+  CNT, D, FILL, IDX, LAB, LAYERS, NONE, PAR, S, TOT, V, WALL,
+  filledCells, insideAutomaton, setWall, wallCells,
+} from '../src/inside.js';
 import { Board, DIRS, coordsOf, hexDistance, indexOf, makeBoard } from '../src/hex.js';
 import { expectedFill, randomWalls, rng } from '../src/lines.js';
 
@@ -13,7 +17,8 @@ let board: Board;
 let ca: Automaton;
 let rand = rng(Date.now() >>> 0);
 let playing = true;
-let view: 'fill' | 'fields' = 'fill';
+let view: 'fill' | 'fields' | 'layer' = 'fill';
+let shownLayer = LAB;
 /** The reference answer for the current walls, once the automaton has settled. */
 let check: { ok: boolean; want: number } | null = null;
 let settledAt: number | null = null;
@@ -22,8 +27,8 @@ const settings = { radius: 12, speed: 600 };
 
 function newField(withPicture: boolean): void {
   board = makeBoard(settings.radius);
-  ca = new Automaton(board);
-  if (withPicture) for (const c of randomWalls(board, rand)) ca.setWall(c, true);
+  ca = insideAutomaton(board);
+  if (withPicture) for (const c of randomWalls(board, rand)) setWall(ca, c, true);
   touched();
   layout();
   draw();
@@ -39,8 +44,8 @@ function step(): void {
   ca.step();
   if (ca.changed === 0 && !check) {
     settledAt = ca.generation;
-    const want = expectedFill(board, ca.walls());
-    const got = ca.filled();
+    const want = expectedFill(board, wallCells(ca));
+    const got = filledCells(ca);
     check = { ok: got.size === want.size && [...got].every((c) => want.has(c)), want: want.size };
   } else if (ca.changed > 0 && check) {
     touched();
@@ -91,8 +96,8 @@ function hexLine(a: number, b: number): number[] {
 function paintTo(cell: number): void {
   if (painting === null || cell < 0) return;
   for (const c of lastCell >= 0 ? hexLine(lastCell, cell) : [cell]) {
-    if (board.inside[c] && ca.cells[c].wall !== painting) {
-      ca.setWall(c, painting);
+    if (board.inside[c] && (ca.layers[WALL][c] === 1) !== painting) {
+      setWall(ca, c, painting);
       touched();
     }
   }
@@ -171,7 +176,25 @@ function isDark(): boolean {
   return window.matchMedia('(prefers-color-scheme: dark)').matches;
 }
 
-function fieldColour(c: Cell): string {
+/** One cell's layers, read off the stack (for drawing only). */
+interface CellView { wall: boolean; tot: number; lab: number; d: number; par: number; s: number; fill: boolean }
+function cellView(i: number): CellView {
+  const l = ca.layers;
+  return {
+    wall: l[WALL][i] === 1, tot: l[TOT][i], lab: l[LAB][i], d: l[D][i],
+    par: l[PAR][i], s: l[S][i], fill: l[FILL][i] === 1,
+  };
+}
+
+/** A layer's value as a heat colour, scaled to the layer's range on the board. */
+let layerRange: [number, number] = [0, 1];
+function layerColour(v: number): string {
+  const [lo, hi] = layerRange;
+  const t = hi > lo ? (v - lo) / (hi - lo) : 0;
+  return isDark() ? `hsl(${200 - 160 * t} 55% ${18 + 40 * t}%)` : `hsl(${200 - 160 * t} 65% ${92 - 45 * t}%)`;
+}
+
+function fieldColour(c: CellView): string {
   // Region label → hue; distance to the label's source → lightness.
   if (c.lab === NONE) return isDark() ? 'hsl(0 0% 12%)' : 'hsl(0 0% 88%)';
   const hue = (c.lab * 137.5) % 360;
@@ -187,15 +210,27 @@ function draw(): void {
     cell: tok('--cell'), ring: tok('--cell-ring'), edge: tok('--cell-edge'), wall: tok('--line'),
     flood: tok('--flood'), accent: tok('--accent'), fg: tok('--fg'),
   };
+  if (view === 'layer') {
+    let lo = Infinity;
+    let hi = -Infinity;
+    for (const i of board.cells) {
+      if (ca.layers[WALL][i] && shownLayer !== WALL) continue; // walls are drawn as walls
+      const v = ca.layers[shownLayer][i];
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    layerRange = [lo, hi];
+  }
   const s = size * 0.97;
   for (const i of board.cells) {
-    const c = ca.cells[i];
+    const c = cellView(i);
     const [x, y] = centre(i);
     const onRing = isRingCell(i);
     let fill: string;
     if (c.wall) fill = col.wall;
     else if (view === 'fields') fill = fieldColour(c);
-    else if (filled(c)) fill = col.flood;
+    else if (view === 'layer') fill = layerColour(ca.layers[shownLayer][i]);
+    else if (c.fill) fill = col.flood;
     else fill = onRing ? col.ring : col.cell;
     hexPath(x, y, s);
     ctx.fillStyle = fill;
@@ -215,7 +250,7 @@ function draw(): void {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     for (const i of board.cells) {
-      const c = ca.cells[i];
+      const c = cellView(i);
       if (c.wall || c.lab === NONE) continue;
       const [x, y] = centre(i);
       if (c.par >= 0) {
@@ -256,7 +291,7 @@ function readout(): void {
   const roots: number[] = [];
   let enclosed = 0;
   for (const i of board.cells) {
-    const c = ca.cells[i];
+    const c = cellView(i);
     if (isRingCell(i)) T = Math.max(T, c.tot);
     if (!c.wall && c.lab !== NONE && c.d === 0) roots.push(c.s);
     if (!c.wall && c.lab === NONE) enclosed++;
@@ -271,7 +306,7 @@ function readout(): void {
     ['Open border T', String(T)],
     ['Border regions', roots.length ? roots.sort((a, b) => b - a).join(' · ') : '—'],
     ['Walled-in cells', String(enclosed)],
-    ['Filled', check ? `${ca.filled().size} / ${check.want}` : String(ca.filled().size)],
+    ['Filled', check ? `${filledCells(ca).size} / ${check.want}` : String(filledCells(ca).size)],
     ['Reference', ref],
   ];
   $('readout').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
@@ -326,21 +361,24 @@ $('random').addEventListener('click', () => {
   newField(true);
 });
 $('clear').addEventListener('click', () => {
-  for (const i of board.cells) ca.setWall(i, false);
+  for (const i of board.cells) setWall(ca, i, false);
   touched();
   draw();
 });
 $('scramble').addEventListener('click', () => {
   // Garbage in every field but the walls: the rule has to recover on its own.
-  const { N, P } = ca.limits;
+  const { N, P } = ca.consts;
   const int = (n: number) => Math.floor(Math.random() * n);
   for (const i of board.cells) {
-    ca.cells[i] = {
-      ...ca.cells[i],
-      idx: int(P + 1), cnt: int(P + 1), tot: int(P + 1),
-      lab: Math.random() < 0.2 ? NONE : int(P), d: int(N + 1),
-      par: int(7) - 1, s: int(P + 1), v: Math.random() < 0.5,
-    };
+    ca.layers[IDX][i] = int(P + 1);
+    ca.layers[CNT][i] = int(P + 1);
+    ca.layers[TOT][i] = int(P + 1);
+    ca.layers[LAB][i] = Math.random() < 0.2 ? NONE : int(P);
+    ca.layers[D][i] = int(N + 1);
+    ca.layers[PAR][i] = int(7) - 1;
+    ca.layers[S][i] = int(P + 1);
+    ca.layers[V][i] = int(2);
+    ca.layers[FILL][i] = int(2);
   }
   touched();
   draw();
@@ -350,7 +388,15 @@ for (const tool of ['paint', 'erase'] as const) {
     eraser = tool === 'erase';
   });
 }
-for (const v of ['fill', 'fields'] as const) {
+const layerSel = $<HTMLSelectElement>('layerSel');
+layerSel.innerHTML = LAYERS.map((name, L) => `<option value="${L}"${L === LAB ? ' selected' : ''}>${name}</option>`).join('');
+layerSel.addEventListener('change', () => {
+  shownLayer = Number(layerSel.value);
+  view = 'layer';
+  $<HTMLInputElement>('view-layer').checked = true;
+  draw();
+});
+for (const v of ['fill', 'fields', 'layer'] as const) {
   $<HTMLInputElement>(`view-${v}`).addEventListener('change', () => {
     view = v;
     draw();

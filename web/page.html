@@ -78,6 +78,7 @@ dl.readout dd { margin: 0; text-align: right; }
 .rules p { margin: 0; color: var(--muted); max-width: 80ch; }
 .rules h3 { font: 600 15px/1.3 var(--body); margin: 6px 0 0; }
 .views { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.views select { font: 13px var(--mono); color: var(--fg); background: var(--panel); border: 1px solid var(--hair); border-radius: 4px; padding: 2px 4px; }
 .table-wrap { overflow-x: auto; }
 .rules table { border-collapse: collapse; font-size: 14px; min-width: 560px; }
 .rules th { text-align: left; font: 500 11px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.09em; color: var(--muted); padding: 0 12px 8px 0; border-bottom: 1px solid var(--hair); }
@@ -126,7 +127,8 @@ dl.readout dd { margin: 0; text-align: right; }
         <div class="label">Show</div>
         <div class="views">
           <label class="check"><input type="radio" name="view" id="view-fill" checked> Fill</label>
-          <label class="check"><input type="radio" name="view" id="view-fields"> Inner fields</label>
+          <label class="check"><input type="radio" name="view" id="view-fields"> Regions and trees</label>
+          <label class="check"><input type="radio" name="view" id="view-layer"> Layer <select id="layerSel" aria-label="Layer to show"></select></label>
         </div>
       </div>
       <dl class="readout" id="readout"></dl>
@@ -140,12 +142,13 @@ dl.readout dd { margin: 0; text-align: right; }
 
   <section class="rules">
     <h2>The rule</h2>
-    <p>One input: each cell's wall bit, which you can change anywhere at any time. Everything else is a handful of integers per cell, each updated every step by the formula below. Every formula reads only the cell itself and its six neighbours (the hex kernel). N is the number of cells, P the number of border cells.</p>
+    <p>The state is a stack of layers, one integer per cell per layer. Each step, every cell reads every layer through the same kernel bank: itself and its six neighbours (E, NE, NW, W, SW, SE). From those readings alone, one update gives the cell's new value in each layer. The engine runs that and nothing else. The only input is the <code>wall</code> layer; <code>fill</code> is the output, and the rest are hidden layers. N is the number of cells, P the number of border cells.</p>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Field</th><th>Kernel</th><th>Values</th></tr></thead>
+        <thead><tr><th>Layer</th><th>Update, from the kernel taps</th><th>Values</th></tr></thead>
         <tbody>
-          <tr><td><code>next</code>, <code>prev</code></td><td>On the border, read from which neighbours are outside: the neighbour just past them going anticlockwise, and the one just before.</td><td>direction</td></tr>
+          <tr><td><code>out</code></td><td>Fixed: 1 past the edge, 0 on the board. A border cell reads its <code>out</code> taps to find <code>prev</code>, the tap just before its run of outside neighbours going anticlockwise.</td><td>bit</td></tr>
+          <tr><td><code>wall</code></td><td>Input: written by you, never by the rule.</td><td>bit</td></tr>
           <tr><td><code>idx</code></td><td>0 at the east corner, else <code>idx(prev) + 1</code>: position round the border.</td><td>0…P</td></tr>
           <tr><td><code>cnt</code></td><td><code>open + cnt(prev)</code> (restarting at the east corner): open border cells so far.</td><td>0…P</td></tr>
           <tr><td><code>tot</code></td><td>At the east corner <code>cnt(prev)</code>, the total T; elsewhere <code>tot(prev)</code>.</td><td>0…P</td></tr>
@@ -157,7 +160,7 @@ dl.readout dd { margin: 0; text-align: right; }
         </tbody>
       </table>
     </div>
-    <p>Each field is a fixed point of its formula given the fields above it, so the whole thing settles to the same answer from any starting state. Press “Scramble state” to fill every field with garbage and watch it recover. Settling takes about P steps for the border, up to N for a cut-off label to die, then twice the region's depth. The readout checks the settled fill against a fill computed over the whole board.</p>
+    <p>Each hidden layer is a fixed point of its update, given the layers above it in the table. So the stack settles to the same answer from any starting state, and walls changed mid-way are simply absorbed. Press “Scramble state” to fill every hidden layer with garbage and watch it recover, or pick a layer under “Show” to watch it settle. The readout checks the settled fill against a fill computed over the whole board.</p>
   </section>
 </div>
 <script>/*APP*/</script>
