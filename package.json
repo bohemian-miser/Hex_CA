@@ -1,0 +1,21 @@
+{
+  "name": "hex-ca",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cellular automata on a hexagon field — the groundwork for running Spectacle as a CA",
+  "type": "module",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsx scripts/build-web.ts",
+    "demo": "tsx scripts/console-demo.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
