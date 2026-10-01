@@ -1,6 +1,8 @@
 # Hex_CA
 Experimenting with cellular automata as the foundation for the spectacle  game hexagon.rodeo 
 
+**Live demo:** https://bohemian-miser.github.io/Hex_CA/
+
 ## Exercise 1 — flood the shorter side of a line
 
 A hexagon-shaped field of hexagons. A *line* of active cells crosses it, border
@@ -64,8 +66,13 @@ npm install
 npm test         # CA vs. a global BFS reference: 400 random single lines (ties included),
                  # decision timing, quiescence, and 6-line sequences over old lines
 npm run typecheck
-npm run build    # → dist/hex-ca.html, a self-contained animated demo
+npm run build    # → dist/index.html, a self-contained animated demo (open it directly)
 ```
+
+Every push to `main` runs the typecheck and tests, builds the demo and deploys
+it to GitHub Pages (`.github/workflows/pages.yml`). That needs the repository's
+Settings → Pages → Build and deployment → Source set to **GitHub Actions**.
+Pull requests run the same checks without deploying (`ci.yml`).
 
 ### Layout
 
@@ -75,6 +82,7 @@ src/ca.ts      the cell state, the rule, and the synchronous stepper
 src/lines.ts   random line generator and the reference fill (global; never used by the rule)
 tests/         vitest
 web/           the demo page (page.html + main.ts), bundled by scripts/build-web.ts
+.github/       CI on pull requests; build and deploy to Pages from main
 ```
 
 ### Open questions and next steps

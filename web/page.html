@@ -39,11 +39,12 @@
   --good: #5cc98a; --bad: #ef7a64; color-scheme: dark;
 }
 html, body { background: var(--bg); color: var(--fg); }
-body { font: 15px/1.5 var(--body); padding-inline: 16px; padding-block: 20px 40px; }
+body { margin: 0; font: 15px/1.5 var(--body); padding-inline: 16px; padding-block: 20px 40px; }
 .wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 20px; }
 header { display: grid; gap: 4px; }
 h1 { font: 700 clamp(26px, 4vw, 38px)/1.05 var(--display); letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
 header p { margin: 0; color: var(--muted); max-width: 70ch; }
+header a { color: var(--accent); }
 .bench { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 20px; align-items: start; }
 @media (max-width: 820px) { .bench { grid-template-columns: minmax(0, 1fr); } }
 .stage { position: relative; background: var(--panel); border: 1px solid var(--hair); border-radius: 6px; aspect-ratio: 1 / 0.92; max-width: 100%; min-width: 0; }
@@ -80,7 +81,7 @@ dl.readout dd { margin: 0; text-align: right; }
 <div class="wrap">
   <header>
     <h1>Shorter-side flood, as a cellular automaton</h1>
-    <p>A line of cells crosses the hexagon field edge to edge. Every cell runs the same local rule on its six neighbours, and between them they flood the side whose stretch of the border is shorter. Nothing in the rule can see the whole board.</p>
+    <p>A line of cells crosses the hexagon field edge to edge. Every cell runs the same local rule on its six neighbours, and between them they flood the side whose stretch of the border is shorter. Nothing in the rule can see the whole board. <a href="https://github.com/bohemian-miser/Hex_CA">Source on GitHub</a></p>
   </header>
 
   <div class="bench">
