@@ -1,7 +1,6 @@
 // Random lines across the board, and the reference answer the CA must match.
 // Neither is part of the automaton: they set it up and check it.
 
-import { Event } from './ca.js';
 import { Board, borderRing, coordsOf, hexDistance, indexOf, isBorder } from './hex.js';
 
 /** mulberry32: small, seedable, good enough for test fields. */
@@ -224,62 +223,33 @@ function cheapestPath(
   return path.reverse();
 }
 
-export interface Outcome {
-  event: Event;
-  /** How many cells of the drawing the line took before it closed. */
-  drawn: number;
-  /** For a bridge: the cells of the arc on each side of the head (border cells not on the line). */
-  arcs?: [number[], number[]];
-  /** For a circuit: the loop's cells, anchor first. */
-  loop?: number[];
-  /** The cells the flood should cover. */
-  fill: Set<number>;
-}
-
 /**
- * The reference answer, computed globally: replay the drawing to find where
- * the line closes, then
- *   - circuit: every cell that can't reach the border without crossing the line;
- *   - bridge: walk the ring from the head both ways to the line, take the
- *     shorter arc, and fill from it without crossing the line.
+ * The reference answer, computed over the whole board: split the non-wall
+ * cells into regions, count each region's open border cells b and the
+ * field's T, and fill every region with 2·b < T (a region with no border at
+ * all always fills).
  */
-export function expectedOutcome(board: Board, drawing: readonly number[]): Outcome {
-  const line: number[] = [];
-  const onLine = new Set<number>();
-  const anch: number[] = []; // 1 free, 2 left, 3 on (as Anch)
-  const pos = new Map<number, number>();
-  for (const c of drawing) {
-    const k = line.length;
-    const border = isBorder(board, c);
-    const a = border ? 3 : k === 0 ? 1 : anch[k - 1] === 1 ? 1 : 2;
-    const touched = neighboursOf(board, c).filter((j) => onLine.has(j) && j !== line[k - 1] && j !== line[k - 2]);
-    line.push(c);
-    onLine.add(c);
-    anch.push(a);
-    pos.set(c, k);
-    if (touched.length) {
-      const anchorAt = Math.max(...touched.map((j) => pos.get(j)!));
-      const fill = floodFrom(board, onLine, borderRing(board).filter((j) => !onLine.has(j)));
-      const inside = new Set(board.cells.filter((i) => !onLine.has(i) && !fill.has(i)));
-      return { event: Event.Circuit, drawn: line.length, loop: line.slice(anchorAt), fill: inside };
+export function expectedFill(board: Board, walls: ReadonlySet<number>): Set<number> {
+  const ring = new Set(borderRing(board));
+  let T = 0;
+  for (const c of ring) if (!walls.has(c)) T++;
+  const fill = new Set<number>();
+  const seen = new Set<number>();
+  for (const start of board.cells) {
+    if (walls.has(start) || seen.has(start)) continue;
+    const region = [start];
+    seen.add(start);
+    for (let k = 0; k < region.length; k++) {
+      for (const w of neighboursOf(board, region[k])) {
+        if (walls.has(w) || seen.has(w)) continue;
+        seen.add(w);
+        region.push(w);
+      }
     }
-    if (a === 3 && k > 0 && anch[k - 1] === 2) {
-      const ring = borderRing(board);
-      const at = ring.indexOf(c);
-      const arc = (step: number) => {
-        const out: number[] = [];
-        for (let i = (at + step + ring.length) % ring.length; !onLine.has(ring[i]); i = (i + step + ring.length) % ring.length) {
-          out.push(ring[i]);
-        }
-        return out;
-      };
-      const arcs: [number[], number[]] = [arc(1), arc(-1)];
-      const [s0, s1] = [arcs[0].length, arcs[1].length];
-      const fill = s0 === s1 ? new Set<number>() : floodFrom(board, onLine, s0 < s1 ? arcs[0] : arcs[1]);
-      return { event: Event.Bridge, drawn: line.length, arcs, fill };
-    }
+    const b = region.filter((c) => ring.has(c)).length;
+    if (b === 0 || 2 * b < T) for (const c of region) fill.add(c);
   }
-  return { event: Event.None, drawn: line.length, fill: new Set() };
+  return fill;
 }
 
 function neighboursOf(board: Board, i: number): number[] {
@@ -291,22 +261,27 @@ function neighboursOf(board: Board, i: number): number[] {
   return out;
 }
 
-/** Breadth-first fill from `seeds` through every inside cell not in `wall`. */
-function floodFrom(board: Board, wall: ReadonlySet<number>, seeds: readonly number[]): Set<number> {
-  const fill = new Set<number>();
-  const queue: number[] = [];
-  for (const c of seeds) {
-    if (!wall.has(c) && !fill.has(c)) {
-      fill.add(c);
-      queue.push(c);
-    }
+/**
+ * A random wall picture: a few bridges, loops and scribbles, some broken or
+ * crossing, plus scattered single cells.
+ */
+export function randomWalls(board: Board, rand: () => number): Set<number> {
+  const walls = new Set<number>();
+  const shapes = 1 + Math.floor(rand() * 4);
+  for (let k = 0; k < shapes; k++) {
+    const kind = rand();
+    const cells =
+      kind < 0.35 ? randomLine(board, rand, { wiggle: rand() * 2 })
+      : kind < 0.7 ? randomLoop(board, rand, { wiggle: rand() * 2 })
+      : randomScribble(board, rand, { maxLength: 4 + Math.floor(rand() * board.radius * 4) });
+    if (!cells) continue;
+    // Sometimes leave a gap.
+    const gap = rand() < 0.25 ? Math.floor(rand() * cells.length) : -1;
+    cells.forEach((c, i) => {
+      if (i !== gap) walls.add(c);
+    });
   }
-  for (let k = 0; k < queue.length; k++) {
-    for (const w of neighboursOf(board, queue[k])) {
-      if (wall.has(w) || fill.has(w)) continue;
-      fill.add(w);
-      queue.push(w);
-    }
-  }
-  return fill;
+  const specks = Math.floor(rand() * board.radius);
+  for (let k = 0; k < specks; k++) walls.add(board.cells[Math.floor(rand() * board.cells.length)]);
+  return walls;
 }
