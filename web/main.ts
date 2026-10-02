@@ -1,69 +1,144 @@
-// The demo page: paint and erase walls, watch the automaton settle, and
-// check the settled fill against the reference.
+// The demo page (DESIGN.md §9): draw lines, erase and paint walls, watch the
+// fill rule settle, and check the settled state against the oracle.
 
-import { Automaton } from '../src/engine.js';
-import {
-  CNT, D, FILL, IDX, LAB, LAYERS, NONE, PAR, S, TOT, V, WALL,
-  filledCells, insideAutomaton, setWall, wallCells,
-} from '../src/inside.js';
-import { Board, DIRS, coordsOf, hexDistance, indexOf, makeBoard } from '../src/hex.js';
-import { expectedFill, randomWalls, rng } from '../src/lines.js';
+import { CA } from '../src/engine.js';
+import { Field, hexField, presetWalls } from '../src/field.js';
+import { FILLED, OFF, ON, WALL, bump, fillCA, fillRule, paint, scramble, stateOf } from '../src/fill.js';
+import { coordsOf, hexDistance, indexOf } from '../src/hex.js';
+import { randomLoop, rng } from '../src/lines.js';
+import { oracle } from '../src/oracle.js';
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const canvas = $<HTMLCanvasElement>('board');
 const ctx = canvas.getContext('2d')!;
 
-let board: Board;
-let ca: Automaton;
-let rand = rng(Date.now() >>> 0);
+/** Channel indices, by name (every fill CA has fillRule's channel order). */
+const NAMES = fillRule.channels.map((s) => s.name);
+const chan = (name: string): number => {
+  const c = NAMES.indexOf(name);
+  if (c < 0) throw new Error(`no channel ${name}`);
+  return c;
+};
+const PAINT = chan('paint'), EPOCH = chan('epoch'), RUN = chan('run'), COMMIT = chan('commit');
+const WANT = chan('want'), STATE = chan('state');
+
+/** Channels holding ids: drawn as hashed hues, not a scale. */
+const HASHED = new Set(['id', 'gpar', 'leader', 'rpar']);
+/** Region channels: meaningless on a blocked cell, which keeps its paint colour. */
+const REGION = new Set(['redge', 'leader', 'dist', 'rpar', 'cdone', 'sub', 'rsize', 'want']);
+
+/** "Step to commit" gives up after this many steps. */
+const SEEK_MAX = 20000;
+/** Per frame: at most this many steps, and no more than this much time stepping. */
+const FRAME_STEPS = 5000;
+const FRAME_MS = 14;
+/** Heat maps are quantised so a frame fills one path per colour, not one per cell. */
+const LEVELS = 32;
+
+type Tool = 'on' | 'erase' | 'wall';
+type View = 'state' | 'diff' | 'epoch' | 'channel';
+type Preset = 'hexagon' | 'blob' | 'lobes' | 'ring';
+
+const settings = { radius: 20, speed: 600, preset: 'hexagon' as Preset };
+let field: Field;
+let ca: CA;
+let root = 0;
+let tool: Tool = 'on';
+let view: View = 'state';
+let shownChannel = chan('leader');
 let playing = true;
-let view: 'fill' | 'fields' | 'layer' = 'fill';
-let shownLayer = LAB;
-/** The reference answer for the current walls, once the automaton has settled. */
-let check: { ok: boolean; want: number } | null = null;
-let settledAt: number | null = null;
+/** The board needs a redraw; the readout needs one (cheap, and the step count moves on a quiet board). */
+let dirty = true;
+let readoutDirty = true;
 
-const settings = { radius: 12, speed: 600 };
+/** The last edit: the commit it waits for and the generation it was made at. */
+let pending: { serial: number; from: number } | null = null;
+/** Steps from the last edit to the root's commit of it. */
+let latency: number | null = null;
+/** The oracle check, made once the board is quiet; null while it is not. */
+let check: { ok: boolean; filled: number } | null = null;
+/** "Step to commit": the root's commit when it started and the steps left. */
+let seek: { from: number; left: number } | null = null;
 
-function newField(withPicture: boolean): void {
-  board = makeBoard(settings.radius);
-  ca = insideAutomaton(board);
-  if (withPicture) for (const c of randomWalls(board, rand)) setWall(ca, c, true);
-  touched();
-  layout();
-  draw();
-}
+// ── The automaton ───────────────────────────────────────────────────────────
 
-/** The walls changed (or the state did): the old check no longer holds. */
-function touched(): void {
+/** A fresh automaton for the current radius and preset; the walls go in with the boot. */
+function newField(): void {
+  field = hexField(settings.radius);
+  ca = fillCA(field);
+  root = field.root;
+  const walls = presetWalls(field, settings.preset);
+  paint(ca, walls, WALL);
+  // The boot commits epoch 0, or 1 when the walls were stamped with step 1.
+  pending = { serial: walls.length ? 1 : 0, from: 0 };
+  latency = null;
   check = null;
-  settledAt = null;
+  seek = null;
+  layout();
+  dirty = true;
 }
 
-function step(): void {
+/** One stroke's cells as one `paint` call: one serial per pointer event. */
+function edit(cells: Iterable<number>, v: 0 | 1 | 3): void {
+  const p = ca.ch[PAINT];
+  const isField = field.topo.isField;
+  const todo: number[] = [];
+  for (const c of cells) {
+    // A line goes round walls, never over them.
+    if (c >= 0 && isField[c] && p[c] !== v && !(v === ON && p[c] === WALL)) todo.push(c);
+  }
+  if (!todo.length) return;
+  paint(ca, todo, v);
+  touched({ serial: ca.generation + 1, from: ca.generation });
+}
+
+/** The picture or state changed: the old check and the latency no longer hold. */
+function touched(next: { serial: number; from: number } | null): void {
+  pending = next;
+  latency = null;
+  check = null;
+  dirty = true;
+}
+
+function advance(): void {
   ca.step();
-  if (ca.changed === 0 && !check) {
-    settledAt = ca.generation;
-    const want = expectedFill(board, wallCells(ca));
-    const got = filledCells(ca);
-    check = { ok: got.size === want.size && [...got].every((c) => want.has(c)), want: want.size };
-  } else if (ca.changed > 0 && check) {
-    touched();
+  stepsDone++;
+  if (pending && ca.ch[COMMIT][root] >= pending.serial) {
+    latency = ca.generation - pending.from;
+    pending = null;
+  }
+  readoutDirty = true;
+  if (ca.changed > 0) {
+    check = null;
+    dirty = true;
+  } else if (!check) {
+    const got = stateOf(ca);
+    const p = ca.ch[PAINT];
+    const want = oracle(field, (slot) => p[slot], ca.u.wallsBound === 1);
+    let ok = true;
+    let filled = 0;
+    for (const c of field.topo.cells) {
+      if (got[c] !== want[c]) ok = false;
+      if (got[c] === FILLED) filled++;
+    }
+    check = { ok, filled };
   }
 }
 
-// ── Painting ────────────────────────────────────────────────────────────────
+// ── Pointer: draw, erase, wall ──────────────────────────────────────────────
 
-let painting: boolean | null = null; // true = adding walls, false = erasing
-let eraser = false;
+let stroke: 0 | 1 | 3 | null = null;
 let lastCell = -1;
+const SQ3 = Math.sqrt(3);
 
 function cellAt(ev: PointerEvent): number {
   const rect = canvas.getBoundingClientRect();
   const x = (ev.clientX - rect.left - ox) / size;
   const y = (ev.clientY - rect.top - oy) / size;
   const [q, r] = cubeRound((SQ3 / 3) * x - y / 3, (2 / 3) * y);
-  return hexDistance(q, r) > board.radius ? -1 : indexOf(board, q, r);
+  if (hexDistance(q, r) > field.board.radius) return -1;
+  const slot = indexOf(field.board, q, r);
+  return field.topo.isField[slot] ? slot : -1;
 }
 
 function cubeRound(fq: number, fr: number): [number, number] {
@@ -81,6 +156,7 @@ function cubeRound(fq: number, fr: number): [number, number] {
 
 /** Cells on the straight hex line from a to b, both ends included. */
 function hexLine(a: number, b: number): number[] {
+  const board = field.board;
   const [aq, ar] = coordsOf(board, a);
   const [bq, br] = coordsOf(board, b);
   const n = hexDistance(bq - aq, br - ar);
@@ -93,36 +169,32 @@ function hexLine(a: number, b: number): number[] {
   return out;
 }
 
-function paintTo(cell: number): void {
-  if (painting === null || cell < 0) return;
-  for (const c of lastCell >= 0 ? hexLine(lastCell, cell) : [cell]) {
-    if (board.inside[c] && (ca.layers[WALL][c] === 1) !== painting) {
-      setWall(ca, c, painting);
-      touched();
-    }
-  }
+function strokeTo(cell: number): void {
+  if (stroke === null || cell < 0) return;
+  edit(lastCell >= 0 ? hexLine(lastCell, cell) : [cell], stroke);
   lastCell = cell;
-  draw();
 }
+
+const TOOL_PAINT: Record<Tool, 0 | 1 | 3> = { on: ON, erase: OFF, wall: WALL };
 
 canvas.addEventListener('pointerdown', (ev) => {
   const cell = cellAt(ev);
   if (cell < 0) return;
   canvas.setPointerCapture(ev.pointerId);
-  // Paint, unless the eraser is picked or it's the right button.
-  painting = !(ev.button === 2 || eraser);
+  // The right button always erases.
+  stroke = ev.button === 2 ? OFF : TOOL_PAINT[tool];
   lastCell = -1;
-  paintTo(cell);
+  strokeTo(cell);
 });
 canvas.addEventListener('pointermove', (ev) => {
-  if (painting !== null) paintTo(cellAt(ev));
+  if (stroke !== null) strokeTo(cellAt(ev));
 });
-const stop = () => {
-  painting = null;
+const endStroke = () => {
+  stroke = null;
   lastCell = -1;
 };
-canvas.addEventListener('pointerup', stop);
-canvas.addEventListener('pointercancel', stop);
+canvas.addEventListener('pointerup', endStroke);
+canvas.addEventListener('pointercancel', endStroke);
 canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
 
 // ── Drawing ─────────────────────────────────────────────────────────────────
@@ -130,7 +202,9 @@ canvas.addEventListener('contextmenu', (ev) => ev.preventDefault());
 let size = 10;
 let ox = 0;
 let oy = 0;
-const SQ3 = Math.sqrt(3);
+/** Cell centres in CSS pixels, per slot (field slots only). */
+let cx = new Float64Array(0);
+let cy = new Float64Array(0);
 
 function layout(): void {
   const rect = canvas.getBoundingClientRect();
@@ -138,33 +212,61 @@ function layout(): void {
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const R = board.radius;
+  const R = field.board.radius;
   size = Math.min((rect.width - 16) / (SQ3 * (2 * R + 1)), (rect.height - 16) / (3 * R + 2));
   ox = rect.width / 2;
   oy = rect.height / 2;
-}
-
-function centre(i: number): [number, number] {
-  const [q, r] = coordsOf(board, i);
-  return [ox + size * SQ3 * (q + r / 2), oy + size * 1.5 * r];
-}
-
-function hexPath(x: number, y: number, s: number): void {
-  ctx.beginPath();
-  for (let k = 0; k < 6; k++) {
-    const a = (Math.PI / 180) * (60 * k - 30);
-    if (k === 0) ctx.moveTo(x + s * Math.cos(a), y + s * Math.sin(a));
-    else ctx.lineTo(x + s * Math.cos(a), y + s * Math.sin(a));
+  cx = new Float64Array(field.board.size);
+  cy = new Float64Array(field.board.size);
+  for (const i of field.topo.cells) {
+    const [q, r] = coordsOf(field.board, i);
+    cx[i] = ox + size * SQ3 * (q + r / 2);
+    cy[i] = oy + size * 1.5 * r;
   }
-  ctx.closePath();
 }
 
-function dirVec(d: number): [number, number] {
-  const [dq, dr] = DIRS[d];
-  const x = SQ3 * (dq + dr / 2);
-  const y = 1.5 * dr;
-  const len = Math.hypot(x, y);
-  return [x / len, y / len];
+/** Unit hexagon corners (pointy-top). */
+const CORNERS = Array.from({ length: 6 }, (_, k) => {
+  const a = (Math.PI / 180) * (60 * k - 30);
+  return [Math.cos(a), Math.sin(a)] as const;
+});
+
+/**
+ * Hexagons at `slots`, filled or stroked as paths of at most CHUNK cells:
+ * building one path of thousands of subpaths costs far more than its share
+ * (half a second for 11k cells in Chromium, against ~30 ms chunked).
+ */
+const CHUNK = 256;
+function hexes(slots: readonly number[], s: number, paint: () => void): void {
+  for (let i = 0; i < slots.length; i += CHUNK) {
+    ctx.beginPath();
+    const end = Math.min(slots.length, i + CHUNK);
+    for (let j = i; j < end; j++) {
+      const x = cx[slots[j]];
+      const y = cy[slots[j]];
+      ctx.moveTo(x + s * CORNERS[0][0], y + s * CORNERS[0][1]);
+      for (let k = 1; k < 6; k++) ctx.lineTo(x + s * CORNERS[k][0], y + s * CORNERS[k][1]);
+      ctx.closePath();
+    }
+    paint();
+  }
+}
+
+/** Cells grouped by colour, so a frame sets each colour once. */
+class Fills {
+  private groups = new Map<string, number[]>();
+  constructor(private readonly s: number) {}
+  add(colour: string, slot: number): void {
+    let g = this.groups.get(colour);
+    if (!g) this.groups.set(colour, (g = []));
+    g.push(slot);
+  }
+  draw(): void {
+    for (const [colour, slots] of this.groups) {
+      ctx.fillStyle = colour;
+      hexes(slots, this.s, () => ctx.fill());
+    }
+  }
 }
 
 let css: CSSStyleDeclaration;
@@ -176,140 +278,151 @@ function isDark(): boolean {
   return window.matchMedia('(prefers-color-scheme: dark)').matches;
 }
 
-/** One cell's layers, read off the stack (for drawing only). */
-interface CellView { wall: boolean; tot: number; lab: number; d: number; par: number; s: number; fill: boolean }
-function cellView(i: number): CellView {
-  const l = ca.layers;
-  return {
-    wall: l[WALL][i] === 1, tot: l[TOT][i], lab: l[LAB][i], d: l[D][i],
-    par: l[PAR][i], s: l[S][i], fill: l[FILL][i] === 1,
-  };
+/** a + (b − a)·t for two #rrggbb colours; a when either is not one. */
+function mix(a: string, b: string, t: number): string {
+  const pa = /^#([0-9a-f]{6})$/i.exec(a);
+  const pb = /^#([0-9a-f]{6})$/i.exec(b);
+  if (!pa || !pb) return t < 0.5 ? a : b;
+  const na = parseInt(pa[1], 16);
+  const nb = parseInt(pb[1], 16);
+  const ch = (sh: number) => Math.round(((na >> sh) & 255) * (1 - t) + ((nb >> sh) & 255) * t);
+  return `rgb(${ch(16)} ${ch(8)} ${ch(0)})`;
 }
 
-/** A layer's value as a heat colour, scaled to the layer's range on the board. */
-let layerRange: [number, number] = [0, 1];
-function layerColour(v: number): string {
-  const [lo, hi] = layerRange;
-  const t = hi > lo ? (v - lo) / (hi - lo) : 0;
+function heat(t: number): string {
   return isDark() ? `hsl(${200 - 160 * t} 55% ${18 + 40 * t}%)` : `hsl(${200 - 160 * t} 65% ${92 - 45 * t}%)`;
 }
 
-function fieldColour(c: CellView): string {
-  // Region label → hue; distance to the label's source → lightness.
-  if (c.lab === NONE) return isDark() ? 'hsl(0 0% 12%)' : 'hsl(0 0% 88%)';
-  const hue = (c.lab * 137.5) % 360;
-  const t = Math.min(1, c.d / Math.max(8, board.radius * 2));
-  return isDark() ? `hsl(${hue} 45% ${42 - 22 * t}%)` : `hsl(${hue} 60% ${80 - 30 * t}%)`;
+function hashed(v: number): string {
+  return isDark() ? `hsl(${(v * 137.5) % 360} 45% 42%)` : `hsl(${(v * 137.5) % 360} 60% 72%)`;
 }
 
 function draw(): void {
+  dirty = false;
   css = getComputedStyle(document.documentElement);
   const rect = canvas.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
   const col = {
-    cell: tok('--cell'), ring: tok('--cell-ring'), edge: tok('--cell-edge'), wall: tok('--line'),
-    flood: tok('--flood'), accent: tok('--accent'), fg: tok('--fg'),
+    cell: tok('--cell'), edge: tok('--cell-edge'), line: tok('--line'), wall: tok('--wall'),
+    flood: tok('--flood'), accent: tok('--accent'), pulse: tok('--pulse'),
   };
-  if (view === 'layer') {
+  const stateColour = (v: number) => (v === ON ? col.line : v === WALL ? col.wall : v === FILLED ? col.flood : col.cell);
+  const cells = field.topo.cells;
+  const cellList = Array.from(cells);
+  const p = ca.ch[PAINT];
+  const st = ca.ch[STATE];
+  const s = size * 0.97;
+  const fills = new Fills(s);
+  /** The picture (lines, walls) drawn small over a view that colours every cell. */
+  const inset = new Fills(s * 0.45);
+
+  if (view === 'state') {
+    for (const c of cells) fills.add(stateColour(st[c]), c);
+  } else if (view === 'diff') {
+    const want = ca.ch[WANT];
+    for (const c of cells) {
+      const differs = (want[c] === 1) !== (st[c] === FILLED);
+      fills.add(differs ? col.pulse : mix(col.cell, stateColour(st[c]), 0.35), c);
+    }
+  } else if (view === 'epoch') {
+    const ep = ca.ch[EPOCH];
+    let top = -Infinity;
+    for (const c of cells) if (ep[c] > top) top = ep[c];
+    const span = 2 * Math.max(1, field.K);
+    for (const c of cells) {
+      const age = top - ep[c];
+      // Newest bright; older fades by age, quantised to a few shades.
+      const t = age === 0 ? 1 : Math.round((0.12 + 0.3 * Math.exp(-age / span)) * LEVELS) / LEVELS;
+      fills.add(mix(col.cell, col.accent, t), c);
+      if (p[c] !== OFF) inset.add(stateColour(p[c]), c);
+    }
+  } else {
+    const name = NAMES[shownChannel];
+    const v = ca.ch[shownChannel];
+    const region = REGION.has(name);
+    const shown = (c: number) => !region || p[c] === OFF;
     let lo = Infinity;
     let hi = -Infinity;
-    for (const i of board.cells) {
-      if (ca.layers[WALL][i] && shownLayer !== WALL) continue; // walls are drawn as walls
-      const v = ca.layers[shownLayer][i];
-      if (v < lo) lo = v;
-      if (v > hi) hi = v;
+    for (const c of cells) {
+      if (!shown(c)) continue;
+      if (v[c] < lo) lo = v[c];
+      if (v[c] > hi) hi = v[c];
     }
-    layerRange = [lo, hi];
-  }
-  const s = size * 0.97;
-  for (const i of board.cells) {
-    const c = cellView(i);
-    const [x, y] = centre(i);
-    const onRing = isRingCell(i);
-    let fill: string;
-    if (c.wall) fill = col.wall;
-    else if (view === 'fields') fill = fieldColour(c);
-    else if (view === 'layer') fill = layerColour(ca.layers[shownLayer][i]);
-    else if (c.fill) fill = col.flood;
-    else fill = onRing ? col.ring : col.cell;
-    hexPath(x, y, s);
-    ctx.fillStyle = fill;
-    ctx.fill();
-    if (size > 6) {
-      ctx.strokeStyle = col.edge;
-      ctx.lineWidth = 0.5;
-      ctx.stroke();
-    }
-  }
-  if (view === 'fields') {
-    // The spanning trees: a tick from each cell towards its parent; roots ringed, with their count.
-    ctx.strokeStyle = col.fg;
-    ctx.fillStyle = col.fg;
-    ctx.lineWidth = Math.max(1, size * 0.1);
-    ctx.font = `600 ${Math.max(8, size * 0.7)}px ui-monospace, monospace`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    for (const i of board.cells) {
-      const c = cellView(i);
-      if (c.wall || c.lab === NONE) continue;
-      const [x, y] = centre(i);
-      if (c.par >= 0) {
-        const [vx, vy] = dirVec(c.par);
-        ctx.beginPath();
-        ctx.moveTo(x, y);
-        ctx.lineTo(x + vx * size * 0.9, y + vy * size * 0.9);
-        ctx.stroke();
-      } else if (c.d === 0) {
-        hexPath(x, y, s * 0.8);
-        ctx.stroke();
-        ctx.fillText(String(c.s), x, y);
+    for (const c of cells) {
+      if (!shown(c)) {
+        fills.add(stateColour(p[c]), c);
+        continue;
       }
+      let colour: string;
+      if (HASHED.has(name)) colour = v[c] === 0 ? col.cell : hashed(v[c]);
+      else colour = heat(hi > lo ? Math.round(((v[c] - lo) / (hi - lo)) * LEVELS) / LEVELS : 0);
+      fills.add(colour, c);
+      if (p[c] !== OFF) inset.add(stateColour(p[c]), c);
     }
   }
-  readout();
+  fills.draw();
+  inset.draw();
+  if (size > 6) {
+    ctx.strokeStyle = col.edge;
+    ctx.lineWidth = 0.5;
+    hexes(cellList, s, () => ctx.stroke());
+  }
+  readoutDirty = true;
 }
 
-const ringCache = new Map<Board, Set<number>>();
-function isRingCell(i: number): boolean {
-  let set = ringCache.get(board);
-  if (!set) {
-    set = new Set(board.cells.filter((c) => {
-      for (let d = 0; d < 6; d++) {
-        const j = board.neighbours[c * 6 + d];
-        if (j < 0 || !board.inside[j]) return true;
-      }
-      return false;
-    }));
-    ringCache.set(board, set);
-  }
-  return set.has(i);
-}
+// ── Readout ─────────────────────────────────────────────────────────────────
+
+let frames = 0;
+let stepsDone = 0;
+let fps = 0;
+let stepsPerSec = 0;
+let rateFrom = performance.now();
 
 function readout(): void {
-  // Read straight off the cells: the east corner holds T; roots hold their region's count.
-  let T = 0;
-  const roots: number[] = [];
-  let enclosed = 0;
-  for (const i of board.cells) {
-    const c = cellView(i);
-    if (isRingCell(i)) T = Math.max(T, c.tot);
-    if (!c.wall && c.lab !== NONE && c.d === 0) roots.push(c.s);
-    if (!c.wall && c.lab === NONE) enclosed++;
-  }
-  const state = check ? `settled at step ${settledAt}` : `settling (${ca.changed} cells changed)`;
+  readoutDirty = false;
+  const run = ca.ch[RUN][root];
+  let filled = 0;
+  for (const c of field.topo.cells) if (ca.ch[STATE][c] === FILLED) filled++;
   const ref = !check
     ? '<span class="pill wait">wait</span>'
     : check.ok ? '<span class="pill good">matches</span>' : '<span class="pill bad">differs</span>';
+  const lat = latency !== null ? `${latency} steps`
+    : pending ? `waiting (${ca.generation - pending.from})` : '—';
   const rows: Array<[string, string]> = [
     ['Step', String(ca.generation)],
-    ['State', state],
-    ['Open border T', String(T)],
-    ['Border regions', roots.length ? roots.sort((a, b) => b - a).join(' · ') : '—'],
-    ['Walled-in cells', String(enclosed)],
-    ['Filled', check ? `${filledCells(ca).size} / ${check.want}` : String(filledCells(ca).size)],
-    ['Reference', ref],
+    ['Active', `${ca.active} / ${field.N}`],
+    ['Changed', String(ca.changed)],
+    ['FPS', String(fps)],
+    ['Steps/s', String(stepsPerSec)],
+    ['Root run / K', `${run} / ${field.K}`],
+    ['Commit latency', lat],
+    ['Filled', String(filled)],
+    ['Oracle', ref],
   ];
   $('readout').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+
+  let status: string;
+  if (seek) status = `Stepping to the next commit… (${SEEK_MAX - seek.left} steps)`;
+  else if (pending) status = `Settling: the root has seen <b>${run}</b> of ${field.K + 1} quiet steps it needs to commit.`;
+  else if (check && !check.ok) status = 'Quiet, but not the right answer: garbage that agrees with itself survives. Press Bump.';
+  else if (check) status = `Settled: <b>${check.filled}</b> cells filled. Drag to draw; right-drag erases.`;
+  else if (latency !== null) status = 'Certified: the commit spreads out from the root, a cell per step.';
+  else status = 'Drag to draw a line; close a loop and its inside fills.';
+  $('status').innerHTML = status;
+}
+
+function legend(): void {
+  const sw = (colour: string, label: string) =>
+    `<span><i class="sw" style="background:${colour}"></i>${label}</span>`;
+  const items: Record<View, string[]> = {
+    state: [sw('var(--line)', 'line'), sw('var(--wall)', 'wall'), sw('var(--flood)', 'filled'), sw('var(--cell)', 'off')],
+    diff: [sw('var(--pulse)', 'want ≠ state'), sw('var(--flood)', 'filled (dimmed)')],
+    epoch: [sw('var(--accent)', 'newest epoch'), sw('var(--cell)', 'older, fading with age')],
+    channel: HASHED.has(NAMES[shownChannel])
+      ? ['ids hashed to hues', sw('var(--cell)', '0')]
+      : [sw(heat(0), 'board minimum'), sw(heat(1), 'maximum')],
+  };
+  $('legend').innerHTML = items[view].join('');
 }
 
 // ── Loop and controls ───────────────────────────────────────────────────────
@@ -319,28 +432,63 @@ let acc = 0;
 function frame(now: number): void {
   const dt = Math.min(100, now - last);
   last = now;
-  if (playing) {
+  const t0 = performance.now();
+  if (seek) {
+    let n = 0;
+    while (seek && n < FRAME_STEPS && performance.now() - t0 < FRAME_MS) {
+      advance();
+      n++;
+      seek.left--;
+      // Done when the root commits, when nothing is left to change, or at the cap.
+      if (ca.ch[COMMIT][root] !== seek.from || ca.active === 0 || seek.left <= 0) seek = null;
+    }
+  } else if (playing) {
     acc += (dt * settings.speed) / 1000;
     let n = 0;
-    while (acc >= 1 && n < 2000) {
-      step();
+    while (acc >= 1 && n < FRAME_STEPS && performance.now() - t0 < FRAME_MS) {
+      advance();
       acc -= 1;
       n++;
     }
+    // Capped this frame: drop the backlog rather than spiral.
     if (acc > 1) acc = 1;
-    if (n) draw();
   }
+  frames++;
+  if (now - rateFrom >= 1000) {
+    fps = Math.round((frames * 1000) / (now - rateFrom));
+    stepsPerSec = Math.round((stepsDone * 1000) / (now - rateFrom));
+    frames = 0;
+    stepsDone = 0;
+    rateFrom = now;
+    readoutDirty = true;
+  }
+  if (dirty) draw();
+  if (readoutDirty) readout();
   requestAnimationFrame(frame);
 }
 
 function setPlaying(on: boolean): void {
   playing = on;
-  $('play').textContent = playing ? 'Pause' : 'Play';
+  $('play').textContent = playing ? 'Pause' : 'Run';
+}
+
+function setTool(t: Tool): void {
+  tool = t;
+  $<HTMLInputElement>(`tool-${t}`).checked = true;
+}
+
+function setView(v: View): void {
+  view = v;
+  $<HTMLInputElement>(`view-${v}`).checked = true;
+  legend();
+  dirty = true;
 }
 
 function bindSlider(id: 'radius' | 'speed', onChange?: () => void): void {
   const input = $<HTMLInputElement>(id);
   const out = $(id + 'Out');
+  input.value = String(settings[id]);
+  out.textContent = input.value;
   input.addEventListener('input', () => {
     settings[id] = Number(input.value);
     out.textContent = input.value;
@@ -348,67 +496,91 @@ function bindSlider(id: 'radius' | 'speed', onChange?: () => void): void {
   });
 }
 
-bindSlider('radius', () => newField(false));
+bindSlider('radius', newField);
 bindSlider('speed');
+$<HTMLSelectElement>('preset').addEventListener('change', (ev) => {
+  settings.preset = (ev.target as HTMLSelectElement).value as Preset;
+  newField();
+});
 $('play').addEventListener('click', () => setPlaying(!playing));
 $('step').addEventListener('click', () => {
   setPlaying(false);
-  step();
-  draw();
+  seek = null;
+  advance();
 });
-$('random').addEventListener('click', () => {
-  rand = rng((Math.random() * 2 ** 32) >>> 0);
-  newField(true);
+$('toCommit').addEventListener('click', () => {
+  setPlaying(false);
+  seek = { from: ca.ch[COMMIT][root], left: SEEK_MAX };
+  dirty = true;
 });
-$('clear').addEventListener('click', () => {
-  for (const i of board.cells) setWall(ca, i, false);
-  touched();
-  draw();
+$('loop').addEventListener('click', () => {
+  const p = ca.ch[PAINT];
+  const blocked = new Set<number>();
+  for (const c of field.topo.cells) if (p[c] !== OFF) blocked.add(c);
+  const loop = randomLoop(field.board, rng((Math.random() * 2 ** 32) >>> 0), { blocked });
+  if (loop) edit(loop, ON);
 });
+$('clear').addEventListener('click', () => edit(field.topo.cells, OFF));
 $('scramble').addEventListener('click', () => {
-  // Garbage in every field but the walls: the rule has to recover on its own.
-  const { N, P } = ca.consts;
-  const int = (n: number) => Math.floor(Math.random() * n);
-  for (const i of board.cells) {
-    ca.layers[IDX][i] = int(P + 1);
-    ca.layers[CNT][i] = int(P + 1);
-    ca.layers[TOT][i] = int(P + 1);
-    ca.layers[LAB][i] = Math.random() < 0.2 ? NONE : int(P);
-    ca.layers[D][i] = int(N + 1);
-    ca.layers[PAR][i] = int(7) - 1;
-    ca.layers[S][i] = int(P + 1);
-    ca.layers[V][i] = int(2);
-    ca.layers[FILL][i] = int(2);
+  scramble(ca, Math.random);
+  touched(null);
+});
+$('bump').addEventListener('click', () => {
+  const next = { serial: ca.generation + 1, from: ca.generation };
+  bump(ca);
+  touched(next);
+});
+for (const t of ['on', 'erase', 'wall'] as const) {
+  $<HTMLInputElement>(`tool-${t}`).addEventListener('change', () => setTool(t));
+}
+for (const v of ['state', 'diff', 'epoch', 'channel'] as const) {
+  $<HTMLInputElement>(`view-${v}`).addEventListener('change', () => setView(v));
+}
+const channelSel = $<HTMLSelectElement>('channelSel');
+channelSel.innerHTML = NAMES.map((name, c) => `<option value="${c}"${c === shownChannel ? ' selected' : ''}>${name}</option>`).join('');
+channelSel.addEventListener('change', () => {
+  shownChannel = Number(channelSel.value);
+  setView('channel');
+});
+window.addEventListener('keydown', (ev) => {
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  const keyTool: Record<string, Tool> = { '1': 'on', '2': 'erase', '3': 'wall' };
+  if (keyTool[ev.key]) {
+    ev.preventDefault();
+    setTool(keyTool[ev.key]);
+  } else if (ev.key === ' ' && !(ev.target as HTMLElement).closest('button, select, input')) {
+    // Space on a focused control is that control's own.
+    ev.preventDefault();
+    setPlaying(!playing);
   }
-  touched();
-  draw();
 });
-for (const tool of ['paint', 'erase'] as const) {
-  $<HTMLInputElement>(`tool-${tool}`).addEventListener('change', () => {
-    eraser = tool === 'erase';
-  });
-}
-const layerSel = $<HTMLSelectElement>('layerSel');
-layerSel.innerHTML = LAYERS.map((name, L) => `<option value="${L}"${L === LAB ? ' selected' : ''}>${name}</option>`).join('');
-layerSel.addEventListener('change', () => {
-  shownLayer = Number(layerSel.value);
-  view = 'layer';
-  $<HTMLInputElement>('view-layer').checked = true;
-  draw();
-});
-for (const v of ['fill', 'fields', 'layer'] as const) {
-  $<HTMLInputElement>(`view-${v}`).addEventListener('change', () => {
-    view = v;
-    draw();
-  });
-}
 new ResizeObserver(() => {
-  if (!board) return;
+  if (!field) return;
   layout();
-  draw();
+  dirty = true;
 }).observe(canvas);
-window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => draw());
-new MutationObserver(() => draw()).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
+  legend();
+  dirty = true;
+});
+new MutationObserver(() => {
+  legend();
+  dirty = true;
+}).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
-newField(true);
+// For the console and headless checks: the automaton, and where a cell is on screen.
+Object.assign(window, {
+  hexca: {
+    get ca() { return ca; },
+    get field() { return field; },
+    /** Client coordinates of the cell at axial (q, r). */
+    point(q: number, r: number): [number, number] {
+      const rect = canvas.getBoundingClientRect();
+      return [rect.left + ox + size * SQ3 * (q + r / 2), rect.top + oy + size * 1.5 * r];
+    },
+  },
+});
+
+newField();
+legend();
 requestAnimationFrame(frame);

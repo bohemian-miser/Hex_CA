@@ -15,4 +15,6 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+        env:
+          FUZZ_SEEDS: '200'
       - run: npm run build

@@ -1,143 +1,273 @@
 # Hex_CA
-Experimenting with cellular automata as the foundation for the spectacle  game hexagon.rodeo 
 
-**Live demo:** https://bohemian-miser.github.io/Hex_CA/ — drag to paint walls.
+Experimenting with cellular automata as the foundation for the Spectacle
+game hexagon.rodeo.
+
+**Live demo:** https://bohemian-miser.github.io/Hex_CA/ — drag to draw a
+line, right-drag to erase, paint walls, close a loop or bridge and watch the
+inside fill.
 
 ## Inside, as a cellular automaton
 
-Walls are painted on a hexagon-shaped field: any cells, in any order, a piece
-at a time, added or erased whenever you like. The walls cut the field into
-regions (6-connected groups of non-wall cells). A region is **inside**, and
-fills, when it holds less than half of the open border:
+A **field** is a 6-connected set of hexagon cells (a hexagon of radius R by
+default, or any ragged subset). Every other cell is **dead**: never
+updated, always read as a fixed value. On the field you paint a **picture**:
+`OFF` (empty), `ON` (a line) or `WALL`. The rule turns that into a **state**
+for every cell: `ON`/`WALL` as painted, or `FILLED`/`OFF` for the rest.
 
-    fill(region) ⇔ 2·b < T     b = the region's open border cells (border cells that aren't walls)
-                                T = open border cells on the whole field
+    fill(region) ⇔ !edge(region) || size(region) < M
 
-- **A circuit:** a region walled off from the border has b = 0, so it always fills.
-- **A bridge:** a wall from edge to edge splits the open border into two arcs,
-  and the side of the shorter arc fills.
-- **A tie:** two equal halves both stay empty.
+- **A region** is a 6-connected group of `OFF` cells.
+- **Exterior** is every dead cell, plus any `WALL` cell 6-connected to a dead
+  cell through other `WALL` cells — the **rim**. A wall drawn in from the
+  edge of the field carries the outside in with it; a wall island sitting
+  alone in the middle does not.
+- **edge(region)** holds when some cell of the region touches the exterior.
+  `M` is the largest size among regions that do.
+- **A loop:** walled off from the exterior (`edge` false) — always fills,
+  whatever its size, however nested or however much of the field it
+  encloses.
+- **A bridge:** a line from edge to edge of the field splits the exterior
+  into two regions; the smaller one fills.
+- **The tie rule:** every edge region of exactly size `M` stays `OFF` — a
+  bridge that halves the field fills neither side. A region smaller than `M`
+  fills even when another region ties for the largest.
 
-At most one region can hold half or more of the open border, and that one is
-the outside. The fill depends only on the walls there are now, not on the
-order they were painted in or when.
+The fill depends only on the picture there is now, never on the order it was
+painted in, and painting is piecewise: add or erase any cells, in any order,
+a few at a time, whenever you like.
 
 ### The rule
 
-The state is a stack of integer **layers**, one value per cell per layer.
-Each step, for every cell at once:
+`src/engine.ts` is the generic engine: named integer channels in a few
+kinds, a radius-1 kernel (self plus six neighbours, any order), one `update`
+called for every field cell. It knows nothing about fills or walls.
+`src/fill.ts` is the rule: 22 channels across five kinds.
 
-1. **Perceive.** Every layer is read through the same kernel bank: the cell
-   itself and its six neighbours (taps E, NE, NW, W, SW, SE). These seven taps
-   per layer are all a cell ever sees.
-2. **Update.** One rule maps that perception to the cell's new value in every
-   layer.
-
-`src/engine.ts` is the generic engine: it holds the layers, applies the kernel
-bank and calls the rule, and knows nothing about walls or fills. Cells past
-the edge hold fixed values. The host may write only the rule's input layers.
-`src/inside.ts` is the rule: the layer list and the update.
-
-The only input is the `wall` layer and the output is `fill`; the rest are
-hidden layers. N is the number of cells, P the number of border cells.
-
-| Layer | Update, from the kernel taps | Values |
+| kind | channels | what |
 |---|---|---|
-| `out` | Fixed: 1 past the edge, 0 on the board. A border cell reads its `out` taps to find `prev`, the tap just before its run of outside neighbours going anticlockwise. | bit |
-| `wall` | Input: written by the host, never by the rule. | bit |
-| `idx` | 0 at the east corner (outside exactly at taps 5, 0, 1), else `idx(prev) + 1`. The cell's position round the border. | 0…P |
-| `cnt` | `open + cnt(prev)`, restarting at the east corner. Open border cells so far. | 0…P |
-| `tot` | At the east corner `cnt(prev)`, which is the total T; elsewhere `tot(prev)`. | 0…P |
-| `lab`, `d` | Lexicographic min-plus: `min( (idx, 0) if an open border cell, (lab_k, d_k + 1) over non-wall taps k )`, with `d` capped at N. | 0…P or none; 0…N |
-| `par` | The first tap with the same label and `d − 1`. | tap or none |
-| `s` | `open + Σ s(k)` over taps k whose `par` points back here. Open border cells in my subtree. | 0…P |
-| `v` | At the root (`d = 0`), `2·s < tot`; elsewhere `v(par)`. | bit |
-| `fill` | `not wall and (lab = none or v)` | bit |
+| const | `field id gpar area` | field membership; a random id 1…N; the static-tree parent's id; size weight (1) |
+| input | `paint stamp` | the picture; the edit's serial |
+| hidden | `epoch rim redge leader dist rpar cdone sub rsize` | the watched system below |
+| gate | `gmax M qt run commit` | the certificate |
+| out | `want state` | the unlatched answer; what is drawn |
 
-**What each layer is for:**
-- `lab` names a region by its smallest border position, and `d` is the
-  distance to that cell. Together they also detect a walled-in region: a label
-  whose source has been cut off has no cell holding `d = 0`, so its `d` counts
-  up to the cap and it dies. A region with no border keeps no label at all.
-- `par` makes each region a spanning tree, rooted at its label's source.
-- `s` counts that region's open border cells up the tree, so the root learns b.
-- `v` is the root's verdict, copied down the tree to every cell in the region.
+The update, in prose, per field cell per step:
 
-**Is it a cellular automaton?** Yes: it is uniform, synchronous,
-deterministic, and reads only radius-1 kernel taps. The input is one layer,
-and the host never writes any other.
+1. **Epoch reset.** `epoch` is a max-flood of itself and every neighbour's
+   `stamp`/`epoch`. A cell whose epoch just rose is **fresh**; taps still on
+   an older epoch are invisible to it (not refuted — just not read). This is
+   the whole "reset": there is no explicit clearing step, so an edit mid-way
+   through a settle is simply absorbed into the wave.
+2. **Rim and region flood.** `rim` floods through `WALL` cells from the dead
+   ring. On `OFF` cells, `redge` floods from any tap that is `rim` (or, with
+   `wallsBound`, any `WALL` tap at all) or already `redge` — "this region
+   touches the exterior."
+3. **Leader flood and size convergecast.** Each `OFF` cell keeps the
+   largest `id` reachable through same-epoch `OFF` taps as its region's
+   `leader`, with a BFS `dist` to it and a parent `rpar` one step closer
+   (ties broken by id, so the flood is tap-order-free). Once a cell's
+   `leader`/`dist`/`rpar` stop changing (`settled`) and all its tree
+   children report `cdone`, it sums its own weight and theirs into `sub`;
+   `rsize` is that sum read back down from the parent, so the whole region
+   agrees on one size.
+4. **Static-tree gate.** `gpar` is a *second*, fixed spanning tree over the
+   field (not the per-region one) used only to certify quiet. A cell is
+   `qt` once nothing watched has changed and every static child is `qt`
+   too; the root's `run` counts consecutive quiet steps and **fires** at
+   `run == K + 1` (`K` = the field's radius in the static tree) — by then
+   every watched channel has been at its true fixed point, everywhere, for
+   at least `K` steps straight. On fire the root reads a lagged, unwatched
+   maximum of edge-region sizes up its static tree as `M`, and commits
+   `commit = epoch`. Every other cell inherits `commit`/`M` from its static
+   parent, so both reach a cell exactly `depth(cell)` steps after the root.
+5. **Latch.** A cell shows `FILLED` only while `commit == epoch`: its own
+   fixed-point `rsize`/`redge` compared against the certified `M`. A cell
+   whose epoch a newer edit has already moved past keeps showing its last
+   latch instead of a half-settled one.
 
-- **Absolute directions.** They appear in exactly two places: the east corner
-  anchors the border numbering, and `par` breaks ties by lowest direction.
-  Neither changes the answer; the tests check that a rotated picture gives the
-  rotated fill.
-- **State size.** It is not finite in the strict, board-independent sense:
-  the counters go up to N and P, so a cell holds O(log N) bits. That is the
-  price of a rule that is static and recovers from any state.
-  - An event-driven version with constant state can't tell a wall painted
-    long ago from one painted just now. That is exactly how drawing a circuit
-    in two halves broke the earlier version.
+### Settling, the bound, and the no-overshoot invariant
 
-### Settling
+Because each channel is the unique fixed point of its formula given the
+channels above it (§5 of `DESIGN.md` spells out the induction), the whole
+stack converges from **any** starting state — "Scramble" in the demo fills
+every hidden/gate/out channel with garbage to show this; "Bump" re-stamps
+the root with a fresh epoch and the same picture, which is what actually
+makes recovery certain (garbage that shares the current epoch can outlive
+it: `tests/garbage.test.ts` pins that a bump always recovers, and that a
+board left unbumped recovers only most of the time).
 
-Each hidden layer is a fixed point of its update, given the layers above it
-in the table. So the stack settles to the same answer from **any** starting
-state, and a wall painted or erased mid-way is simply absorbed. "Scramble
-state" in the demo fills every hidden layer with garbage to show it, and the
-layer picker shows any single layer as a heat map.
+A cell's commit is bounded by the epoch wave, the region's own radius, the
+wall flood (if any), and the static-tree depth and gate margin:
 
-After the last change, settling takes:
+    T_commit(c) ≤ t₀ + Dw + max(3·Er, Wd + 2·Er) + 2K + depth(c) + 3
 
-1. about P steps for the border numbering and count;
-2. up to N steps for a cut-off label to count up and die;
-3. twice the region's depth for `s` and `v`.
+which on a hexagon works out to about `11R + 3` steps after the last edit —
+roughly 5.5× the field's diameter, down from an earlier design's ~127·R
+(see "What changed" below). `settleBound()` in `src/oracle.ts` computes this
+exactly from a field and the edited cells, and every test that waits for a
+settle checks the real commit step against it rather than against a fixed
+step count.
 
-Step 2 is the slow one: a circuit fills about N steps after it closes (about
-600 steps at radius 14). Each step is cheap (about 0.2 ms at radius 14 in
-JavaScript), so the demo runs hundreds of steps per frame.
+Measured on a Raspberry Pi 5 (`npm run bench` at R = 20, 40, 80; the
+R = 6…40 series from the review's scaling runs, with straight rows and
+regular loops):
+
+- **Boot** (empty field, nothing painted) to full quiet: 49, 94, 115, 172,
+  250, 349 steps at R = 6, 10, 14, 20, 28, 40, and 676 at R = 80 — the boot
+  is the *tightest* case of the bound (`Dw = 0`), so it lands within a step
+  or two of it.
+- **A closed loop or bridge**, painted all but its last cell then closed, to
+  every cell's commit: 48–61, 90–103, 109–133, 172–194, 267–281, 352–413
+  steps at R = 6…40 — about 10·R. Random, wigglier shapes make longer,
+  thinner regions and take longer: in `npm run bench` the root commits the
+  closing cell at 168–186 steps (R = 20), 307–368 (R = 40) and 609–675
+  (R = 80), each 10–25 % inside its own picture's `settleBound`; the bound is
+  per picture, not a fixed multiple of R.
+- **Per-step cost**: 0.08–1.13 ms raw per step while settling (R = 6…40, on
+  the active set, not the whole board) — about 1.4 µs per cell computed, 3–4
+  µs per cell that actually changed; a settled board costs well under 1 µs a
+  step (`active == 0`, nothing to do).
+
+**No-overshoot invariant**, checked every step of every fuzz/overshoot test,
+not just at quiet: a cell shown `FILLED` is always the oracle's answer for
+*some* picture that genuinely existed, and a given cell flips `FILLED` at
+most once per edit. The cost of that guarantee: after an erase, the old
+fill stays exactly as it was until the next commit reaches that cell — it
+doesn't flicker through a wrong intermediate state, but it also doesn't
+disappear instantly.
+
+### Host contract
+
+An edit's `stamp` must be `generation + 1` — the number of the step that
+will absorb it — so that every change between two steps shares one serial
+and serials strictly increase across steps. `paint()` enforces this; nothing
+else is sound (reusing a serial across a whole stroke lets a cell already on
+that epoch read new paint without going fresh, and settling degrades to
+roughly N steps — measured about 7× slower at R = 20). The same rule is
+meant to carry forward: anything that edits the board from inside the CA
+later (§10 of `DESIGN.md`, line growth) stamps with `u.step`, not a value of
+its own choosing.
+
+### The active-set engine
+
+`CA.step()` only recomputes the slots on its active list — every slot some
+channel of which changed last step, plus each slot's own field taps — and
+every read in a step sees the *pre-step* state (writes are buffered and
+applied after the pass), so it is bit-identical to `stepFull()`, which
+recomputes the whole field every time and exists as the reference sweep.
+`write()` adds a slot and its taps to the active list whether or not the
+value actually changes. A settled board has an empty active list and `step`
+costs nothing; `tests/engine.test.ts` runs both sweeps, and a third copy
+with a randomised per-slot tap order, in lockstep against the same edit
+stream and checks every channel agrees at every step.
 
 ### Run it
 
 ```bash
 npm install
-npm test         # vs. a whole-board reference: random wall pictures, a circuit drawn in two
-                 # halves, bridges painted in random order, edits mid-settle (adding and
-                 # erasing, several per step), recovery from garbage state, rotation
+npm test          # vitest: oracle pictures, the CA against the oracle, fuzz streams with a
+                  # per-step latch check, overshoot, engine lockstep twins, scramble+bump
+                  # recovery, rotation (FUZZ_SEEDS=200 for CI's longer run)
 npm run typecheck
-npm run build    # → dist/index.html, the demo (open it directly)
+npm run build     # → dist/index.html, the demo (open it directly)
+npm run bench     # settle steps / ms / µs-per-update at R = 20, 40, 80 (not a test)
 ```
 
-The reference (`expectedFill`) does the same job over the whole board: it
-finds the regions, counts b and T, and fills when `2·b < T`. Breaking the
-rule's tie test, its label cap or its verdict copy each makes the tests fail.
+The reference (`src/oracle.ts`) computes §4's predicate directly over the
+whole field — the regions, which touch the exterior, the tie at `M` — with
+no CA involved, and `settleBound()` computes the bound above by BFS. Both
+are the thing the CA's fuzz tests check against on every step, not just at
+the end.
 
-Every push to `main` runs the typecheck and tests, builds the demo and deploys
-it to GitHub Pages. Pull requests run the same checks without deploying.
+Every push to `main` runs the typecheck, tests and build, and deploys the
+demo to GitHub Pages. Pull requests run the same checks without deploying.
 
 ### Layout
 
 ```
-src/hex.ts     hexagon board, axial coords, direction-indexed neighbours, border ring (for checks only)
-src/engine.ts  the generic layered CA: layers, the hex kernel bank, one update per cell
-src/inside.ts  the rule: the layer list and the update (input `wall`, output `fill`)
-src/lines.ts   random walls (bridges, loops, scribbles, specks) and the reference fill
-tests/         vitest
-web/           the demo page (page.html + main.ts), bundled by scripts/build-web.ts
-.github/       CI on pull requests; build and deploy to Pages from main
+src/hex.ts      hexagon board, axial coords, direction-indexed neighbours
+src/engine.ts   the generic channel CA: ChannelSpec/Rule/Topology, active set, stepFull
+src/field.ts    Field: masks, the static tree, ids, wall presets (hexagon/blob/lobes/ring)
+src/fill.ts     the rule: channels, update, paint/bump/scramble, stateOf
+src/oracle.ts   the reference predicate and settleBound
+src/lines.ts    random pictures for tests and the demo (loops, bridges, scribbles, walls)
+tests/          vitest: oracle, fill, fuzz, overshoot, engine, field, garbage, rotate
+web/            the demo page (page.html + main.ts), bundled by scripts/build-web.ts
+scripts/bench.ts  settle steps / ms / µs-per-update at three field sizes
+.github/        CI on pull requests; build and deploy to Pages from main
 ```
+
+### The demo
+
+Draw with the **Line** tool (left-drag), **Erase** (right-drag, clears both
+`ON` and `WALL`) or **Wall**; keys `1`/`2`/`3` switch tools. **Random loop**
+drops a closed line for a quick look. **Radius** (4–60) and **Preset**
+(hexagon / blob / lobes / ring, as wall pictures) rebuild the field;
+**Clear**, **Scramble** and **Bump** act on it as described above.
+**Play/Pause** (space), **Step** and **Step to commit** control playback at
+the **Steps/s** rate. **View** switches the board between the drawn state,
+a want-vs-state diff, the epoch wave, or any single channel as a heat map.
+The **readout** shows generation, active/changed cells, FPS and steps/s,
+the root's quiet run against `K`, commit latency since the last edit, the
+filled count, and an oracle ✓/✗ once the board is quiet.
+
+### Known limits
+
+- **The gate is global.** Any edit anywhere restarts the quiet count for the
+  whole field, so nothing fills while anything is still being drawn — the
+  bound counts from the *last* edit, not the first. At R = 20 a loop alone
+  fills in 162 steps; the same loop with a distant cell painted every 120
+  steps takes 3789. Fine for painting by hand; a game with lines growing
+  continuously needs the gate to work per-region instead (see "Open
+  questions").
+- **Erasing doesn't un-fill instantly.** A cell that was correctly `FILLED`
+  stays `FILLED` until the next commit reaches it, even once the picture
+  that justified it is gone — the no-overshoot invariant only promises no
+  cell is ever shown filled for a picture that *never* existed, not that
+  the display is live.
+- **Spiral regions are the worst case.** A region whose leader is reached
+  by a long, narrow path has `Er ≈ size / width`, which the bound (and real
+  settle time) scales with directly — any flood-based scheme pays this.
+
+### What changed from the earlier, min-plus-border design
+
+The previous rule (kept in `DESIGN.md` §11 as the record of it, no longer
+in `src/`) numbered the hexagon's border starting from one fixed corner and
+had every region find its "openness" by flooding a label outward and then
+counting that label's open border cells up a spanning tree; a region cut off
+from its label source only discovered this by counting all the way up to N,
+so one closure cost on the order of N steps at N work apiece, while most of
+the board sat transiently `FILLED` in the meantime, and the border numbering
+only made sense on an unbroken hexagon edge. This design replaces that count
+with an **epoch**: a stale value is simply invisible rather than something
+that has to be refuted, which turns an O(N) death into an O(diameter) one;
+it names a region by the **largest id** in it instead of a border position,
+so masked, ragged or irregular fields need no border walk at all; it
+compares each region's size against the field's actual maximum through a
+convergecast and a certificate on a fixed static tree, rather than counting
+border cells specifically, so a wall and a line are "one thing" (anything
+that blocks); and what's shown is **latched** behind that certificate, so a
+half-settled board is never drawn as if it were finished.
 
 ### Open questions and next steps
 
-- **Faster death for cut-off labels.** A label counts up to N before it dies.
-  A retraction wave (a cell whose parent is gone tells its children at once)
-  would make it proportional to the region's depth. The risk is oscillation,
-  so it wants the same garbage-state tests.
-- **The game on top.** Spectacle's semantics are per line: rival lines are
-  captured rather than walled off, and each line claims its own shorter side.
-  They can be layered on as patterns and owners once this base is trusted.
-- **Irregular outlines.** Spectacle's hex field is a substitution patch, not a
-  hexagon. On a ragged outline a border cell can have more than two border
-  neighbours, so `next` and `prev` would need a wall-following rule.
-- **Length measure.** The border is measured in cells. Exposed edge length
-  (a corner cell has 3 outside edges, a side cell 2) would weight `open` by
-  the number of outside neighbours.
+- **Per-region gates.** The gate is global because quiet is checked once,
+  at the root. A loop's fill doesn't actually depend on the rest of the
+  field (its `redge` is 0 regardless of `M`), so only bridges truly need a
+  field-wide maximum — splitting the gate so loops certify locally, while
+  bridges still wait on the shared one, would let fills keep happening
+  while an unrelated part of the field is still being edited. This needs a
+  watched, *stable* per-region height channel to drive a local quiet count,
+  which is a design of its own (the earlier design's boot problem came from
+  almost exactly this).
+- **The game on top.** Spectacle's rules are per line, not per wall: rival
+  lines are captured rather than simply blocking, and each line claims only
+  its own shorter side rather than one shared fill. `DESIGN.md` §10 sketches
+  owners and patterns as extra input/region channels; building that out is
+  the next real step once this base — the fill rule alone, under fuzzing —
+  is trusted.
+
+### Licence
+
+AGPL-3.0-only — see `LICENSE`.

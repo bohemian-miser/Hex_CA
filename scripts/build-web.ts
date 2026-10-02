@@ -29,7 +29,7 @@ const doc = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="description" content="A local cellular-automaton rule on a hexagon field that floods the side of a line whose border arc is shorter.">
+<meta name="description" content="One local cellular-automaton rule on a hexagon field: the inside of every drawn loop fills, and so does the smaller side of every line from edge to edge.">
 <link rel="icon" href="data:image/svg+xml,${encodeURIComponent(ICON)}">
 ${page.slice(0, cut)}
 </head>
