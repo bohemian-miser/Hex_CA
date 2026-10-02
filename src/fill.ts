@@ -200,7 +200,7 @@ function update(P: Int32Array, out: Int32Array, u: Uniforms): void {
     out[RUN] = run;
     if (run === u.K + 1) {
       commit = e;
-      M = P[GMAX * TAPS];
+      M = gmax;
     }
   } else {
     out[RUN] = 0;
