@@ -1,0 +1,140 @@
+<title>Hex NCA Fill</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* The hand-written CA page's bench (web/page.html), cut down: board left, controls and readout right, channels under the board. */
+:root {
+  --bg: #eef1ee;
+  --panel: #f8faf8;
+  --fg: #1d2421;
+  --muted: #5d6a64;
+  --hair: #cdd6d1;
+  --accent: #0f7a66;
+  --cell: #ffffff;
+  --cell-edge: #c8d2cc;
+  --line: #1d2421;
+  --flood: #3fb59a;
+  --neg: #3d6fb3;
+  --pos: #c4572e;
+  --good: #1f8a4c;
+  --bad: #b8402f;
+  --display: "Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131816; --panel: #1a201d; --fg: #e3ebe6; --muted: #93a39b; --hair: #2c3631;
+    --accent: #4fd1b0; --cell: #222a26; --cell-edge: #36423c; --line: #f2f6f3; --flood: #2f9c83;
+    --neg: #6f9fe0; --pos: #ec8a5e; --good: #5cc98a; --bad: #ef7a64; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131816; --panel: #1a201d; --fg: #e3ebe6; --muted: #93a39b; --hair: #2c3631;
+  --accent: #4fd1b0; --cell: #222a26; --cell-edge: #36423c; --line: #f2f6f3; --flood: #2f9c83;
+  --neg: #6f9fe0; --pos: #ec8a5e; --good: #5cc98a; --bad: #ef7a64; color-scheme: dark;
+}
+html, body { background: var(--bg); color: var(--fg); }
+body { margin: 0; font: 15px/1.5 var(--body); padding-inline: 16px; padding-block: 20px 40px; }
+.wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 20px; }
+header { display: grid; gap: 4px; }
+h1 { font: 700 clamp(26px, 4vw, 38px)/1.05 var(--display); letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
+header p { margin: 0; color: var(--muted); max-width: 70ch; }
+a { color: var(--accent); }
+/* The channel tiles sit under the board, or under the controls on a narrow screen. */
+.bench { display: grid; grid-template-columns: minmax(0, 1fr) 300px; grid-template-areas: "stage side" "channels side"; gap: 20px; align-items: start; }
+@media (max-width: 820px) { .bench { grid-template-columns: minmax(0, 1fr); grid-template-areas: "stage" "side" "channels"; } }
+.stage-col { grid-area: stage; }
+.side { grid-area: side; }
+.channels { grid-area: channels; }
+.stage-col { display: grid; gap: 8px; min-width: 0; }
+.status { font: 500 14px/1.4 var(--body); min-height: 1.4em; }
+.status b { color: var(--accent); font-weight: 500; }
+.stage { position: relative; background: var(--panel); border: 1px solid var(--hair); border-radius: 6px; aspect-ratio: 1 / 0.92; max-width: 100%; min-width: 0; }
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+.side { display: grid; gap: 16px; min-width: 0; }
+.group { display: grid; gap: 10px; min-width: 0; }
+.label { font: 500 11px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.09em; color: var(--muted); }
+.buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+button { font: 500 14px/1 var(--body); color: var(--fg); background: var(--panel); border: 1px solid var(--hair); border-radius: 4px; padding: 9px 12px; cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+button[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.views { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.slider { display: grid; grid-template-columns: 70px minmax(0, 1fr) 42px; align-items: center; gap: 8px; font-size: 13px; }
+.slider output { font: 400 13px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair); border-radius: 3px; padding: 0 4px; }
+dl.readout { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; font: 400 13px/1.35 var(--mono); font-variant-numeric: tabular-nums; border-top: 1px solid var(--hair); padding-top: 12px; }
+dl.readout dt { color: var(--muted); }
+dl.readout dd { margin: 0; text-align: right; }
+.pill { display: inline-block; padding: 2px 7px; border-radius: 999px; font: 500 12px var(--mono); border: 1px solid currentColor; }
+.pill.good { color: var(--good); } .pill.bad { color: var(--bad); }
+.verdict { border-top: 1px solid var(--hair); padding-top: 12px; min-height: 1.5em; }
+.verdict + dl.readout { border-top: 0; padding-top: 0; }
+.meta { margin: 0; font: 12px/1.45 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 12px; height: 12px; border-radius: 2px; border: 1px solid var(--hair); }
+.sw.dot { width: 6px; height: 6px; border-radius: 50%; border: 0; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; }
+.tile { display: grid; gap: 4px; padding: 5px; text-align: left; font: 12px/1.2 var(--mono); min-width: 0; }
+.tile canvas { display: block; width: 100%; aspect-ratio: 1 / 0.92; cursor: pointer; }
+.tile b { font-weight: 500; }
+.tile i { font-style: normal; color: var(--muted); }
+</style>
+<div class="wrap">
+  <header>
+    <h1>Fill, as a trained neural CA</h1>
+    <p>Paint walls on the hexagon field. Every cell runs the same small neural network on itself and its six neighbours, step after step; it was trained, not written, to make every enclosed region read 1 on its fill channel and everything else 0. The badge checks it against a flood fill done the ordinary way. <a href="index.html">Hand-written CA</a> · <a href="https://github.com/bohemian-miser/Hex_CA">Source on GitHub</a></p>
+  </header>
+
+  <div class="bench">
+    <div class="stage-col">
+      <div class="status" id="status"></div>
+      <div class="stage"><canvas id="board" aria-label="The hexagon field: drag to paint or erase walls"></canvas></div>
+    </div>
+    <div class="side">
+      <div class="group">
+        <div class="label">Draw</div>
+        <div class="views">
+          <label class="check"><input type="radio" name="tool" id="tool-wall" checked> Wall <kbd>1</kbd></label>
+          <label class="check"><input type="radio" name="tool" id="tool-erase"> Erase <kbd>2</kbd></label>
+        </div>
+        <div class="buttons">
+          <button id="loop">Random loop</button>
+          <button id="clear">Clear walls</button>
+        </div>
+        <label class="slider" for="radius">Radius <input type="range" id="radius" min="4" max="14" value="8"><output id="radiusOut">8</output></label>
+      </div>
+      <div class="group">
+        <div class="label">Run</div>
+        <div class="buttons">
+          <button id="play" class="primary">Pause</button>
+          <button id="step">Step</button>
+          <button id="reset">Reset state</button>
+        </div>
+        <label class="slider" for="speed">Steps/s <input type="range" id="speed" min="1" max="600" value="60"><output id="speedOut">60</output></label>
+        <label class="check"><input type="checkbox" id="resetOnEdit"> Reset state on every edit</label>
+      </div>
+      <div class="group">
+        <div class="label">Show</div>
+        <div class="buttons">
+          <button id="showFill" aria-pressed="true">Fill</button>
+        </div>
+        <div class="legend" id="legend"></div>
+      </div>
+      <div class="verdict" id="verdict" aria-live="polite"></div>
+      <dl class="readout" id="readout"></dl>
+      <p class="meta" id="meta"></p>
+    </div>
+    <div class="group channels">
+      <div class="label">Channels: click one to show it on the board</div>
+      <div class="tiles" id="tiles"></div>
+    </div>
+  </div>
+</div>
+<script>/*APP*/</script>
