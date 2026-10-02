@@ -224,44 +224,6 @@ function cheapestPath(
 }
 
 /**
- * The reference answer, computed over the whole board: split the non-wall
- * cells into regions, count each region's open border cells b and the
- * field's T, and fill every region with 2·b < T (a region with no border at
- * all always fills).
- */
-export function expectedFill(board: Board, walls: ReadonlySet<number>): Set<number> {
-  const ring = new Set(borderRing(board));
-  let T = 0;
-  for (const c of ring) if (!walls.has(c)) T++;
-  const fill = new Set<number>();
-  const seen = new Set<number>();
-  for (const start of board.cells) {
-    if (walls.has(start) || seen.has(start)) continue;
-    const region = [start];
-    seen.add(start);
-    for (let k = 0; k < region.length; k++) {
-      for (const w of neighboursOf(board, region[k])) {
-        if (walls.has(w) || seen.has(w)) continue;
-        seen.add(w);
-        region.push(w);
-      }
-    }
-    const b = region.filter((c) => ring.has(c)).length;
-    if (b === 0 || 2 * b < T) for (const c of region) fill.add(c);
-  }
-  return fill;
-}
-
-function neighboursOf(board: Board, i: number): number[] {
-  const out: number[] = [];
-  for (let d = 0; d < 6; d++) {
-    const j = board.neighbours[i * 6 + d];
-    if (j >= 0 && board.inside[j]) out.push(j);
-  }
-  return out;
-}
-
-/**
  * A random wall picture: a few bridges, loops and scribbles, some broken or
  * crossing, plus scattered single cells.
  */

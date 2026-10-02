@@ -1,126 +1,178 @@
-// A generic layered cellular automaton on a hex board.
+// A rule-agnostic cellular automaton on a slot array (DESIGN.md §6).
 //
-// The state is a stack of integer LAYERS (channels), one value per cell per
-// layer. One step, for every cell at once:
+// The state is a set of named integer CHANNELS, one Int32Array each
+// (structure of arrays: ch[c][slot]). One step, for every listed field slot
+// at once:
 //
-//   1. PERCEIVE. Each layer is read through the hex kernel bank: the cell
-//      itself (tap −1) and its six neighbours (taps 0…5: E, NE, NW, W, SW,
-//      SE). These seven taps are the only thing a cell ever sees.
-//   2. UPDATE. The rule maps that perception to the cell's new value in
-//      every layer. The same rule runs at every cell.
+//   1. GATHER. Every channel at the slot itself (tap 0) and at its six
+//      neighbours (taps 1…6), into P[c*7 + t]. These seven taps are all a
+//      cell ever sees, and the rule must not care in which order taps 1…6
+//      come (`tapOrder` shuffles them in tests to prove it).
+//   2. UPDATE. The rule maps P to the slot's new value in every channel.
 //
-// Cells past the edge of the board are fixed: they hold the rule's
-// `outside` values in every layer and never update. Layers listed in
-// `inputs` are the only ones the host may write; the rule passes them
-// through unchanged.
+// Every read sees the pre-step state: new values are buffered and applied
+// after the pass. So computing only the ACTIVE slots — those that changed
+// last step, their taps, and whatever the host wrote — is bit-identical to
+// the reference sweep over every field slot (`stepFull`).
 //
-// The engine knows nothing about walls or fills. The rule lives elsewhere.
+// Dead slots (isField 0) hold each channel's `dead` value and are never
+// updated or written. The engine never interprets a channel.
 
-import { Board } from './hex.js';
+export type ChannelKind = 'const' | 'input' | 'hidden' | 'gate' | 'out';
 
-/** What a cell sees: each layer through the hex kernel bank. */
-export interface Perception {
-  /** Layer `layer` at tap `k`: −1 = the cell itself, 0…5 = its neighbours. */
-  at(layer: number, k: number): number;
+export interface ChannelSpec {
+  name: string;
+  kind: ChannelKind;
+  /** GPU texture bank; the CPU engine ignores it. */
+  bank: number;
+  /** Value on a fresh field slot. */
+  init: number;
+  /** Value on every dead slot, forever. */
+  dead: number;
+  /** Part of the system whose fixed point the gate certifies; the engine ignores it. */
+  watch: boolean;
+}
+
+export interface Uniforms {
+  N: number;
+  CAP: number;
+  K: number;
+  /** generation + 1: the number of the step being computed. */
+  step: number;
+  wallsBound: 0 | 1;
 }
 
 export interface Rule {
-  /** Layer names, in order. */
-  readonly layers: readonly string[];
-  /** Layers the host writes (the rule leaves them alone). */
-  readonly inputs: readonly number[];
-  /** Each layer's value in cells past the edge of the board. */
-  readonly outside: readonly number[];
-  /** Each layer's value on a fresh board. */
-  readonly initial: readonly number[];
-  /** The update: write the cell's new value for every non-input layer into `out`. */
-  update(p: Perception, out: Int32Array, consts: Consts): void;
+  readonly channels: readonly ChannelSpec[];
+  /** P[c*7 + t]: channel c at tap t, 0 = self, 1..6 = taps in any order. out[c] holds self on entry. */
+  update(P: Int32Array, out: Int32Array, u: Uniforms): void;
 }
 
-/** Board-wide constants a rule may use (sizes, for caps on counters). */
-export interface Consts {
-  /** Number of cells on the board. */
-  N: number;
-  /** Number of border cells. */
-  P: number;
+export interface Topology {
+  /** Number of slots. */
+  size: number;
+  /** Every field slot. */
+  cells: Int32Array;
+  /** nbr[slot*6 + k]: slot's neighbour k (every field slot has all six in range). */
+  nbr: Int32Array;
+  isField: Uint8Array;
 }
 
-export class Automaton {
-  readonly board: Board;
+/** Taps per channel in P: self plus six neighbours. */
+const TAPS = 7;
+
+export class CA {
+  readonly topo: Topology;
   readonly rule: Rule;
-  readonly consts: Consts;
-  /** layers[L][i]: the value of layer L at slot i. */
-  layers: Int32Array[];
-  private nextLayers: Int32Array[];
+  /** The uniforms handed to the rule; `step` is set before every pass. */
+  readonly u: Uniforms;
+  /** SoA state, ch[c][slot]; dead slots hold `dead`. */
+  readonly ch: Int32Array[];
   generation = 0;
-  /** Cells whose state changed in the last step. */
+  /** Slots whose value changed in the last step. */
   changed = 0;
+  /** Slots listed for the next step. */
+  active = 0;
+  /** Tests only: per-slot tap permutation, tap t+1 reads neighbour tapOrder[slot*6 + t]. */
+  tapOrder: Int32Array | null = null;
 
-  constructor(board: Board, rule: Rule) {
-    this.board = board;
+  private readonly index = new Map<string, number>();
+  private readonly nCh: number;
+  /** Channels the rule may not change (const and input): restored after update. */
+  private readonly fixed: Int32Array;
+  private readonly P: Int32Array;
+  private readonly out: Int32Array;
+  /** The active list, and the one being stepped (swapped every step). */
+  private list: Int32Array;
+  private work: Int32Array;
+  /** 1 while a slot is in `list`, so it is listed once. */
+  private listed: Uint8Array;
+  /** Pending writes: (slot, value per channel) records, flat. */
+  private pending: Int32Array;
+
+  constructor(topo: Topology, rule: Rule, u: Omit<Uniforms, 'step'>, constants?: Record<string, ArrayLike<number>>) {
+    this.topo = topo;
     this.rule = rule;
-    this.consts = { N: board.cells.length, P: Math.max(1, 6 * board.radius) };
-    const make = () =>
-      rule.layers.map((_, L) => {
-        const a = new Int32Array(board.size);
-        for (let i = 0; i < board.size; i++) a[i] = board.inside[i] ? rule.initial[L] : rule.outside[L];
-        return a;
-      });
-    this.layers = make();
-    this.nextLayers = make();
-  }
+    this.u = { ...u, step: 1 };
+    const specs = rule.channels;
+    this.nCh = specs.length;
+    specs.forEach((s, c) => {
+      if (this.index.has(s.name)) throw new Error(`channel ${s.name} declared twice`);
+      this.index.set(s.name, c);
+    });
+    this.fixed = Int32Array.from(
+      specs.flatMap((s, c) => (s.kind === 'const' || s.kind === 'input' ? [c] : [])),
+    );
 
-  layer(name: string): number {
-    const L = this.rule.layers.indexOf(name);
-    if (L < 0) throw new Error(`no layer ${name}`);
-    return L;
-  }
-
-  get(name: string, i: number): number {
-    return this.layers[this.layer(name)][i];
-  }
-
-  /** The only way in: write an input layer at a cell on the board. */
-  setInput(name: string, i: number, value: number): void {
-    const L = this.layer(name);
-    if (!this.rule.inputs.includes(L)) throw new Error(`${name} is not an input layer`);
-    if (this.board.inside[i]) this.layers[L][i] = value;
-  }
-
-  step(): void {
-    const { board, rule, consts } = this;
-    const cur = this.layers;
-    const nxt = this.nextLayers;
-    const nb = board.neighbours;
-    const nLayers = cur.length;
-    const out = new Int32Array(nLayers);
-    const isInput = rule.layers.map((_, L) => rule.inputs.includes(L));
-    // Every board cell has all six neighbours in the padded array (past the
-    // edge they are outside cells holding the outside values), so a tap is
-    // one array read.
-    let base = 0;
-    let i = 0;
-    const p: Perception = {
-      at: (layer, k) => (k < 0 ? cur[layer][i] : cur[layer][nb[base + k]]),
-    };
-    let changed = 0;
-    for (const c of board.cells) {
-      i = c;
-      base = c * 6;
-      for (let L = 0; L < nLayers; L++) out[L] = cur[L][i];
-      rule.update(p, out, consts);
-      let diff = false;
-      for (let L = 0; L < nLayers; L++) {
-        const v = isInput[L] ? cur[L][i] : out[L];
-        if (v !== cur[L][i]) diff = true;
-        nxt[L][i] = v;
+    const { size, cells, nbr, isField } = topo;
+    for (const slot of cells) {
+      if (!isField[slot]) throw new Error(`cell ${slot} is not a field slot`);
+      for (let k = 0; k < 6; k++) {
+        const j = nbr[slot * 6 + k];
+        if (j < 0 || j >= size) throw new Error(`field slot ${slot} has no neighbour ${k}`);
       }
-      if (diff) changed++;
     }
-    this.layers = nxt;
-    this.nextLayers = cur;
-    this.generation++;
-    this.changed = changed;
+
+    this.ch = specs.map((s) => {
+      const a = new Int32Array(size);
+      for (let i = 0; i < size; i++) a[i] = isField[i] ? s.init : s.dead;
+      return a;
+    });
+    for (const [name, values] of Object.entries(constants ?? {})) {
+      const c = this.index.get(name);
+      if (c === undefined) throw new Error(`no channel ${name}`);
+      if (specs[c].kind !== 'const') throw new Error(`${name} is not a const channel`);
+      const a = this.ch[c];
+      for (const slot of cells) a[slot] = values[slot];
+    }
+
+    this.P = new Int32Array(this.nCh * TAPS);
+    this.out = new Int32Array(this.nCh);
+    this.list = new Int32Array(size);
+    this.work = new Int32Array(size);
+    this.listed = new Uint8Array(size);
+    this.pending = new Int32Array(Math.max(16, (this.nCh + 1) * 64));
+    // Everything is computed once before anything can be quiet.
+    for (const slot of cells) this.enlist(slot);
+  }
+
+  private channel(name: string): number {
+    const c = this.index.get(name);
+    if (c === undefined) throw new Error(`no channel ${name}`);
+    return c;
+  }
+
+  get(name: string, slot: number): number {
+    return this.ch[this.channel(name)][slot];
+  }
+
+  /** The only way in: an 'input' channel at a field slot. Activates the slot and its taps. */
+  write(name: string, slot: number, v: number): void {
+    const c = this.channel(name);
+    if (this.rule.channels[c].kind !== 'input') throw new Error(`${name} is not an input channel`);
+    if (!(slot >= 0 && slot < this.topo.size) || !this.topo.isField[slot]) return;
+    this.ch[c][slot] = v;
+    this.enlistWithTaps(slot);
+  }
+
+  /** One step over the active slots. */
+  step(): void {
+    // Take the list; marks go so the next list can be built from scratch.
+    const work = this.list;
+    const n = this.active;
+    this.list = this.work;
+    this.work = work;
+    for (let i = 0; i < n; i++) this.listed[work[i]] = 0;
+    this.active = 0;
+    this.pass(work, n);
+  }
+
+  /** One step over every field slot: the reference sweep. */
+  stepFull(): void {
+    for (let i = 0; i < this.active; i++) this.listed[this.list[i]] = 0;
+    this.active = 0;
+    const cells = this.topo.cells;
+    this.pass(cells, cells.length);
   }
 
   /** Step until nothing changes (or `max` steps). Returns steps taken. */
@@ -129,5 +181,73 @@ export class Automaton {
     do this.step();
     while (this.changed > 0 && this.generation - start < max);
     return this.generation - start;
+  }
+
+  /** Compute `n` slots of `slots` against the pre-step state, then apply and list the changes. */
+  private pass(slots: Int32Array, n: number): void {
+    const { ch, nCh, P, out, fixed, rule } = this;
+    const nbr = this.topo.nbr;
+    const order = this.tapOrder;
+    const u = this.u;
+    u.step = this.generation + 1;
+    const rec = nCh + 1;
+    let count = 0;
+    for (let i = 0; i < n; i++) {
+      const slot = slots[i];
+      const base = slot * 6;
+      for (let c = 0; c < nCh; c++) {
+        const a = ch[c];
+        const p = c * TAPS;
+        const self = a[slot];
+        P[p] = self;
+        out[c] = self;
+        if (order) for (let t = 0; t < 6; t++) P[p + 1 + t] = a[nbr[base + order[base + t]]];
+        else for (let t = 0; t < 6; t++) P[p + 1 + t] = a[nbr[base + t]];
+      }
+      rule.update(P, out, u);
+      for (let f = 0; f < fixed.length; f++) out[fixed[f]] = P[fixed[f] * TAPS];
+      let diff = false;
+      for (let c = 0; c < nCh; c++) {
+        if (out[c] !== P[c * TAPS]) {
+          diff = true;
+          break;
+        }
+      }
+      if (!diff) continue;
+      if ((count + 1) * rec > this.pending.length) {
+        const grown = new Int32Array(this.pending.length * 2);
+        grown.set(this.pending);
+        this.pending = grown;
+      }
+      const at = count * rec;
+      this.pending[at] = slot;
+      this.pending.set(out, at + 1);
+      count++;
+    }
+
+    const pending = this.pending;
+    for (let i = 0; i < count; i++) {
+      const at = i * rec;
+      const slot = pending[at];
+      for (let c = 0; c < nCh; c++) ch[c][slot] = pending[at + 1 + c];
+      this.enlistWithTaps(slot);
+    }
+    this.changed = count;
+    this.generation++;
+  }
+
+  private enlist(slot: number): void {
+    if (this.listed[slot]) return;
+    this.listed[slot] = 1;
+    this.list[this.active++] = slot;
+  }
+
+  private enlistWithTaps(slot: number): void {
+    this.enlist(slot);
+    const { nbr, isField } = this.topo;
+    for (let k = 0; k < 6; k++) {
+      const j = nbr[slot * 6 + k];
+      if (j >= 0 && isField[j]) this.enlist(j);
+    }
   }
 }
