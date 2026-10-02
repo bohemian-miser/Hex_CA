@@ -208,6 +208,11 @@ drops a closed line for a quick look. **Radius** (4–60) and **Preset**
 **Play/Pause** (space), **Step** and **Step to commit** control playback at
 the **Steps/s** rate. **View** switches the board between the drawn state,
 a want-vs-state diff, the epoch wave, or any single channel as a heat map.
+**Grid** adds a small map of every channel under the board, grouped by kind
+and each on its own live range; click one to put it on the board.
+**Spectrum** gives each channel of the ticked groups (const is off at first)
+its own hue and blends them per cell, weighted by each one's value on its
+range, with lines and walls drawn as in the State view.
 The **readout** shows generation, active/changed cells, FPS and steps/s,
 the root's quiet run against `K`, commit latency since the last edit, the
 filled count, and an oracle ✓/✗ once the board is quiet.
