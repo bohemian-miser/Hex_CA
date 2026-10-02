@@ -8,7 +8,8 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "build": "tsx scripts/build-web.ts"
+    "build": "tsx scripts/build-web.ts",
+    "bench": "tsx scripts/bench.ts"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",

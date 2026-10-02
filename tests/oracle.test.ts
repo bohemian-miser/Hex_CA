@@ -1,14 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { hexField, Field } from '../src/field.js';
+import { FILLED, OFF, ON, WALL } from '../src/fill.js';
 import { coordsOf, hexDistance } from '../src/hex.js';
 import { oracle, settleBound } from '../src/oracle.js';
-
-// Mirrors src/fill.ts's picture values (not yet defined when this task was
-// written; oracle.ts deliberately doesn't export them, so tests restate them).
-const OFF = 0;
-const ON = 1;
-const FILLED = 2;
-const WALL = 3;
 
 /** A picture as a lookup: everything not named is OFF. */
 function makePaint(field: Field, marks: { on?: Iterable<number>; wall?: Iterable<number> }): (slot: number) => number {
@@ -241,7 +235,9 @@ describe('settleBound (DESIGN.md §5)', () => {
     for (const s of field.topo.cells) if (field.ids[s] > field.ids[leader]) leader = s;
     const [lq, lr] = coordsOf(field.board, leader);
     const Er = R + hexDistance(lq, lr);
-    const expected = DwRoot + Math.max(3 * Er, Er) + 3 * K + 3;
+    // No walls: Wd = 0, so the rim branch is 0 + 2·Er and 3·Er wins.
+    const Wd = 0;
+    const expected = DwRoot + Math.max(3 * Er, Wd + 2 * Er) + 3 * K + 3;
     expect(atRoot).toBe(expected);
 
     // Editing a border cell instead only changes Dw (R + R = 2R).
@@ -254,7 +250,7 @@ describe('settleBound (DESIGN.md §5)', () => {
       }
     }
     const atBorder = settleBound(field, paint, [border]);
-    expect(atBorder).toBe(2 * R + Math.max(3 * Er, Er) + 3 * K + 3);
+    expect(atBorder).toBe(2 * R + Math.max(3 * Er, Wd + 2 * Er) + 3 * K + 3);
   });
 
   it('grows with K and is unaffected by edits outside the field', () => {

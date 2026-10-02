@@ -1,5 +1,6 @@
-// Random lines across the board, and the reference answer the CA must match.
-// Neither is part of the automaton: they set it up and check it.
+// Random pictures for the tests, the bench and the demo: bridges, loops,
+// scribbles and wall sets, plus the seeded rng they draw from. Nothing here
+// is part of the automaton; the reference answer lives in src/oracle.ts.
 
 import { Board, borderRing, coordsOf, hexDistance, indexOf, isBorder } from './hex.js';
 

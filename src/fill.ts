@@ -15,13 +15,13 @@
 // tap whose id is x" — never a tap index — so tap order is irrelevant and
 // the code ports to GLSL line for line.
 
-import { CA, ChannelSpec, Rule, Uniforms } from './engine.js';
+import { CA, ChannelSpec, Rule, TAPS as ENGINE_TAPS, Uniforms } from './engine.js';
 import { Field } from './field.js';
 
 /** Picture values (paint) and states. FILLED is a state, never painted. */
 export const OFF = 0, ON = 1, FILLED = 2, WALL = 3;
 
-/** Channel indices: positions in `fillRule.channels`, so P[c * 7 + t] reads channel c at tap t. */
+/** Channel indices: positions in `fillRule.channels`, so P[c * TAPS + t] reads channel c at tap t. MAXM is the channel `M`. */
 const FIELD = 0, ID = 1, GPAR = 2, AREA = 3, PAINT = 4, STAMP = 5,
   EPOCH = 6, RIM = 7, REDGE = 8, LEADER = 9, DIST = 10, RPAR = 11, CDONE = 12, SUB = 13, RSIZE = 14,
   GMAX = 15, MAXM = 16, QT = 17, RUN = 18, COMMIT = 19, WANT = 20, STATE = 21;
@@ -66,36 +66,40 @@ const CHANNELS: readonly ChannelSpec[] = [
 /** The watched channels: the closed system whose fixed point the gate certifies. */
 const WATCHED = Int32Array.from(CHANNELS.flatMap((s, c) => (s.watch ? [c] : [])));
 
-/** Taps per channel in P. */
-const T = 7;
+/**
+ * The engine's P stride, as a module constant: V8 folds a local const into
+ * `update`'s hot loop but reads an imported binding each time (~10% slower on
+ * a boot, 3× under a CommonJS transform).
+ */
+const TAPS = ENGINE_TAPS;
 
 /** DESIGN.md §3, line for line. P[c * 7 + t]: channel c at tap t (0 = self). */
 function update(P: Int32Array, out: Int32Array, u: Uniforms): void {
   const CAP = u.CAP;
   const wallsBound = u.wallsBound === 1;
-  const id = P[ID * T];
-  const paint = P[PAINT * T];
-  const gpar = P[GPAR * T];
+  const id = P[ID * TAPS];
+  const paint = P[PAINT * TAPS];
+  const gpar = P[GPAR * TAPS];
 
   // e = max(epoch, stamp, max_k epoch_k, max_k stamp_k): the newest edit in reach.
-  let e = P[EPOCH * T];
-  if (P[STAMP * T] > e) e = P[STAMP * T];
+  let e = P[EPOCH * TAPS];
+  if (P[STAMP * TAPS] > e) e = P[STAMP * TAPS];
   for (let t = 1; t <= 6; t++) {
-    if (P[EPOCH * T + t] > e) e = P[EPOCH * T + t];
-    if (P[STAMP * T + t] > e) e = P[STAMP * T + t];
+    if (P[EPOCH * TAPS + t] > e) e = P[EPOCH * TAPS + t];
+    if (P[STAMP * TAPS + t] > e) e = P[STAMP * TAPS + t];
   }
-  const fresh = e > P[EPOCH * T];
+  const fresh = e > P[EPOCH * TAPS];
 
   // Per-tap bits. cur: on this epoch, or dead (a dead tap reads rim = 1);
   // fr: a free (OFF) field cell on this epoch. Taps on an older epoch are invisible.
   let fr = 0;
   let edge = false;
   for (let t = 1; t <= 6; t++) {
-    const F = P[FIELD * T + t] === 1;
-    if (F && P[EPOCH * T + t] !== e) continue;
-    const pk = P[PAINT * T + t];
+    const F = P[FIELD * TAPS + t] === 1;
+    if (F && P[EPOCH * TAPS + t] !== e) continue;
+    const pk = P[PAINT * TAPS + t];
     if (F && pk === OFF) fr |= 1 << t;
-    if (P[RIM * T + t] === 1 || (wallsBound && F && pk === WALL)) edge = true;
+    if (P[RIM * TAPS + t] === 1 || (wallsBound && F && pk === WALL)) edge = true;
   }
   out[EPOCH] = e;
   out[RIM] = paint === WALL && edge ? 1 : 0;
@@ -109,9 +113,9 @@ function update(P: Int32Array, out: Int32Array, u: Uniforms): void {
     dist = 0;
     for (let t = 1; t <= 6; t++) {
       if (!((fr >> t) & 1)) continue;
-      if (P[REDGE * T + t] === 1) redge = 1;
-      const lk = P[LEADER * T + t];
-      const dk = P[DIST * T + t] + 1;
+      if (P[REDGE * TAPS + t] === 1) redge = 1;
+      const lk = P[LEADER * TAPS + t];
+      const dk = P[DIST * TAPS + t] + 1;
       if (lk <= 0 || dk >= CAP) continue;
       if (lk > leader || (lk === leader && dk < dist)) {
         leader = lk;
@@ -122,26 +126,26 @@ function update(P: Int32Array, out: Int32Array, u: Uniforms): void {
     if (dist > 0) {
       for (let t = 1; t <= 6; t++) {
         if (!((fr >> t) & 1)) continue;
-        if (P[LEADER * T + t] === leader && P[DIST * T + t] === dist - 1 && P[ID * T + t] > rpar) rpar = P[ID * T + t];
+        if (P[LEADER * TAPS + t] === leader && P[DIST * TAPS + t] === dist - 1 && P[ID * TAPS + t] > rpar) rpar = P[ID * TAPS + t];
       }
     }
     // kid(k): a free tap of this leader whose parent is this cell. settled: nothing
     // about the tree moved here, and every free tap agrees on the leader.
     let agree = true;
     let kidsDone = true;
-    let sum = P[AREA * T];
+    let sum = P[AREA * TAPS];
     for (let t = 1; t <= 6; t++) {
       if (!((fr >> t) & 1)) continue;
-      if (P[LEADER * T + t] !== leader) {
+      if (P[LEADER * TAPS + t] !== leader) {
         agree = false;
         continue;
       }
-      if (P[RPAR * T + t] === id) {
-        if (P[CDONE * T + t] !== 1) kidsDone = false;
-        sum += P[SUB * T + t];
+      if (P[RPAR * TAPS + t] === id) {
+        if (P[CDONE * TAPS + t] !== 1) kidsDone = false;
+        sum += P[SUB * TAPS + t];
       }
     }
-    const settled = !fresh && leader === P[LEADER * T] && dist === P[DIST * T] && rpar === P[RPAR * T] && agree;
+    const settled = !fresh && leader === P[LEADER * TAPS] && dist === P[DIST * TAPS] && rpar === P[RPAR * TAPS] && agree;
     if (settled && kidsDone) {
       cdone = 1;
       sub = sum < CAP ? sum : CAP;
@@ -151,7 +155,7 @@ function update(P: Int32Array, out: Int32Array, u: Uniforms): void {
     else {
       for (let t = 1; t <= 6; t++) {
         if (!((fr >> t) & 1)) continue;
-        if (P[ID * T + t] === rpar && P[LEADER * T + t] === leader) rsize = P[RSIZE * T + t];
+        if (P[ID * TAPS + t] === rpar && P[LEADER * TAPS + t] === leader) rsize = P[RSIZE * TAPS + t];
       }
     }
   }
@@ -168,16 +172,16 @@ function update(P: Int32Array, out: Int32Array, u: Uniforms): void {
   let gmax = paint === OFF && redge === 1 ? rsize : 0;
   let kidsQuiet = true;
   for (let t = 1; t <= 6; t++) {
-    if (P[FIELD * T + t] !== 1 || P[GPAR * T + t] !== id) continue;
-    if (P[GMAX * T + t] > gmax) gmax = P[GMAX * T + t];
-    if (P[QT * T + t] !== 1) kidsQuiet = false;
+    if (P[FIELD * TAPS + t] !== 1 || P[GPAR * TAPS + t] !== id) continue;
+    if (P[GMAX * TAPS + t] > gmax) gmax = P[GMAX * TAPS + t];
+    if (P[QT * TAPS + t] !== 1) kidsQuiet = false;
   }
   out[GMAX] = gmax;
 
   let changed = false;
   for (let i = 0; i < WATCHED.length; i++) {
     const c = WATCHED[i];
-    if (out[c] !== P[c * T]) {
+    if (out[c] !== P[c * TAPS]) {
       changed = true;
       break;
     }
@@ -189,21 +193,21 @@ function update(P: Int32Array, out: Int32Array, u: Uniforms): void {
   // was quiet at one common step, so the watched system is at its fixed point
   // and the lagged gmax is exactly M. Everyone else copies (commit, M) from
   // its static parent, the tap whose id is gpar.
-  let commit = P[COMMIT * T];
-  let M = P[MAXM * T];
+  let commit = P[COMMIT * TAPS];
+  let M = P[MAXM * TAPS];
   if (gpar === 0) {
-    const run = qt ? Math.min(P[RUN * T] + 1, u.K + 2) : 0;
+    const run = qt ? Math.min(P[RUN * TAPS] + 1, u.K + 2) : 0;
     out[RUN] = run;
     if (run === u.K + 1) {
       commit = e;
-      M = gmax;
+      M = P[GMAX * TAPS];
     }
   } else {
     out[RUN] = 0;
     for (let t = 1; t <= 6; t++) {
-      if (P[FIELD * T + t] === 1 && P[ID * T + t] === gpar) {
-        commit = P[COMMIT * T + t];
-        M = P[MAXM * T + t];
+      if (P[FIELD * TAPS + t] === 1 && P[ID * TAPS + t] === gpar) {
+        commit = P[COMMIT * TAPS + t];
+        M = P[MAXM * TAPS + t];
       }
     }
   }
@@ -215,7 +219,7 @@ function update(P: Int32Array, out: Int32Array, u: Uniforms): void {
   out[STATE] = paint === ON ? ON
     : paint === WALL ? WALL
     : commit === e ? (want ? FILLED : OFF)
-    : P[STATE * T] === FILLED ? FILLED : OFF;
+    : P[STATE * TAPS] === FILLED ? FILLED : OFF;
 }
 
 export const fillRule: Rule = { channels: CHANNELS, update };

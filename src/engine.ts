@@ -58,8 +58,8 @@ export interface Topology {
   isField: Uint8Array;
 }
 
-/** Taps per channel in P: self plus six neighbours. */
-const TAPS = 7;
+/** Taps per channel in P: self plus six neighbours, so channel c at tap t is P[c * TAPS + t]. */
+export const TAPS = 7;
 
 export class CA {
   readonly topo: Topology;
@@ -131,6 +131,7 @@ export class CA {
     this.list = new Int32Array(size);
     this.work = new Int32Array(size);
     this.listed = new Uint8Array(size);
+    // Room for 64 changed slots to start with; `pass` doubles it as needed.
     this.pending = new Int32Array(Math.max(16, (this.nCh + 1) * 64));
     // Everything is computed once before anything can be quiet.
     for (const slot of cells) this.enlist(slot);

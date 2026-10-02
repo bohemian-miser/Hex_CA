@@ -156,9 +156,10 @@ function eccentricityWithin(topo: Topology, members: readonly number[], start: n
 /**
  * The settle bound of DESIGN.md §5 for an edit touching `edited` on the
  * picture `paint` (the picture *after* the edit): Dw (epoch wave) + the
- * worse of 3·Er or Wd + Er (leader/size vs. rim) + 2K (the root's quiet run)
- * + depth(c) + 3, with depth(c) = K throughout (the deepest cell, i.e. the
- * whole field commits by this step).
+ * worse of 3·Er (leader, tree, sizes) or Wd + 2·Er (rim along the walls,
+ * then redge from the region's exterior contact across up to its diameter)
+ * + 2K (the root's quiet run) + depth(c) + 3, with depth(c) = K throughout
+ * (the deepest cell, i.e. the whole field commits by this step).
  */
 export function settleBound(field: Field, paint: (slot: number) => number, edited: number[]): number {
   const topo = field.topo;
@@ -228,5 +229,5 @@ export function settleBound(field: Field, paint: (slot: number) => number, edite
     }
   }
 
-  return Dw + Math.max(3 * Er, Wd + Er) + 3 * K + 3;
+  return Dw + Math.max(3 * Er, Wd + 2 * Er) + 3 * K + 3;
 }

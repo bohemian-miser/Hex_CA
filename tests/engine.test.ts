@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { CA, ChannelSpec, Rule, Topology, Uniforms } from '../src/engine.js';
+import { fillCA, paint } from '../src/fill.js';
 import { makeBoard } from '../src/hex.js';
 import { rng } from '../src/lines.js';
+import { fuzzStream, seeds } from './helpers.js';
 
 /** A hexagon of radius R as a Topology, optionally masked down to `keep`. */
 function hexTopo(R: number, keep?: (slot: number) => boolean): Topology {
@@ -231,5 +233,55 @@ describe('engine', () => {
       for (const c of topo.cells) expect(ca.get('s', c)).toBe(g + 1);
     }
     for (let i = 0; i < topo.size; i++) if (!topo.isField[i]) expect(ca.get('s', i)).toBe(-5);
+  });
+
+  // DESIGN.md §8 item 5: the fill rule itself, replayed off T5's fuzz streams
+  // (ragged fields, walls, loops/bridges/scribbles, erases, idle gaps) —
+  // three automata in lockstep: the active set (`step`), the reference sweep
+  // (`stepFull`), and an active set under a random per-slot `tapOrder`. Every
+  // channel at every field slot must agree after every single step, not just
+  // at quiet, since a divergence could self-correct by the next edit.
+  it.each(seeds(10))('fill rule: step, stepFull and a random tapOrder agree on fuzz stream seed %i', (seed) => {
+    const stream = fuzzStream(seed);
+    const { field, wallsBound } = stream;
+    const label = `seed ${seed} (R ${stream.R}${stream.ragged ? ', ragged' : ''}${wallsBound ? ', wallsBound' : ''})`;
+
+    const a = fillCA(field, { wallsBound }); // active step
+    const b = fillCA(field, { wallsBound }); // stepFull: the reference sweep
+    const c = fillCA(field, { wallsBound }); // active step, taps shuffled per slot
+    const rand = rng(0xca11 + seed * 97);
+    const order = new Int32Array(field.topo.size * 6);
+    for (const slot of field.topo.cells) {
+      const p = [0, 1, 2, 3, 4, 5];
+      for (let k = 5; k > 0; k--) {
+        const j = Math.floor(rand() * (k + 1));
+        [p[k], p[j]] = [p[j], p[k]];
+      }
+      order.set(p, slot * 6);
+    }
+    c.tapOrder = order;
+
+    const step = (tag: string) => {
+      a.step();
+      b.stepFull();
+      c.step();
+      expectSame(a, b, `${label}: ${tag} (stepFull)`);
+      expectSame(a, c, `${label}: ${tag} (tapOrder)`);
+    };
+
+    for (const op of stream.ops) {
+      if (op.kind === 'step') {
+        for (let i = 0; i < op.n; i++) step('op step');
+      } else {
+        paint(a, op.slots, op.v);
+        paint(b, op.slots, op.v);
+        paint(c, op.slots, op.v);
+      }
+    }
+    while (a.changed > 0 || a.active > 0) step('settle');
+
+    expect(a.active, `${label}: active == 0 once quiet`).toBe(0);
+    expect(b.active, `${label}: active == 0 once quiet`).toBe(0);
+    expect(c.active, `${label}: active == 0 once quiet`).toBe(0);
   });
 });

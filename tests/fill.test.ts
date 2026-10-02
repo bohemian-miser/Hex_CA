@@ -5,6 +5,7 @@ import { FILLED, OFF, ON, WALL, bump, fillCA, fillRule, paint, scramble, stateOf
 import { coordsOf, hexDistance, indexOf, makeBoard } from '../src/hex.js';
 import { randomLoop, rng } from '../src/lines.js';
 import { oracle, settleBound } from '../src/oracle.js';
+import { channel, count } from './helpers.js';
 
 // The pictures of DESIGN.md §8 item 1 through the CA, each on the full
 // hexagon and on a blob-masked field. Every edit is settled under watch: at
@@ -16,13 +17,6 @@ import { oracle, settleBound } from '../src/oracle.js';
 const R = 10;
 /** Far past any bound at R = 10: a run that gets here never settles. */
 const MAX_STEPS = 20_000;
-
-/** Channel values by name, so a per-step check reads the array directly. */
-function channel(ca: CA, name: string): Int32Array {
-  const c = ca.rule.channels.findIndex((s) => s.name === name);
-  if (c < 0) throw new Error(`no channel ${name}`);
-  return ca.ch[c];
-}
 
 interface Picture {
   on?: number[];
@@ -127,12 +121,6 @@ interface Settled {
   bound: number;
   /** FILLED cells in the oracle of the settled picture. */
   filled: number;
-}
-
-function count(state: Uint8Array, v: number): number {
-  let n = 0;
-  for (let i = 0; i < state.length; i++) if (state[i] === v) n++;
-  return n;
 }
 
 function expectState(actual: Uint8Array, expected: Uint8Array, label: string): void {
@@ -418,6 +406,50 @@ describe('fill rule: walls', () => {
     for (const s of insideLoop) if (state[s] !== WALL) expect(state[s], `inside slot ${s}`).toBe(OFF);
     expect(spoke.filled).toBeGreaterThan(0);
     expect(spoke.filled).toBeLessThan(insideLoop.length);
+  });
+});
+
+describe('fill rule: the settle bound where the rim branch dominates (DESIGN.md §5)', () => {
+  it('a wall snake from the rim into a corridor commits within settleBound, past what Wd + Er allowed', () => {
+    // The corridor: L OFF cells along row 0 ending one in from the east rim
+    // (depth K - 1). A WALL snake along row 0 from the west rim to the
+    // corridor's west end (Wd = 2R - L - 1 > 2Er); everything else ON. The
+    // edit erases the corridor's east end (Dw = 2R - 1). redge enters at the
+    // west end only once rim has run the whole snake, then floods the whole
+    // corridor (L - 1 ≈ 2Er, not Er): allCommit = 7R - 2 here, over the
+    // bound as first written (Wd + Er) by Er - 1. Needs the corridor's
+    // leader (its max id) in the middle, so Er = (L - 1) / 2: scan idSeeds.
+    const L = 9;
+    const m = (L - 1) / 2;
+    let field: Field | null = null;
+    for (let idSeed = 0; idSeed < 400 && !field; idSeed++) {
+      const f = hexField(R, { idSeed });
+      const corridor: number[] = [];
+      for (let q = R - L; q <= R - 1; q++) corridor.push(indexOf(f.board, q, 0));
+      let leader = corridor[0];
+      for (const s of corridor) if (f.ids[s] > f.ids[leader]) leader = s;
+      if (corridor.indexOf(leader) === m) field = f;
+    }
+    expect(field, 'an idSeed with the leader mid-corridor').not.toBeNull();
+    const board = field!.board;
+    const corridor: number[] = [];
+    for (let q = R - L; q <= R - 1; q++) corridor.push(indexOf(board, q, 0));
+    const snake: number[] = [];
+    for (let q = -R; q <= R - L - 1; q++) snake.push(indexOf(board, q, 0));
+    const east = corridor[corridor.length - 1];
+    const on = field!.topo.cells.filter((s) => !corridor.includes(s) && !snake.includes(s));
+
+    const session = new Session(field!);
+    session.settle(0, [field!.root], 'boot');
+    session.edit({ on: [...on, east], wall: snake }, 'corridor, snake, the rest on');
+    const serial = session.ca.generation + 1;
+    paint(session.ca, [east], OFF);
+    const settled = session.settle(serial, [east], 'erase the corridor east end'); // asserts allCommit <= settleBound
+    // The components by hand, and the bound as §5 first had it: this case must exceed that.
+    const Dw = 2 * R - 1, Er = m, Wd = snake.length - 1, K = field!.K;
+    expect(settled.bound).toBe(Dw + Math.max(3 * Er, Wd + 2 * Er) + 3 * K + 3);
+    expect(settled.allCommit).toBeGreaterThan(Dw + Math.max(3 * Er, Wd + Er) + 3 * K + 3);
+    expect(settled.filled).toBe(0); // the corridor is the only region and touches the exterior
   });
 });
 

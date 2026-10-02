@@ -137,8 +137,10 @@ function buildField(board: Board, mask: Uint8Array, opts: FieldOptions): Field {
  *
  * 'hexagon': none (a clean field). 'blob': a wobbly rim a cell or two thick,
  * plus one random interior wall cell as an island. 'lobes': two discs joined
- * by a neck, walls everywhere else. 'ring': the one-in rim plus a central
- * wall disc.
+ * by a neck, walls everywhere else. 'ring': a rim two cells thick plus a
+ * central wall disc. Every rim touches the dead ring, so it is exterior (the
+ * field inside it is ragged, not enclosed): a ring one cell in would be an
+ * island, and the whole interior would fill before anything was drawn.
  */
 export function presetWalls(field: Field, preset: 'hexagon' | 'blob' | 'lobes' | 'ring', seed = 1): number[] {
   const { board, topo } = field;
@@ -176,12 +178,12 @@ export function presetWalls(field: Field, preset: 'hexagon' | 'blob' | 'lobes' |
     return out;
   }
 
-  // 'ring': the one-in rim plus a central wall disc.
+  // 'ring': the outer two rings plus a central wall disc.
   const inner = Math.max(0, Math.floor(R / 5));
   for (const slot of topo.cells) {
     const [q, r] = coordsOf(board, slot);
     const d = hexDistance(q, r);
-    if (d === R - 1 || d <= inner) out.push(slot);
+    if (d >= R - 1 || d <= inner) out.push(slot);
   }
   return out;
 }
