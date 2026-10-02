@@ -193,7 +193,7 @@ src/fill.ts     the rule: channels, update, paint/bump/scramble, stateOf
 src/oracle.ts   the reference predicate and settleBound
 src/lines.ts    random pictures for tests and the demo (loops, bridges, scribbles, walls)
 tests/          vitest: oracle, fill, fuzz, overshoot, engine, field, garbage, rotate
-web/            the demo page (page.html + main.ts), bundled by scripts/build-web.ts
+web/            the demo page (page.html + main.ts) and the trained NCA's page (nca.html + nca.ts), bundled by scripts/build-web.ts
 scripts/bench.ts  settle steps / ms / µs-per-update at three field sizes
 .github/        CI on pull requests; build and deploy to Pages from main
 ```
@@ -272,6 +272,55 @@ half-settled board is never drawn as if it were finished.
   owners and patterns as extra input/region channels; building that out is
   the next real step once this base — the fill rule alone, under fuzzing —
   is trusted.
+
+## Trained NCA
+
+`nca/` and `web/nca.html` hold a second, learned answer to "fill every
+enclosed region" (no bridges, no owners, no smaller-side rule): a neural
+cellular automaton, distill.pub's [Growing Neural Cellular
+Automata](https://distill.pub/2020/growing-ca/) style, trained from
+scratch. Channel 0 is the wall input (re-imposed every step), channel 1
+the fill output (>0.5), 14 more hidden; each step every cell runs one
+network on itself and its six neighbours — a 7-tap convolution to 64
+hidden units, ReLU, a zero-init linear layer added back in: 10,896
+parameters. Enclosed = can't reach a non-wall rim cell through walls.
+
+`nca/train.py`: phase 1 runs fresh from all-zero every iteration; phase 2
+(`--pool`) keeps a pool of boards between iterations and edits some each
+round — opening or closing a loop on a settled board — so it keeps
+working mid-draw, not just from a blank board. Loss is MSE on fill vs.
+the oracle, last 4 steps of a randomised run; Adam, per-parameter
+gradient normalisation, decayed lr. Shipped weights: 1,400 fresh-start
+iterations at R=6, 1,800 pool iterations at R=8 on an earlier generator,
+then 6,000 more at R=8 on the current one — ~0.8 s/iter on a Pi 5, ~2.5
+hours in all:
+
+    python -m nca.train --name p1 --R 6 --iters 1400
+    python -m nca.train --name p2 --pool --init runs/p1/ckpt.pt --R 8 --iters 1800 --lr 1e-3
+    python -m nca.train --name p3 --pool --init runs/p2/ckpt.pt --R 8 --iters 6000 --lr 1e-3
+    python -m nca.evaluate runs/p3/ckpt.pt
+    python -m nca.export runs/p3/ckpt.pt
+
+(needs `torch` + `numpy`, see `nca/requirements.txt`). `nca/evaluate.py`,
+500 held-out boards, exact = every cell right, trivial = always-empty:
+
+| boards | R | exact @56 / @224 steps | trivial |
+|---|---|---|---|
+| mix | 8 | 0.998 / 0.998 | 0.428 |
+| mix | 11 | 0.998 / 1.000 | 0.396 |
+| page loops | 8 | 1.000 / 1.000 | 0.000 |
+| edit test (56+56 steps, no reset), mix / page loops | 8 | 1.000 / 1.000 | 0.450 / 0.282 |
+
+`src/nca.ts`, a hand-rolled float32 re-implementation of the PyTorch
+model, is pinned to it by a parity fixture (`tests/fixtures/nca-parity.json`,
+from `nca/export.py`): both agree to 1e-3 on every value
+(`tests/nca.test.ts`). Driving `web/nca.html` headless — hand-painted and
+multi-loop walls, live opens and closes, five "Random loop" presses in a
+row (walls accumulate; a full board makes it a no-op), R=14 (well past the
+trained radius) with a 127-cell loop and a small one, 2,000 idle steps on
+a settled board — found no wrong cell anywhere. The honest limit: none of
+that went past R=14 or a few thousand steps, so there's no evidence either
+way for the much larger boards the hand-written CA above is built for.
 
 ### Licence
 
