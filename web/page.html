@@ -91,6 +91,21 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
 .stage-col { display: grid; gap: 8px; min-width: 0; }
 .status { font: 500 14px/1.4 var(--body); min-height: 1.4em; color: var(--fg); }
 .status b { color: var(--accent); font-weight: 500; }
+.views.sub { padding-left: 24px; gap: 4px 12px; }
+.legend.strip { gap: 4px 10px; font: 12px var(--mono); }
+.legend b { color: var(--fg); font-weight: 500; }
+.legend .note { display: block; flex-basis: 100%; }
+.channels { display: flex; flex-wrap: wrap; gap: 14px 18px; align-items: start; }
+.channels[hidden], .views[hidden] { display: none; }
+.tgroup { display: grid; gap: 8px; min-width: 0; }
+.tiles { display: flex; flex-wrap: wrap; gap: 8px; }
+.tile { display: grid; gap: 4px; padding: 6px; text-align: left; font: 12px/1.2 var(--mono); }
+.tile[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.tile canvas { position: static; display: block; cursor: pointer; }
+.thead { display: flex; justify-content: space-between; gap: 6px; }
+.thead b { font-weight: 500; }
+.thead i { font-style: normal; color: var(--muted); }
+.trange { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
 </style>
 <div class="wrap">
   <header>
@@ -102,6 +117,7 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
     <div class="stage-col">
       <div class="status" id="status">Drag to draw a line; close a loop and its inside fills.</div>
       <div class="stage"><canvas id="board" aria-label="The hexagon field: drag to draw lines, erase or paint walls"></canvas></div>
+      <div class="channels" id="gridPanel" hidden aria-label="Every channel of the rule, one small map each"></div>
     </div>
     <div class="side">
       <div class="group">
@@ -146,6 +162,15 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
           <label class="check"><input type="radio" name="view" id="view-diff"> Want vs state</label>
           <label class="check"><input type="radio" name="view" id="view-epoch"> Epoch wave</label>
           <label class="check"><input type="radio" name="view" id="view-channel"> Channel <select id="channelSel" aria-label="Channel to show"></select></label>
+          <label class="check"><input type="radio" name="view" id="view-grid"> Grid: every channel</label>
+          <label class="check"><input type="radio" name="view" id="view-spectrum"> Spectrum: channels as hues</label>
+        </div>
+        <div class="views sub" id="specGroups" hidden role="group" aria-label="Channel groups blended into the spectrum">
+          <label class="check"><input type="checkbox" id="spec-const"> const</label>
+          <label class="check"><input type="checkbox" id="spec-input"> input</label>
+          <label class="check"><input type="checkbox" id="spec-hidden"> hidden</label>
+          <label class="check"><input type="checkbox" id="spec-gate"> gate</label>
+          <label class="check"><input type="checkbox" id="spec-out"> out</label>
         </div>
       </div>
       <dl class="readout" id="readout"></dl>
