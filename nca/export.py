@@ -139,15 +139,11 @@ def self_check(weights_path, fixture_path):
     return float(np.abs(got - np.array(fix["state"], dtype=np.float32)).max())
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("ckpt")
-    p.add_argument("--weights", default="web/nca-weights.json")
-    p.add_argument("--fixture", default="tests/fixtures/nca-parity.json")
-    p.add_argument("--note", default="")
-    args = p.parse_args()
-
-    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)  # a checkpoint from a GPU loads here too
+def load_checkpoint(path, note="", label=None):
+    """(model, meta) of a training checkpoint (ckpt.pt or best.pt): the model rebuilt from its config, and
+    the meta the web page shows (the default note names the file as `label`, else its path). Reads the
+    file, writes nothing."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)  # a checkpoint from a GPU loads here too
     cfg = ck["config"]
     model = HexNCA(cfg["channels"], cfg["hidden"], cfg["clamp"], cfg["fireRate"], cfg.get("nConsts", 1),
                    cfg.get("perception", "taps"))  # checkpoints from before v4 have no pool
@@ -159,9 +155,28 @@ def main():
         steps = [min(s[0] for s in steps.values()), max(s[1] for s in steps.values())]
     meta = {"trainedR": cfg["R"], "steps": steps, "stepsMult": cfg.get("stepsMult"),
             "iterations": cfg.get("prevIterations", 0) + ck["iteration"],
+            "runIteration": ck["iteration"],  # the run's own count (iterations adds the --init chain's)
             "pool": bool(cfg.get("pool", False)),  # edit-trained: the page keeps the state across edits
             "floods": bool(cfg.get("floods", False)),  # spec v6: channels 2..7 are the hand-written floods
-            "note": args.note or f"{'phase 2 (pool)' if cfg['pool'] else 'phase 1'} from {args.ckpt}"}
+            "note": note or f"{'phase 2 (pool)' if cfg.get('pool') else 'phase 1'} from {label or path}"}
+    return model, meta
+
+
+def checkpoint_json(path, note="", label=None):
+    """A checkpoint's weights in the web format (weights_json), in memory: what nca.dashboard serves to the
+    play page for a run (/weights?run=NAME, --static's <run>/weights.json). Writes nothing."""
+    return weights_json(*load_checkpoint(path, note, label))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("ckpt")
+    p.add_argument("--weights", default="web/nca-weights.json")
+    p.add_argument("--fixture", default="tests/fixtures/nca-parity.json")
+    p.add_argument("--note", default="")
+    args = p.parse_args()
+
+    model, meta = load_checkpoint(args.ckpt, args.note)
     wj, fix = export(model, meta, args.weights, args.fixture)
     err = self_check(args.weights, args.fixture)
     S = side(fix["R"])

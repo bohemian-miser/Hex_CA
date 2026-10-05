@@ -19,10 +19,16 @@ Run:
 
 Endpoints:
     GET /                 the page (inline CSS + JS, no external resources)
-    GET /api/runs         [{name, mtime, lastIteration, hasPool}, ...] newest log.jsonl first
+    GET /api/runs         [{name, mtime, lastIteration, hasPool, hasWeights}, ...] newest log.jsonl first
     GET /api/log?run=N    {config, records} -- the parsed log.jsonl, compactly
     GET /api/pool?run=N   the pool snapshot as JSON (see pool_to_json below), or an empty one
                           (200, radii: []) if there isn't one yet / it's unreadable right now
+    GET /play             the interactive board, dist/nca.html (npm run build); also /play.html. The page's
+                          Play link opens it as /play?weights=<url of the run's weights>&name=<run>
+    GET /weights?run=N    the run's best.pt (else ckpt.pt) as the play page's weights JSON, converted by
+                          nca/export.py (torch, imported on first use only); also /N/weights.json. 404 JSON
+                          without a checkpoint. Cached by the checkpoint's mtime, in memory and under the
+                          system temp dir (WEIGHTS_CACHE) -- never in the run directory.
 
 Static copy (no server): python -m nca.dashboard --static OUT_DIR [--runs runs] [--only NAME ...]
 [--source pi|vm] writes OUT_DIR/index.html (the same page, with a flag baked in), runs-<source>.json
@@ -30,24 +36,34 @@ Static copy (no server): python -m nca.dashboard --static OUT_DIR [--runs runs] 
 <name>/log.json and <name>/pool.json (what /api/log and /api/pool return). Opened from there the page
 fetches those relative files instead of /api/*: it merges runs-pi.json and runs-vm.json (a fixed list,
 so two publishers never write the same file and nothing is ever listed), polls every 15 s and shows
-the data's own time. nca/cloud/publish.sh uploads such a copy to the bucket.
+the data's own time. nca/cloud/publish.sh uploads such a copy to the bucket. Unless --no-weights, it also
+writes play.html (dist/nca.html) and <name>/weights.json for each run with a checkpoint here (the list's
+hasWeights); the page's Play link opens play.html?weights=<name>/weights.json&name=<name>, and for a run
+whose list says no weights (the VM's) it looks for <name>/weights.json first. --weights-only writes just
+play.html, those weights.json and index.html (the page alone, no data): what publish.sh --weights-only
+uploads for the cloud runs from the Pi (index.html only with --keep-page).
 
-Stdlib + numpy only. Single process, single thread per request (ThreadingHTTPServer), no
-subprocesses, no writes anywhere (the server; --demo and --static write files once and exit or
-serve), run names are checked against the actual directory listing before touching the
-filesystem with them.
+Stdlib + numpy only (torch only for a run's weights, imported when first asked for). Single process,
+single thread per request (ThreadingHTTPServer), no subprocesses, no writes anywhere but the weights
+cache in the temp dir (the server; --demo and --static write files once and exit or serve), run names
+are checked against the actual directory listing before touching the filesystem with them.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
+import re
 import sys
+import tempfile
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 import numpy as np
 
@@ -165,6 +181,7 @@ def api_runs(runs_root: Path) -> list:
             "mtime": mtime,
             "lastIteration": (last or {}).get("iteration"),
             "hasPool": (p / "pool.npz").is_file(),
+            "hasWeights": run_checkpoint(p) is not None,
         })
     out.sort(key=lambda r: r["mtime"], reverse=True)
     return out
@@ -235,6 +252,92 @@ def sanitize(obj):
     if isinstance(obj, list):
         return [sanitize(v) for v in obj]
     return obj
+
+
+# ── the play page and a run's weights ──────────────────────────────────────────────────────────
+
+PLAY_HTML = Path(__file__).resolve().parent.parent / "dist" / "nca.html"  # npm run build (scripts/build-web.ts)
+CHECKPOINTS = ("best.pt", "ckpt.pt")  # a run's weights: its best model, else its latest
+WEIGHTS_CACHE = Path(tempfile.gettempdir()) / "hexca-play-weights"
+_weights_lock = threading.Lock()
+_weights_mem: dict = {}  # checkpoint path -> (path:mtime:size, JSON bytes)
+
+
+def run_checkpoint(run_dir: Path):
+    """The checkpoint the play page gets for a run: best.pt, else ckpt.pt, else None."""
+    for f in CHECKPOINTS:
+        if (run_dir / f).is_file():
+            return run_dir / f
+    return None
+
+
+def run_weights(run_dir: Path):
+    """The play page's weights JSON (bytes) of the run's checkpoint, converted by nca/export.py's
+    checkpoint_json; None without a checkpoint. Cached by the file's path, mtime and size, in memory and
+    under WEIGHTS_CACHE (so a publisher's next process doesn't import torch again for an unchanged file;
+    older entries of the same checkpoint are dropped). Nothing is written into the run directory. Raises
+    if the checkpoint can't be read or converted (caught mid-copy, or a format export.py doesn't know)."""
+    ck = run_checkpoint(run_dir)
+    if ck is None:
+        return None
+    ck = ck.resolve()
+    st = ck.stat()
+    key = f"{ck}:{st.st_mtime_ns}:{st.st_size}:meta3"  # meta3: runIteration, the note names <run>/<file>
+    with _weights_lock:
+        hit = _weights_mem.get(str(ck))
+        if hit and hit[0] == key:
+            return hit[1]
+        stem = hashlib.sha256(str(ck).encode()).hexdigest()[:16]
+        disk = WEIGHTS_CACHE / f"{stem}-{hashlib.sha256(key.encode()).hexdigest()[:16]}.json"
+        try:
+            body = disk.read_bytes()
+        except OSError:
+            from .export import checkpoint_json  # torch: only here, so the dashboard runs without it
+            wj = checkpoint_json(str(ck), label=f"{run_dir.name}/{ck.name}")  # no local path in a public file
+            body = json.dumps(wj, separators=(",", ":"), allow_nan=False).encode("utf-8")
+            try:
+                WEIGHTS_CACHE.mkdir(parents=True, exist_ok=True)
+                for old in WEIGHTS_CACHE.glob(f"{stem}-*.json"):
+                    old.unlink(missing_ok=True)
+                tmp = disk.with_name(f"{disk.name}.{os.getpid()}.tmp")
+                tmp.write_bytes(body)
+                tmp.replace(disk)
+            except OSError:
+                pass  # the cache is a convenience
+        _weights_mem[str(ck)] = (key, body)
+        return body
+
+
+def export_play(out_dir: Path, runs_root: Path, names) -> set:
+    """play.html (a copy of dist/nca.html) and <name>/weights.json for each of `names` with a checkpoint,
+    into out_dir. Returns the names whose weights.json it wrote. Without a built play page it writes
+    nothing (weights alone can't be played). A run whose checkpoint can't be converted is skipped, said
+    on stderr."""
+    try:
+        play = PLAY_HTML.read_bytes()
+    except OSError:
+        print(f"no {PLAY_HTML} (npm run build): no play page or weights written", file=sys.stderr)
+        return set()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    done = set()
+    for name in names:
+        try:
+            body = run_weights(runs_root / name)
+        except Exception as exc:  # noqa: BLE001 -- one bad checkpoint must not stop the rest
+            print(f"{name}: no weights.json ({exc!r})", file=sys.stderr)
+            continue
+        if body is None:
+            continue
+        d = out_dir / name
+        d.mkdir(exist_ok=True)
+        tmp = d / "weights.json.tmp"
+        tmp.write_bytes(body)
+        tmp.replace(d / "weights.json")
+        done.add(name)
+    tmp = out_dir / "play.html.tmp"
+    tmp.write_bytes(play)
+    tmp.replace(out_dir / "play.html")
+    return done
 
 
 # ── demo data: fabricates a contract-conforming runs/_demo/{log.jsonl,pool.npz}. Only called
@@ -422,13 +525,17 @@ def _write_json(path: Path, obj) -> None:
     tmp.replace(path)
 
 
-def export_static(out_dir: Path, runs_root: Path, only=None, source: str = "pi") -> list:
+def export_static(out_dir: Path, runs_root: Path, only=None, source: str = "pi", weights: bool = True) -> list:
     """Write the static copy (see the module docstring) of the runs under runs_root (only those named in
-    `only`, if given) into out_dir. Returns the runs-<source>.json entries."""
+    `only`, if given) into out_dir; with `weights`, play.html and their weights.json too (export_play).
+    Returns the runs-<source>.json entries."""
     if source not in STATIC_SOURCES:
         raise ValueError(f"--source must be one of {STATIC_SOURCES}")
     out_dir.mkdir(parents=True, exist_ok=True)
     runs = [r for r in api_runs(runs_root) if not only or r["name"] in only]
+    played = export_play(out_dir, runs_root, [r["name"] for r in runs if r["hasWeights"]]) if weights else set()
+    for r in runs:
+        r["hasWeights"] = r["name"] in played  # in this copy: a weights.json next to it
     now = round(time.time(), 1)
     for r in runs:
         r["source"], r["exported"] = source, now
@@ -443,12 +550,17 @@ def export_static(out_dir: Path, runs_root: Path, only=None, source: str = "pi")
             pool = EMPTY_POOL
         _write_json(d / "pool.json", pool)
     _write_json(out_dir / f"runs-{source}.json", runs)  # after the runs' files, so it never names a missing one
+    write_static_page(out_dir)
+    return runs
+
+
+def write_static_page(out_dir: Path) -> None:
+    """out_dir/index.html: the page with STATIC baked in (code only, no data)."""
     page = PAGE_HTML.replace(STATIC_FLAG, "var STATIC = true;")
     assert page != PAGE_HTML, "the static flag is missing from the page"
     tmp = out_dir / "index.html.tmp"
     tmp.write_text(page, encoding="utf-8")
     tmp.replace(out_dir / "index.html")
-    return runs
 
 
 # ── HTTP ────────────────────────────────────────────────────────────────────────────────────
@@ -467,14 +579,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _html(self, text: str) -> None:
-        body = text.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+    def _html(self, text: str, status: int = 200) -> None:
+        self._bytes(text.encode("utf-8"), "text/html; charset=utf-8", status)
+
+    def _bytes(self, body: bytes, ctype: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _weights(self, name: str, runs_root: Path) -> None:
+        """/weights?run=NAME and /NAME/weights.json: the run's checkpoint as the play page's weights."""
+        if name not in valid_run_names(runs_root):
+            self._json({"error": "unknown run"}, 404)
+            return
+        try:
+            body = run_weights(runs_root / name)
+        except Exception as exc:  # noqa: BLE001 -- caught mid-copy, or a format export.py doesn't know
+            self._json({"error": f"could not convert {name}'s checkpoint: {exc!r}"}, 500)
+            return
+        if body is None:
+            self._json({"error": f"no checkpoint ({' or '.join(CHECKPOINTS)}) in run {name}"}, 404)
+            return
+        self._bytes(body, "application/json; charset=utf-8")
 
     def do_GET(self) -> None:  # noqa: N802 (stdlib name)
         try:
@@ -485,6 +614,17 @@ class Handler(BaseHTTPRequestHandler):
 
             if path in ("/", "/index.html"):
                 self._html(PAGE_HTML)
+            elif path in ("/play", "/play.html"):
+                try:
+                    self._bytes(PLAY_HTML.read_bytes(), "text/html; charset=utf-8")
+                except OSError:
+                    self._html(f"<!doctype html><meta charset=utf-8><title>Play page not built</title>"
+                               f"<p>The play page isn't built: no <code>{PLAY_HTML}</code>. Run <code>npm run "
+                               f"build</code> in <code>{PLAY_HTML.parent.parent}</code>, then reload.</p>", 404)
+            elif path == "/weights":
+                self._weights((qs.get("run") or [""])[0], runs_root)
+            elif re.fullmatch(r"/[^/]+/weights\.json", path):
+                self._weights(unquote(path.split("/")[1]), runs_root)
             elif path == "/favicon.ico":
                 self.send_response(204)
                 self.end_headers()
@@ -547,6 +687,10 @@ def main() -> None:
     ap.add_argument("--only", nargs="+", metavar="NAME", help="--static: just these runs")
     ap.add_argument("--source", default="pi", choices=STATIC_SOURCES,
                     help="--static: which publisher this is (writes runs-<source>.json)")
+    ap.add_argument("--no-weights", action="store_true",
+                    help="--static: no play.html or <run>/weights.json (the VM: its CPU is for training)")
+    ap.add_argument("--weights-only", action="store_true",
+                    help="--static: only play.html, index.html (no data) and <run>/weights.json of the --only runs")
     args = ap.parse_args()
 
     runs_root = Path(args.runs)
@@ -556,8 +700,17 @@ def main() -> None:
         build_demo(runs_root / "_demo")
         print(f"wrote demo run to {runs_root / '_demo'}", file=sys.stderr)
 
+    if args.static and args.weights_only:
+        names = sorted(n for n in (args.only or []) if n in valid_run_names(runs_root))
+        done = export_play(Path(args.static), runs_root, names)
+        write_static_page(Path(args.static))
+        print(f"wrote {args.static}: play.html, index.html and weights.json of {sorted(done)}"
+              + (f"; none for {sorted(set(args.only or []) - done)}" if set(args.only or []) - done else ""),
+              file=sys.stderr)
+        return
+
     if args.static:
-        runs = export_static(Path(args.static), runs_root, args.only, args.source)
+        runs = export_static(Path(args.static), runs_root, args.only, args.source, not args.no_weights)
         missing = sorted(set(args.only or []) - {r["name"] for r in runs})
         print(f"wrote {args.static}: index.html, runs-{args.source}.json, {len(runs)} run(s)"
               + (f"; no log.jsonl for {missing}" if missing else ""), file=sys.stderr)
@@ -606,6 +759,11 @@ a { color: var(--accent); }
 .hdr-row { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; }
 select, button { font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--hair);
   border-radius: 4px; padding: 5px 9px; cursor: pointer; }
+a.play { font: 600 13px/1.2 var(--body); text-decoration: none; color: var(--bg); background: var(--accent);
+  border: 1px solid var(--accent); border-radius: 4px; padding: 6px 12px; white-space: nowrap; }
+a.play:hover { filter: brightness(1.1); }
+a.play:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+a.play.off { color: var(--muted); background: var(--panel); border-color: var(--hair); cursor: not-allowed; filter: none; }
 .stat { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
 .stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
 .stat .v { font: 13px/1.2 var(--mono); }
@@ -669,6 +827,7 @@ footer { color: var(--muted); font-size: 11px; margin-top: 20px; }
   <h1>NCA training</h1>
   <div class="hdr-row">
     <select id="runSelect"><option value="latest">latest</option></select>
+    <a class="play off" id="playLink" target="_blank" rel="noopener" aria-disabled="true">&#9654; Play</a>
     <div class="stat"><span class="k">iteration</span><span class="v" id="statIter">-</span></div>
     <div class="progress"><i id="progressBar" style="width:0%"></i></div>
     <div class="stat"><span class="k">sec/iter</span><span class="v" id="statSpi">-</span></div>
@@ -1390,7 +1549,51 @@ function populateRunSelect(runs) {
   }
   sel.value = wanted;
 }
-document.getElementById("runSelect").addEventListener("change", function (e) { state.selected = e.target.value; });
+document.getElementById("runSelect").addEventListener("change", function (e) {
+  state.selected = e.target.value;
+  updatePlay(pickActiveRun(state.runs));
+});
+
+// ---- Play: the interactive board (dist/nca.html) with the run's best weights, in a new tab ---------
+// Locally /play fetching /weights?run=NAME (the server converts best.pt, else ckpt.pt); in the static copy
+// play.html fetching NAME/weights.json. A run listed without weights (the VM's: the Pi publishes them,
+// publish.sh --weights-only) is looked for with a HEAD of its weights.json, at most once a minute.
+var weightsProbe = Object.create(null);   // run name -> {ok, at, pending}
+function weightsURL(name) { return STATIC ? encodeURIComponent(name) + "/weights.json" : "/weights?run=" + encodeURIComponent(name); }
+function playURL(name) {
+  var q = function (v) { return encodeURIComponent(v).replace(/%2F/g, "/"); };  // a "/" may stay as it is in a query
+  return (STATIC ? "play.html" : "/play") + "?weights=" + q(weightsURL(name)) + "&name=" + q(name);
+}
+function setPlay(name, ok, why) {
+  var a = document.getElementById("playLink");
+  a.classList.toggle("off", !ok);
+  if (ok) {
+    a.href = playURL(name);
+    a.removeAttribute("aria-disabled");
+    a.title = "Open the board with " + name + "'s best weights in a new tab: paint walls, watch it fill";
+  } else {
+    a.removeAttribute("href");
+    a.setAttribute("aria-disabled", "true");
+    a.title = why;
+  }
+}
+function updatePlay(name) {
+  var run = name ? state.runs.find(function (r) { return r.name === name; }) : null;
+  if (!run) return setPlay(null, false, "no run");
+  if (run.hasWeights) return setPlay(name, true);
+  if (!STATIC) return setPlay(name, false, "no checkpoint (best.pt or ckpt.pt) in this run yet");
+  var p = weightsProbe[name] || { ok: false, at: 0 };
+  setPlay(name, p.ok, p.at ? "no weights published for this run" : "looking for this run's weights...");
+  if (p.pending || Date.now() - p.at < 60000) return;
+  p.pending = true;
+  weightsProbe[name] = p;
+  fetch(weightsURL(name), { method: "HEAD", cache: "no-store" })
+    .then(function (r) { return r.ok; }, function () { return false; })
+    .then(function (ok) {
+      weightsProbe[name] = { ok: ok, at: Date.now() };
+      if (pickActiveRun(state.runs) === name) updatePlay(name);
+    });
+}
 
 function pickActiveRun(runs) {
   if (state.selected === "latest") return runs.length ? runs[0].name : null;
@@ -1403,6 +1606,7 @@ function poll() {
     populateRunSelect(runs);
     var active = pickActiveRun(runs);
     state.activeRun = active;
+    updatePlay(active);
     var runMeta = runs.find(function (r) { return r.name === active; }) || null;
     var note = runs.length + " run" + (runs.length === 1 ? "" : "s") + " found";
     if (STATIC) {

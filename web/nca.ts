@@ -1,15 +1,18 @@
 // The trained NCA's page (web/nca.html): paint walls, run the network, and
 // check its fill channel against the oracle (any of its acceptable targets).
-// The weights are bundled in.
+// The weights are bundled in. With ?weights=<url>&name=<label> (the training
+// dashboard's Play) the page loads a run's weights instead, falling back to the
+// bundled ones, and can reload them while the run trains, keeping the walls.
 
 import weightsJson from './nca-weights.json';
-import { HexNCA, cellCoords, cellIndex, hexDist, loadWeights, randomBridge, targets } from '../src/nca.js';
+import { HexNCA, cellCoords, cellIndex, hexDist, loadWeights, randomBridge, targets, type NCAWeights } from '../src/nca.js';
 import { coordsOf, indexOf, makeBoard } from '../src/hex.js';
 import { randomLoop, rng } from '../src/lines.js';
 
-const weights = loadWeights(weightsJson);
-const meta = weights.meta;
-const C = weights.channels;
+/** The bundled weights until ?weights= brings others (setWeights). */
+let weights = loadWeights(weightsJson);
+let meta = weights.meta;
+let C = weights.channels;
 
 const $ = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const canvas = $<HTMLCanvasElement>('board');
@@ -29,8 +32,10 @@ const MAX_R = 32;
 const SETTLE_PER_R = 8;
 
 const clampInt = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, Math.round(v)));
+/** The largest radius the weights were trained at (meta.trainedR is a number or a list), else a fallback. */
+const trainedRs = Array.isArray(meta.trainedR) ? meta.trainedR : typeof meta.trainedR === 'number' ? [meta.trainedR] : [];
 const settings = {
-  radius: clampInt(typeof meta.trainedR === 'number' ? meta.trainedR : 8, 4, MAX_R),
+  radius: clampInt(trainedRs.length ? Math.max(...trainedRs) : 8, 4, MAX_R),
   speed: 60,
 };
 
@@ -204,7 +209,7 @@ const pixel = ([r, g, b]: readonly number[]) => ((255 << 24) | (b << 16) | (g <<
 const fillLevel = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * LEVELS);
 
 /** The diverging map's range: the export's clamp, else symmetric round zero. */
-const [LO, HI] = weights.clamp ?? [-1, 1];
+let [LO, HI] = weights.clamp ?? [-1, 1];
 /** A value on the diverging map as a level in −LEVELS…LEVELS (negative: towards --neg). */
 function divLevel(v: number): number {
   const t = v >= 0 ? (HI > 0 ? Math.min(1, v / HI) : 0) : LO < 0 ? -Math.min(1, v / LO) : 0;
@@ -331,7 +336,7 @@ function draw(): void {
 
 // ── Channel tiles ───────────────────────────────────────────────────────────
 
-const NAMES = Array.from({ length: C }, (_, c) => (c === 0 ? 'wall' : c === 1 ? 'fill' : 'hidden'));
+let NAMES = Array.from({ length: C }, (_, c) => (c === 0 ? 'wall' : c === 1 ? 'fill' : 'hidden'));
 /**
  * A state-channel tile is clickable (shows that channel on the board, diverging scale);
  * a const tile (mask, and in version 2 theta1/theta2) just shows its value, plain 0…1 scale.
@@ -629,11 +634,126 @@ const restyle = () => {
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', restyle);
 new MutationObserver(restyle).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
 
+// ── Weights from a URL (the training dashboard's Play) ──────────────────────
+
+const params = new URLSearchParams(location.search);
+/** ?weights=<url>, relative to the page or absolute: a run's weights JSON (nca/export.py's format). */
+const weightsUrl = params.get('weights');
+/** ?name=<label>: what to call them (the run's name). */
+const weightsName = params.get('name');
+/** With its box ticked, the page refetches this often and swaps in weights that changed. */
+const AUTO_RELOAD_MS = 120_000;
+/** The fetched text now in use, to tell new weights from the same file again. */
+let weightsText = '';
+let source: { label: string; loaded: Date; checked?: Date; error?: string } = { label: 'bundled weights', loaded: new Date() };
+let reloading = false;
+let autoTimer = 0;
+
+const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
+const clock = (d: Date) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+async function fetchWeights(url: string): Promise<{ text: string; w: NCAWeights }> {
+  const res = await fetch(new URL(url, location.href), { cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const text = await res.text();
+  return { text, w: loadWeights(JSON.parse(text)) };
+}
+
+/** `w` becomes the weights the page uses: what follows from them (names, colour range) too. */
+function setWeights(w: NCAWeights): void {
+  weights = w;
+  meta = w.meta;
+  C = w.channels;
+  [LO, HI] = w.clamp ?? [-1, 1];
+  NAMES = Array.from({ length: C }, (_, c) => (c === 0 ? 'wall' : c === 1 ? 'fill' : 'hidden'));
+}
+
+function showSource(): void {
+  // The run's own iteration (the dashboard's) when the export says it, the --init chain's total too if it differs.
+  const own = typeof meta.runIteration === 'number' ? meta.runIteration : null;
+  const all = typeof meta.iterations === 'number' ? meta.iterations : null;
+  const n = own ?? all;
+  const it = n === null ? 'iteration not recorded' : `iteration ${n.toLocaleString()}`
+    + (own !== null && all !== null && all !== own ? ` (${all.toLocaleString()} with its --init)` : '');
+  const el = $('source');
+  el.textContent = `${source.label} · ${it} · loaded ${clock(source.loaded)}`
+    + (source.checked ? ` · checked ${clock(source.checked)}: unchanged` : '');
+  if (source.error) {
+    const err = document.createElement('span');
+    err.className = 'err';
+    err.textContent = source.error;
+    el.append(err);
+  }
+}
+
+/** Before the first model: the URL's weights, else the bundled ones with a notice saying why. */
+async function initialWeights(): Promise<void> {
+  if (!weightsUrl) return;
+  $('weightsGroup').hidden = false;
+  if (weightsName) document.title = `${weightsName} · ${document.title}`;
+  $('status').textContent = `Loading weights from ${weightsUrl}…`;
+  try {
+    const { text, w } = await fetchWeights(weightsUrl);
+    weightsText = text;
+    setWeights(w);
+    source = { label: weightsName || weightsUrl, loaded: new Date() };
+    // The radius and the edit mode follow these weights, as they do the bundled ones.
+    const rs = ([] as unknown[]).concat(meta.trainedR ?? []).filter((v): v is number => typeof v === 'number');
+    settings.radius = clampInt(rs.length ? Math.max(...rs) : 8, 4, MAX_R);
+    $<HTMLInputElement>('radius').value = $('radiusOut').textContent = String(settings.radius);
+    resetOnEdit = resetBox.checked = meta.pool !== true;
+  } catch (e) {
+    source = { label: 'bundled weights', loaded: new Date(), error: `Could not load ${weightsUrl} (${why(e)}), so these are the bundled weights.` };
+  }
+  showSource();
+}
+
+/** Fetch the URL again and swap the model in: the walls stay, the state starts over. Automatic: only if the file changed. */
+async function reloadWeights(auto: boolean): Promise<void> {
+  if (!weightsUrl || reloading) return;
+  reloading = true;
+  const btn = $<HTMLButtonElement>('reloadWeights');
+  btn.disabled = true;
+  try {
+    const { text, w } = await fetchWeights(weightsUrl);
+    if (auto && text === weightsText) {
+      source.checked = new Date();
+    } else {
+      weightsText = text;
+      setWeights(w);
+      tiles.length = 0;
+      mini = null;
+      $('tiles').replaceChildren();
+      buildTiles();
+      $('meta').textContent = metaLine();
+      newModel(m.R);
+      show(shown !== null && shown < C ? shown : null);
+      source = { label: weightsName || weightsUrl, loaded: new Date() };
+    }
+    source.error = undefined;
+  } catch (e) {
+    source.error = `Could not reload ${weightsUrl} (${why(e)}): still the weights loaded before.`;
+  } finally {
+    reloading = false;
+    btn.disabled = false;
+    showSource();
+  }
+}
+
+$('reloadWeights').addEventListener('click', () => void reloadWeights(false));
+$<HTMLInputElement>('autoReload').addEventListener('change', (ev) => {
+  clearInterval(autoTimer);
+  if ((ev.target as HTMLInputElement).checked) autoTimer = window.setInterval(() => void reloadWeights(true), AUTO_RELOAD_MS);
+});
+
 // For the console and headless checks.
 Object.assign(window, {
   hexnca: {
     get model() { return m; },
     get targets() { return oracles; },
+    get weights() { return weights; },
+    /** Which weights are in use (?weights=): label, load time, last error. */
+    get source() { return source; },
     /** Client coordinates of the cell at axial (q, r). */
     point(q: number, r: number): [number, number] {
       const rect = canvas.getBoundingClientRect();
@@ -643,10 +763,12 @@ Object.assign(window, {
   },
 });
 
-$('meta').textContent = metaLine();
-buildTiles();
-newModel(settings.radius);
-addLoop();
-show(null);
-setPlaying(true);
-requestAnimationFrame(frame);
+void initialWeights().then(() => {
+  $('meta').textContent = metaLine();
+  buildTiles();
+  newModel(settings.radius);
+  addLoop();
+  show(null);
+  setPlaying(true);
+  requestAnimationFrame(frame);
+});

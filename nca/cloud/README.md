@@ -36,7 +36,8 @@ never write a secret into a plan or into instance metadata (both end up in publi
 | `down.sh` | **lead only** | final pull with checkpoints, deletes the VM, checks nothing of ours is left |
 | `watch.sh [minutes]` | anyone | pulls every 2 min, prints a block, exits when something needs a look |
 | `pull.sh [--ckpt]` | anyone | bucket -> `runs/` (checkpoints only with `--ckpt`) |
-| `publish.sh [--every SEC] RUN...` | anyone with bucket write | the static dashboard of local runs to `dash/` |
+| `publish.sh [--every SEC] RUN...` | anyone with bucket write | the static dashboard of local runs to `dash/` (with their Play page and weights) |
+| `publish.sh --weights-only [--keep-page] [--every SEC] RUN...` | the Pi, bucket write | only `dash/play.html` and `dash/RUN/weights.json`, for the VM's runs (the VM has no page build); `--keep-page` puts the page with the Play link back when a VM on older code overwrites `dash/index.html` |
 | `startup.sh`, `shutdown.sh` | the VM | its boot and shutdown scripts (passed as metadata by `launch.sh`) |
 | `plan.example.txt` | | the plan format, a benchmark plan and a curriculum |
 | `selftest.sh` | anyone | all of the above against a local directory: no cloud, no money |
@@ -100,6 +101,7 @@ gcloud storage cp runs/pure-a/best.pt gs://recipe-lanes-staging-hexca-runs/init/
 nca/cloud/launch.sh --dry-run my-plan.txt        # checks + the exact command
 nca/cloud/launch.sh my-plan.txt                  # creates hexca-train (zone a, else b, else c)
 nca/cloud/publish.sh --every 60 pure-a &         # optional: the Pi's own run on the public page too
+nca/cloud/publish.sh --weights-only --keep-page --every 120 RUN-STAGE... &   # Play for the VM's runs (after pull.sh)
 nca/cloud/watch.sh 40; echo "exit $?"            # or hand this to an agent (next section)
 nca/cloud/down.sh                                # when it says so: pull, delete, verify -> one line
 ```
