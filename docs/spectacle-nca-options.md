@@ -10,6 +10,14 @@ from tails — for every player and for rules it never saw. Builds on `nca-revie
 
 ## 0. Decisions for the owner
 
+**Owner update (2026-10-05, after this was written): Spectre tiles come for free.** Spectacle's
+Spectre view is purely client-side: a hexagon arena is drawn as Spectres through the isomorphism
+(`'spectre-iso'` labels: every seam of a hexagon is a seam of its Spectre with the same class;
+Spectacle `client/src/spectre-view.ts`), and the server, engine and wire only ever run hexagons (solo is
+hexagons only). So a CA that plays the hex game plays the Spectre game too. The plan's M4 (a graph NCA on
+Spectre tiles) is dropped, and every "Spectre later" argument below (§3's row, the judgement, §7's
+transfer risk) no longer counts: options A, C and E are to be ranked on the hex task alone.
+
 **The principle behind every option below, in the owner's words: "you can't prerender the rules, it
 changes when a player takes over another player's line."** In Spectacle a line carries its own rule
 (`path.rule` / `path.table`, `CLAUDE.md` "Captured patterns"): a captured line changes owner and keeps its
@@ -192,7 +200,7 @@ graph NCA. Costs are input planes into the first (7-tap) layer only; parameter c
 | Cost | ~16 × 7 × 128 = 14k params; trivial compute | ~97k params on the first layer | ~49k params; trivial compute | trivial | 7-tap gather per cell with a per-cell permutation (12 frames), then a 1×1: ~7× activation memory, ≈ same FLOPs; ~2 h to build + a parity test | trivial |
 | Cheap experiment to rank it | **per-cell supervised lookup, no CA**: a 1-hidden-layer MLP (same width) from (static planes, rule code) → 15 chord bits, on 1.9 M random (type, rot, rule) draws; held-out rules; minutes on the Pi's CPU. Ranks A/B/C/D by how fast and how exactly the lookup is learnable | same | same | same | same probe in the local frame (target = local chords) — expect near-trivial | same |
 
-**Judgement.** C is the recommendation: it is still only board facts, it is the representation a graph
+**Judgement** (written before the owner's update in §0; the Spectre reasons no longer count). C is the recommendation: it is still only board facts, it is the representation a graph
 NCA on Spectre tiles would use anyway, and it makes the per-cell lookup two bilinear steps instead of a
 108-way memorisation. A is the baseline the owner can compare it against for the cost of one more run.
 E is the strongest design for the long run (6–12× weight sharing, the Spectre form) but needs a model
