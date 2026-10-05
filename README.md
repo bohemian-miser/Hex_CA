@@ -320,25 +320,26 @@ Two failures on the way, fixed in the trainer, not the model:
   bridge-exact from 0.88 to 0.33 in 2,500 iterations. Still running now at
   5e-5 instead (rollback tightened to a 15% drop) — not done as of writing.
 
-### Honest numbers (shipped checkpoint, `runs/gb-r456b/best.pt`)
+### Honest numbers (shipped checkpoint, `runs/fb-r6816nt/best.pt`)
 
-`python -m nca.evaluate CKPT --radii 6 8 10 16`, held out at 8R steps, exact
-= every cell right against either acceptable target, trivial = always-empty,
-both/none = share of bridge boards left every-side-filled / 2+ sides empty:
+Launch 4 (see `docs/nca-journey.md`): launch 3's best, fine-tuned for 85 minutes on one L4 at R 6-16
+with half the pool on ragged board outlines (random blobs and crops of Spectacle's hex fields) and
+extra near-even bridges. `python -m nca.evaluate CKPT --radii 8 16 24 --n 100 --n-big 50 --mults 8 16`,
+held-out boards read out at 16R steps, exact = every cell right against any acceptable target
+(±2 standard errors), trivial = always-empty, both/none = share of bridge boards left
+every-side-filled / two or more sides empty:
 
-| R (n) | mix exact (trivial) | page loops | bridge exact | both | none |
+| R (n) | mix (trivial) | page loops | bridge | ragged bridge | bridge both / none |
 |---|---|---|---|---|---|
-| 6 (100) | 0.980 (0.340) | 1.000 | 0.910 | 0.000 | 0.010 |
-| 8 (100) | 0.960 (0.340) | 1.000 | 0.890 | 0.000 | 0.070 |
-| 10 (100) | 0.940 (0.300) | 0.990 | 0.770 | 0.000 | 0.220 |
-| 16 (30) | 0.767 (0.400) | 1.000 | 0.400 | 0.000 | 0.600 |
+| 8 (100) | 0.99 ±0.02 (0.34) | 1.00 | 0.99 ±0.02 | 0.98 ±0.03 | 0.01 / 0.00 |
+| 16 (100) | 0.95 ±0.04 (0.30) | 0.99 | 0.98 ±0.03 | 0.91 ±0.06 | 0.00 / 0.00 |
+| 24 (50) | 0.94 ±0.07 (0.22) | 1.00 | 0.76 ±0.12 | 0.88 ±0.09 | 0.02 / 0.10 |
 
-R 16 is honestly poor (`none` 0.600, bridges mostly fill no side) since it's
-only trained at R 4-6 so far; R 6-10 already beats the hybrid's own bridge
-exact (0.753 at R 8). The edit test (settle, one live wall edit, no reset, exact
-against the edited targets) tracks the fresh-state numbers closely:
-mix/bridge/page 0.990/0.970/1.000 at R 6, 0.950/0.950/0.980 at R 8,
-0.970/0.770/0.990 at R 10 — confirmed by hand too: driving `dist/nca.html`
+R 24 is the open problem: every miss there is a near-even bridge (area ratio above 0.5), and a
+further 100-minute stage at R 8-24 did not move it. The previous shipped checkpoint (trained at
+R 4-6 only) scored 0.89 / 0.40 on bridges at R 8 / 16 and 0.21 on Spectacle's level-3 field outline.
+The edit test (settle, one live wall edit, no reset, exact against the edited targets) at R 8:
+mix 0.96, bridge 0.92, page loops 1.00. For the previous checkpoint, confirmed by hand too: driving `dist/nca.html`
 headless (Playwright) past ~10R steps, seven live edits at R=6 (a loop drawn
 cell by cell while running, opened, closed, a second loop, a rim-to-rim
 wall, broken, restored) all matched with no reset; 30 checks of alternating
