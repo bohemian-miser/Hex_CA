@@ -295,8 +295,9 @@ but it was hand-crafted — exactly the shortcut the bitter lesson warns
 against — so the owner's call was to go back and make the plain model learn
 it properly. The fix wasn't a smarter architecture, just more honest
 training: a persistent sample pool that keeps training on *edited*, not
-just fresh, boards. On a GPU at ~19 iterations/s the plain model passed the
-hybrid's own numbers within a couple of minutes.
+just fresh, boards, run for tens of thousands of iterations on a GPU (~19
+iterations/s) instead of a few hundred on a Pi. On held-out bridge boards at
+R 8 it now gets 0.89 exact against the hybrid's 0.75.
 
 `nca/train.py`'s default is that plain recipe: a persistent pool of boards
 per radius, each kept in the state it was left in; most of a batch takes one
@@ -334,7 +335,7 @@ both/none = share of bridge boards left every-side-filled / 2+ sides empty:
 
 R 16 is honestly poor (`none` 0.600, bridges mostly fill no side) since it's
 only trained at R 4-6 so far; R 6-10 already beats the hybrid's own bridge
-exact (0.753 at R 8). The edit test (settle, 3 live edits, no reset, exact
+exact (0.753 at R 8). The edit test (settle, one live wall edit, no reset, exact
 against the edited targets) tracks the fresh-state numbers closely:
 mix/bridge/page 0.990/0.970/1.000 at R 6, 0.950/0.950/0.980 at R 8,
 0.970/0.770/0.990 at R 10 — confirmed by hand too: driving `dist/nca.html`
