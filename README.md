@@ -287,6 +287,14 @@ into 256 hidden units, a zero-init linear layer added back into the state:
 and a rim-to-rim wall fills every rim region but the largest, by area or by
 the angular span of its rim contact, either acceptable when they disagree.
 
+The page's **Board** selector swaps the hexagon (the Radius slider) for one
+of Spectacle's own hex fields — the game's actual ragged tile patches at
+levels 2, 3 and 4 (`nca/fields/*.json`, also `?map=l2`/`l3`/`l4` in the
+URL) — with no change to the model or its inputs: the field's own missing
+neighbours already read as "off board" to the trained rim perception.
+Level 4 (3905 tiles) runs well under real time in plain JS (a few steps a
+second, noted on the page); level 2 and 3 stay smooth.
+
 The plain model got loops right quickly, but short attempts (hundreds of
 iterations, `runs/experiments.md`) never learned the bridge half, so a
 hybrid shipped first (PR #7): five hidden channels hand-written as exact

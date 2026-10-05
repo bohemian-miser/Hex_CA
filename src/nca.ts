@@ -7,6 +7,12 @@
 // (0,+1) (0,-1) (+1,0) (-1,0) (-1,+1) (+1,-1). This is NOT src/hex.ts's layout
 // (that one pads a ring); it is the Python side's, nca/hexgrid.py.
 //
+// The board need not be the full hexagon: HexNCA takes an optional custom mask (the same
+// S×S array, see `fieldMask`) in its place — a ragged shape, such as a crop of Spectacle's
+// own hex field (web/nca.ts's map selector). "Off board" then means off that shape, not
+// off the hexagon; the model was trained on ragged masks too (nca/masks.py), so this needs
+// no new input — a cell's rim-ness already falls out of which of its 7 taps are on-mask.
+//
 // One step, every on-board cell at once (synchronous, double-buffered):
 //   x = concat(state, consts)                C + K channels (K consts: version 1
 //                                             is just "mask"; version 2 and 3 are
@@ -104,6 +110,24 @@ export function boardMask(R: number): Uint8Array {
     for (let col = 0; col < S; col++) m[row * S + col] = hexDist(col - R, row - R) <= R ? 1 : 0;
   }
   return m;
+}
+
+/**
+ * A ragged board shape from a list of axial (q, r) cells (e.g. Spectacle's own hex fields,
+ * web/nca.ts's map selector): R is one past the farthest cell's hex distance from the
+ * centre, so every listed cell lands strictly inside the S×S array with room for at least
+ * one off-board neighbour all round (the model's rim input). `mask` is 1 at each listed
+ * cell, 0 everywhere else in the array — HexNCA takes it as a custom board shape in place
+ * of the default full hexagon.
+ */
+export function fieldMask(qr: ReadonlyArray<readonly [number, number]>): { R: number; mask: Uint8Array } {
+  let maxD = 0;
+  for (const [q, r] of qr) maxD = Math.max(maxD, hexDist(q, r));
+  const R = Math.max(1, maxD + 1);
+  const S = side(R);
+  const mask = new Uint8Array(S * S);
+  for (const [q, r] of qr) mask[cellIndex(R, q, r)] = 1;
+  return { R, mask };
 }
 
 // ── Weights ─────────────────────────────────────────────────────────────────
@@ -277,13 +301,19 @@ export class HexNCA {
   private readonly pmax: Float64Array;
   private readonly pmin: Float64Array;
 
-  /** `rand` is only drawn on when fireRate < 1 (each cell fires with that chance, all channels together). */
-  constructor(w: NCAWeights, R: number, rand: () => number = Math.random) {
+  /**
+   * `mask`, when given, replaces the default full hexagon as the board shape (same S×S
+   * layout, 1 on board else 0 — see `fieldMask`): a ragged field, not just a hexagon of
+   * radius R. It must be S² long. `rand` is only drawn on when fireRate < 1 (each cell
+   * fires with that chance, all channels together).
+   */
+  constructor(w: NCAWeights, R: number, mask?: Uint8Array, rand: () => number = Math.random) {
     if (!Number.isInteger(R) || R < 1) throw new Error('HexNCA: R must be an integer >= 1');
     const C = w.channels;
     const H = w.hidden;
     const S = side(R);
     const N = S * S;
+    if (mask && mask.length !== N) throw new Error(`HexNCA: mask has ${mask.length} slots, expected ${N} (S=${S})`);
     this.R = R;
     this.S = S;
     this.N = N;
@@ -292,9 +322,12 @@ export class HexNCA {
     this.clamp = w.clamp;
     this.fireRate = w.fireRate;
     this.rand = rand;
-    this.mask = boardMask(R);
+    this.mask = mask ? Uint8Array.from(mask) : boardMask(R);
     this.walls = new Uint8Array(N);
-    this.consts = w.consts.map((name) => buildConst(name, R));
+    // The "mask" const input is this board's own shape, not necessarily the full hexagon
+    // (buildConst('mask', R) would be); every other const (none in the shipped weights)
+    // is positional and shape-independent, so it still comes from buildConst.
+    this.consts = w.consts.map((name) => (name === 'mask' ? Float32Array.from(this.mask) : buildConst(name, R)));
     this.state = new Float32Array(C * N);
     this.next = new Float32Array(C * N);
 
@@ -494,10 +527,10 @@ export class HexNCA {
  */
 const SPAN_EPS = 0.02;
 
-export function targets(walls: ArrayLike<number>, R: number): Uint8Array[] {
+export function targets(walls: ArrayLike<number>, R: number, customMask?: Uint8Array): Uint8Array[] {
   const S = side(R);
   const N = S * S;
-  const mask = boardMask(R);
+  const mask = customMask ?? boardMask(R);
   const theta1 = buildConst('theta1', R);
   const theta2 = buildConst('theta2', R);
   // Regions by breadth-first search, numbered in order of their lowest cell index.
@@ -524,7 +557,20 @@ export function targets(walls: ArrayLike<number>, R: number): Uint8Array[] {
       const row = Math.floor(i / S);
       const col = i % S;
       cells++;
-      if (hexDist(col - R, row - R) === R) {
+      // Rim: an on-board cell with an off-board neighbour (off the array, or off `mask` —
+      // the board's own shape, the full hexagon on the default board). For the default
+      // board this is exactly hexDist(col - R, row - R) === R; for a ragged one (a
+      // Spectacle field) it is the field's own outline, with no extra input needed.
+      let onRim = false;
+      for (const [dr, dc] of NEIGHBOURS) {
+        const r2 = row + dr;
+        const c2 = col + dc;
+        if (r2 < 0 || r2 >= S || c2 < 0 || c2 >= S || !mask[r2 * S + c2]) {
+          onRim = true;
+          break;
+        }
+      }
+      if (onRim) {
         rimCells++;
         if (theta1[i] < t1min) t1min = theta1[i];
         if (theta1[i] > t1max) t1max = theta1[i];

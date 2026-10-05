@@ -57,14 +57,18 @@ a { color: var(--accent); }
 .group { display: grid; gap: 10px; min-width: 0; }
 .label { font: 500 11px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.09em; color: var(--muted); }
 .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
-button { font: 500 14px/1 var(--body); color: var(--fg); background: var(--panel); border: 1px solid var(--hair); border-radius: 4px; padding: 9px 12px; cursor: pointer; }
-button:hover { border-color: var(--accent); }
+button, select { font: 500 14px/1 var(--body); color: var(--fg); background: var(--panel); border: 1px solid var(--hair); border-radius: 4px; padding: 9px 12px; cursor: pointer; }
+button:hover, select:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
 button[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-button:focus-visible, input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mapRow { display: flex; align-items: center; gap: 10px; }
+.mapRow select { flex: 1; min-width: 0; }
 .views { display: flex; flex-wrap: wrap; gap: 6px 16px; }
 .check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
 .slider { display: grid; grid-template-columns: 70px minmax(0, 1fr) 42px; align-items: center; gap: 8px; font-size: 13px; }
+.slider[hidden] { display: none; }
 .slider output { font: 400 13px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
 input[type=range] { width: 100%; accent-color: var(--accent); }
 kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair); border-radius: 3px; padding: 0 4px; }
@@ -101,7 +105,7 @@ dl.readout dd { margin: 0; text-align: right; }
   <div class="bench">
     <div class="stage-col">
       <div class="status" id="status"></div>
-      <div class="stage"><canvas id="board" aria-label="The hexagon field: drag to paint or erase walls"></canvas></div>
+      <div class="stage"><canvas id="board" aria-label="The field: drag to paint or erase walls"></canvas></div>
     </div>
     <div class="side">
       <div class="group" id="weightsGroup" hidden>
@@ -113,17 +117,24 @@ dl.readout dd { margin: 0; text-align: right; }
         <label class="check"><input type="checkbox" id="autoReload"> Reload every 2 minutes (if they changed)</label>
       </div>
       <div class="group">
+        <div class="label">Board</div>
+        <div class="mapRow">
+          <select id="map" title="Which field the automaton runs on"></select>
+        </div>
+        <label class="slider" id="radiusRow" for="radius">Radius <input type="range" id="radius" min="4" max="32" value="8"><output id="radiusOut">8</output></label>
+        <p class="meta" id="mapInfo"></p>
+      </div>
+      <div class="group">
         <div class="label">Draw</div>
         <div class="views">
           <label class="check"><input type="radio" name="tool" id="tool-wall" checked> Wall <kbd>1</kbd></label>
           <label class="check"><input type="radio" name="tool" id="tool-erase"> Erase <kbd>2</kbd></label>
         </div>
         <div class="buttons">
-          <button id="loop">Random loop</button>
-          <button id="bridge">Random bridge</button>
+          <button id="loop" title="Hexagon board only">Random loop</button>
+          <button id="bridge" title="Hexagon board only">Random bridge</button>
           <button id="clear">Clear walls</button>
         </div>
-        <label class="slider" for="radius">Radius <input type="range" id="radius" min="4" max="32" value="8"><output id="radiusOut">8</output></label>
       </div>
       <div class="group">
         <div class="label">Run</div>
