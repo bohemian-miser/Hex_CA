@@ -136,6 +136,20 @@ check "watch: the VM stopped, not deleted -> exit 9" test "$(watch stopped FAKE_
 grep -q 'stopped, not deleted' "$WORK/watch-stopped.log"; check "...and says 'stopped, not deleted'" test $? -eq 0
 fake stale running progress 1200
 check "watch: a 20-minute-old heartbeat -> exit 7" test "$(watch stale)" -eq 7
+# A launch 20 min old whose status.json can't be fetched (a transient failure: the bucket has none, the mirror
+# kept the last one seen, 30 s old): not a dead VM until FETCH_FAILS passes in a row fail.
+fake flaky running progress 30
+printf 'utc\tunix\tevent\tvm\tzone\tlaunch\tmaxHours\tnote\n-\t%s\tcreate\thexca-train\tz\tx\t6\ttest\n' \
+  "$(( $(date +%s) - 1200 ))" >"$WORK/ledger-x.tsv"
+mkdir -p "$WORK/r-flaky/_cloud" && mv "$WORK/wb-flaky/status.json" "$WORK/r-flaky/_cloud/status.last.json"
+check "watch: one failed status fetch (the last heartbeat seen 30 s old) 20 min after the launch -> no exit 7 (exit 0)" \
+  test "$(watch flaky LEDGER="$WORK/ledger-x.tsv" FETCH_PAUSE=0)" -eq 0
+grep -q 'no current status.json this pass: 1 in a row' "$WORK/watch-flaky.log"; check "...and says it used the last one seen" test $? -eq 0
+rm -f "$WORK/r-flaky/_cloud/status.last.json"
+check "watch: no heartbeat fetched in FETCH_FAILS (3) passes in a row, 20 min after the launch -> exit 7" \
+  test "$(env BUCKET="$WORK/wb-flaky" RUNS="$WORK/r-flaky" WATCH_SEC=1 FETCH_PAUSE=0 LEDGER="$WORK/ledger-x.tsv" \
+          bash "$HERE/watch.sh" 1 >"$WORK/watch-flaky3.log" 2>&1; echo $?)" -eq 7
+grep -q 'no heartbeat of this launch fetched in 3 passes' "$WORK/watch-flaky3.log"; check "...and says so, with the count" test $? -eq 0
 fake plateau running plateau 30
 check "watch: a run PLATEAU -> exit 3" test "$(watch plateau)" -eq 3
 check "watch: ...not with WATCH_IGNORE=PLATEAU -> exit 0" test "$(watch plateau WATCH_IGNORE=PLATEAU)" -eq 0
@@ -145,6 +159,7 @@ fake ended "done" progress 30
 check "watch: a run ENDED (all its stages done) -> exit 6" test "$(watch ended)" -eq 6
 
 echo "-- the ledger and launch.sh --dry-run"
+export MAX_HOURS=6 BUDGET_HOURS=6.5  # what these checks assume (env.sh's defaults have moved since)
 now=$(date +%s)
 # shellcheck source-path=SCRIPTDIR source=common.sh
 . "$HERE/common.sh"

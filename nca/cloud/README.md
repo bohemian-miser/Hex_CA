@@ -84,7 +84,9 @@ One stage per line, `run-name | stage-name | minutes | nca.train args` (see `pla
   names its own `--init`; `bucket:PATH` is fetched first;
 - different run-names: in parallel, a process each on the one GPU (`--threads` = 4 / runs unless given);
 - minutes: the stage's time box (`--minutes`). Each run's total + `SETUP_MIN` (25) must fit in `MAX_HOURS`.
-  The lr decays at 60% and 85% of `--iters`, so choose `--iters` that the minutes reach;
+  The VM adds `--schedule time` unless the args name a `--schedule`: the lr decays at 60% and 85% of the
+  stage's minutes (counted across a preemption's resume), so `--iters` is only a cap; with
+  `--schedule iters` the decay is at 60% / 85% of `--iters` again and `--iters` must be one the minutes reach;
 - don't pass `--name`, `--resume`, `--minutes` or `--device`;
 - on a relaunch (after a preemption) the VM pulls `runs/` from the bucket: a stage that ended
   (`{"stopped": "done"}`, `{"stopped": "collapsed"}` = the trainer's collapse guard ran out of rollbacks,
@@ -135,7 +137,7 @@ You have 30 seconds and no context. In `~/projects/hex_ca`:
 | 2 | DONE: the plan is over (`ok` or the reason it gave up); the VM powers itself off | tell the lead to run `down.sh` (deletes the stopped VM, pulls the checkpoints) |
 | 9 | the VM is **stopped, not deleted** (it still costs its disk) | tell the lead to run `down.sh` |
 | 8 | the VM is gone without DONE: Spot preemption or the 6 h limit | the work up to the last minute is in the bucket; the lead may `launch.sh` the same plan again (it resumes) if the budget allows |
-| 7 | the heartbeat is > 10 min old (or none 15 min after the launch) | read `runs/_cloud/startup.log`; if nothing moves, tell the lead (`down.sh`) |
+| 7 | the heartbeat is > 10 min old (or none 15 min after the launch), judged only on a fresh fetch or after `FETCH_FAILS` (3) passes in a row whose fetch failed (each retried `FETCH_TRIES` (3) times); the message gives the real age of the last heartbeat seen (`runs/_cloud/status.last.json`) | read `runs/_cloud/startup.log` and `runs/_cloud/pull.err`; if nothing moves, tell the lead (`down.sh`) |
 | 1 | usage / settings error | read the message |
 
    Once you have seen a PLATEAU / DIVERGED / ENDED and decided to carry on, `WATCH_IGNORE=PLATEAU,ENDED`
@@ -162,7 +164,10 @@ command that creates, changes or deletes. Reading (`watch.sh`, `pull.sh`, `progr
 `SETUP_MIN` (25) budgets for all of that inside `MAX_HOURS`. Check on the first boot: the driver install
 time and whether it rebooted (`startup.log`), the torch version and that it found the GPU, `gpu` utilisation
 in `status.json` (several runs should keep it well above 30%), and each run's it/s in the watch block, to
-size `--iters` for the next plan.
+size `--iters` for the next plan. Each log line splits `secPerIter` into `dataSec` (the training thread's time
+on boards, damage and targets) and `modelSec`; on cuda the board work runs in a producer process
+(`--producer process`, nca/producer.py) a few iterations ahead, so `dataSec` should be near 0 there and
+`prodSec` (the producer's own time per iteration) must stay below `modelSec`, or the GPU waits again.
 
 ## Local test
 

@@ -133,6 +133,8 @@ run_stages() {  # run_stages RUN THREADS: the run's stages, in order
       if [ -f "$CODE/runs/$prev/best.pt" ]; then mode=(--init "runs/$prev/best.pt"); else mode=(--init "runs/$prev/ckpt.pt"); fi
     fi
     [[ " ${argv[*]} " == *" --threads "* ]] || argv+=(--threads "$threads")
+    # the lr decay at 60% / 85% of the stage's time box, not of an --iters the box may never reach
+    [[ " ${argv[*]} " == *" --schedule "* ]] || argv+=(--schedule time)
     set_state "$run" "$stage" "$i" "$n" running
     mkdir -p "$CODE/runs/$dir"
     log "$dir: python -m nca.train --name $dir ${argv[*]} ${mode[*]} --minutes $left"

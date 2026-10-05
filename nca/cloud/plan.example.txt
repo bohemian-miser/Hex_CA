@@ -6,8 +6,9 @@
 #     --threads defaults to 4 / number of runs)
 #   - a stage lives in runs/<run>-<stage>; names are lowercase letters, digits and '-'
 #   - minutes: the stage's time box (passed as --minutes, less what an earlier, preempted try used). Each
-#     run's minutes + SETUP_MIN (25) must fit in MAX_HOURS (6 h). The lr decays at 60% / 85% of --iters,
-#     so pick --iters the minutes can reach (benchmark first), or the decay never comes.
+#     run's minutes + SETUP_MIN (25) must fit in MAX_HOURS (6 h). The VM adds --schedule time (unless the
+#     args name a --schedule): the lr decays at 60% / 85% of the stage's minutes, so --iters is only a cap
+#     (make it one the minutes cannot reach); --schedule iters puts the decay at 60% / 85% of --iters again.
 #   - bucket:PATH is a file in the bucket, fetched first (put it there with gcloud storage cp)
 #   - don't pass --name, --resume, --minutes or --device: the VM sets them
 #

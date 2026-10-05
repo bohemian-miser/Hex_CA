@@ -8,7 +8,10 @@
 #   2  DONE is in the bucket: the plan ended (see its reason) and the VM powers itself off -> run down.sh
 #   8  the VM is gone without DONE: deleted (Spot preemption, --max-run-duration, or down.sh)
 #   9  the VM is stopped, not deleted (it still costs its disk) -> run down.sh
-#   7  the heartbeat (status.json) is older than 10 min, or there is none 15 min after the launch
+#   7  the heartbeat (status.json) is older than 10 min, or there is none 15 min after the launch -- either only
+#      once FETCH_FAILS (3) passes in a row could not fetch a current status.json (each pass retries the fetch
+#      FETCH_TRIES (3) times, FETCH_PAUSE (10) s apart): a transient failed fetch is not a dead VM. The message
+#      gives the real age of the last heartbeat seen (runs/_cloud/status.last.json keeps it)
 #   5  a run is DIVERGED or COLLAPSED (its collapse guard ran out of rollbacks)
 #   4  a run is STALLED       3  a run is PLATEAU
 #   6  a run ENDED (all its stages done, or failed) while others go on
@@ -22,6 +25,9 @@ minutes=${1:-40}
 [[ $minutes =~ ^[0-9]+$ ]] || { echo "usage: watch.sh [minutes]" >&2; exit 1; }
 WATCH_SEC=${WATCH_SEC:-120}
 STALE_SEC=${STALE_SEC:-600}
+FETCH_TRIES=${FETCH_TRIES:-3}
+FETCH_PAUSE=${FETCH_PAUSE:-10}
+FETCH_FAILS=${FETCH_FAILS:-3}
 IGNORE=",${WATCH_IGNORE:-},"
 end=$(( $(date +%s) + 60 * minutes ))
 mkdir -p "$MIRROR"
@@ -29,6 +35,9 @@ read -r launch zone maxh _ < <(ledger_last 2>/dev/null || echo "- - - -")
 created=$(awk -F'\t' -v l="$launch" '$3 == "create" && $6 == l { t = $2 } END { print t + 0 }' "$LEDGER" 2>/dev/null || echo 0)
 
 rank() { case $1 in 5) echo 4 ;; 4) echo 3 ;; 3) echo 2 ;; 6) echo 1 ;; *) echo 0 ;; esac; }  # worst first
+misses=0                   # passes in a row without a current status.json
+last_good=$MIRROR/status.last.json  # the last status.json of this launch fetched (its age is the real one)
+this_launch() { [ -f "$1" ] && { [ "$launch" = - ] || [ "$(json "$1" 'd.get("launch", "")')" = "$launch" ]; }; }
 vm_status() {  # RUNNING, TERMINATED (stopped), ..., or GONE
   if ! is_gs; then echo "${FAKE_VM_STATUS:-RUNNING}"; return; fi
   local s
@@ -41,12 +50,23 @@ note_ledger() {  # note_ledger EVENT [UNIX]: once per launch
 
 while :; do
   bash "$(dirname "$0")/pull.sh" >/dev/null 2>"$MIRROR/pull.err" || true
-  now=$(date +%s)
   st=$MIRROR/status.json
-  s_launch=$(json "$st" 'd.get("launch", "")')
-  if [ -f "$st" ] && [ "$launch" != - ] && [ "$s_launch" != "$launch" ]; then
-    st=/nonexistent   # a heartbeat from an earlier launch says nothing about this one
+  # A failed fetch (pull.sh then has no status.json in the mirror) is retried before it counts as a miss.
+  for _ in $(seq 2 "$FETCH_TRIES"); do
+    this_launch "$st" && break
+    sleep "$FETCH_PAUSE"
+    if get status.json "$st.tmp"; then mv "$st.tmp" "$st"; else rm -f "$st.tmp"; fi
+  done
+  if this_launch "$st" && [ -n "$(json "$st" 'int(d["time"])')" ]; then
+    misses=0
+    cp "$st" "$last_good"
+  else
+    misses=$((misses + 1))
+    echo "  (no current status.json this pass: $misses in a row; using the last one seen)"
+    st=$last_good   # the last heartbeat of this launch seen, if any
+    this_launch "$st" || st=/nonexistent   # (one from an earlier launch says nothing about this one)
   fi
+  now=$(date +%s)
   s_time=$(json "$st" 'int(d["time"])')
   if [ -n "$s_time" ]; then age=$(( now - s_time )); else age=; fi
   vm=$(vm_status)
@@ -101,12 +121,13 @@ while :; do
     note_ledger stop
     exit 9
   fi
-  if [ -n "$age" ] && [ "$age" -gt "$STALE_SEC" ]; then
-    echo "EXIT 7: the heartbeat is ${age}s old (limit ${STALE_SEC}s): the VM's script is stuck or dead. See $MIRROR/startup.log."
+  # A heartbeat counts as stale only when it was fetched fresh this pass, or after FETCH_FAILS failed passes.
+  if [ -n "$age" ] && [ "$age" -gt "$STALE_SEC" ] && { [ "$misses" -eq 0 ] || [ "$misses" -ge "$FETCH_FAILS" ]; }; then
+    echo "EXIT 7: the heartbeat is ${age}s old (limit ${STALE_SEC}s$([ "$misses" -gt 0 ] && echo "; the last $misses fetches failed")): the VM's script is stuck or dead. See $MIRROR/startup.log and $MIRROR/pull.err."
     exit 7
   fi
-  if [ -z "$age" ] && [ "$created" -gt 0 ] && [ $(( now - created )) -gt 900 ]; then
-    echo "EXIT 7: no heartbeat 15 min after the launch. See $MIRROR/startup.log (if any) or the serial console."
+  if [ -z "$age" ] && [ "$created" -gt 0 ] && [ $(( now - created )) -gt 900 ] && [ "$misses" -ge "$FETCH_FAILS" ]; then
+    echo "EXIT 7: no heartbeat of this launch fetched in $misses passes in a row, $(( (now - created) / 60 )) min after the launch (none seen yet). See $MIRROR/startup.log (if any), $MIRROR/pull.err or the serial console."
     exit 7
   fi
   if [ "$worst" -ne 0 ]; then

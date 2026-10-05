@@ -3,6 +3,7 @@
     python -m nca.selftest
 """
 
+import tempfile
 import time
 
 import numpy as np
@@ -331,6 +332,10 @@ def main() -> None:
     snapshot_checks()
     collapse_checks()
     progress_checks()
+    ragged_checks()
+    near_tie_checks()
+    schedule_checks()
+    producer_checks()
     print("\nALL OK")
 
 
@@ -521,7 +526,8 @@ def snapshot_checks() -> None:
                 "last_idx": (np.int64, (B,))}
         for R in (3, 4):
             S = side(R)
-            want.update({f"walls_{R}": (np.uint8, (n, S, S)), f"fill_{R}": (np.float16, (n, S, S)),
+            want.update({f"walls_{R}": (np.uint8, (n, S, S)), f"mask_{R}": (np.uint8, (n, S, S)),
+                         f"fill_{R}": (np.float16, (n, S, S)),
                          f"target_{R}": (np.uint8, (n, S, S)), f"ntargets_{R}": (np.uint8, (n,)),
                          f"loss_{R}": (np.float32, (n,)), f"age_{R}": (np.int32, (n,)),
                          f"edits_{R}": (np.int32, (n,)), f"damage_{R}": (np.int8, (n,)),
@@ -1572,6 +1578,214 @@ def pool_checks() -> None:
           and mx[corner_cell] == np.float32(-0.5) and mn[corner_cell] == np.float32(-0.5),
           "hex_pool by hand: the centre's max is its neighbour's 0.7, not the corner tap's 0.9, its min -0.9; "
           "a board corner on a -0.5 board reads max -0.5 (its off-board taps don't count as 0)")
+
+
+def _area_brute(walls, board, R):
+    """Independent of data.targets: (fills set, depth) on any board by plain BFS over (q, r) dicts, the rim =
+    board cells with a neighbour off the board (or off the array); area only (+ every max-area region)."""
+    S = side(R)
+    cells = {(int(c), int(r)) for r, c in np.argwhere(board == 1)}
+    free = {x for x in cells if not walls[x[1], x[0]]}
+    nbrs = lambda x: [(x[0] + dc, x[1] + dr) for dr, dc in NEIGHBOURS]
+    rim_c = {x for x in cells if any(y not in cells for y in nbrs(x))}
+    seen, regions = set(), []
+    for x in sorted(free):
+        if x in seen:
+            continue
+        comp, stack = {x}, [x]
+        seen.add(x)
+        while stack:
+            for y in nbrs(stack.pop()):
+                if y in free and y not in seen:
+                    seen.add(y)
+                    comp.add(y)
+                    stack.append(y)
+        regions.append(comp)
+    rims = [g for g in regions if g & rim_c]
+    big = max((len(g) for g in rims), default=0)
+    out = []
+    for keep in [g for g in rims if len(g) == big] or [set()]:
+        f = np.zeros((S, S), np.uint8)
+        for g in regions:
+            if g is not keep:
+                for q, r in g:
+                    f[r, q] = 1
+        out.append(f.tobytes())
+    depth = np.full((S, S), -1, np.int16)
+    front = sorted(free & rim_c)
+    for q, r in front:
+        depth[r, q] = 0
+    for x in front:
+        for y in nbrs(x):
+            if y in free and depth[y[1], y[0]] < 0:
+                depth[y[1], y[0]] = depth[x[1], x[0]] + 1
+                front.append(y)
+    return set(out), depth
+
+
+def ragged_checks() -> None:
+    """Ragged board masks (nca/masks.py) and the targets on them (data.targets with board=)."""
+    from .data import _axial_dist, area_ratio, damage_walls, edge
+    from .masks import blob_mask, field, field_mask, ragged_mask
+
+    print("\n-- ragged boards (nca/masks.py; review item 1b) --")
+    check(all(np.array_equal(edge(mask(R) == 1), rim(R)) for R in range(0, 25)),
+          "data.edge (on-board cells with an off-board neighbour) of the hexagon is its rim(R), R 0..24")
+    q3, d3 = field(3)
+    q4, d4 = field(4)
+    check(len(q3) == 496 and len(q4) == 3905 and len({tuple(x) for x in q4}) == 3905 and d4.min() == 1,
+          f"Spectacle's hex fields (nca/fields): level 3 = 496 tiles, level 4 = 3,905 distinct axial cells "
+          f"({int((d4 == 1).sum())} on its outline)")
+    rng = np.random.default_rng(4242)
+    ok, shares, concave, src = True, [], 0, {"blob": 0, "field": 0}
+    for i in range(60):
+        R = int(rng.integers(3, 17))
+        m = (blob_mask(rng, R) if i % 2 else field_mask(rng, R, 3 + i % 4 // 2)) == 1
+        src["blob" if i % 2 else "field"] += 1
+        lab = _labels(m, R)
+        off = _labels((mask(R) == 1) & ~m, R)
+        holes = [k for k in range(int(off.max()) + 1) if not ((off == k) & rim(R)).any()]
+        ok &= bool(m.any()) and not (m & (mask(R) == 0)).any() and lab.max() == 0 and not holes
+        shares.append(m.sum() / mask(R).sum())
+        # concave: a board cell outside it with 4+ of its 6 neighbours on board (a notch / bay)
+        nb_on = sum(np.roll(np.roll(m, dr, 0), dc, 1) for dr, dc in NEIGHBOURS)
+        concave += bool((~m & (mask(R) == 1) & (nb_on >= 4)).any())
+    check(ok and min(shares) >= 0.3, f"60 ragged masks (blobs and level-3/4 field crops, R 3..16): inside the "
+          f"hexagon, one component, no holes, {min(shares):.2f}..{max(shares):.2f} of its cells; {concave} have a "
+          f"concave bay (an off-board cell with 4+ board neighbours)")
+    n_ok, n_multi, dmg_ok, n = 0, 0, True, 0
+    for i in range(80):
+        R = int(rng.integers(3, 9))
+        m = ragged_mask(rng, R)
+        w = random_walls(rng, R, "bridge" if i % 2 else None, board=m)
+        fills, depth = targets(w, R, m)
+        want, bdepth = _area_brute(w, m, R)
+        got = {f.tobytes() for f in fills}
+        n_ok += want <= got and np.array_equal(depth, bdepth) and not w[m == 0].any() and not fills[:, m == 0].any()
+        n_multi += len(want) > 0 and fills[0][edge(m == 1)].any()
+        for kind in ("edit", "burst", "erase", "stamp"):
+            d = damage_walls(rng, w, R, kind, board=m)
+            dmg_ok &= not d[m == 0].any()
+        n += 1
+    check(n_ok == n and dmg_ok, f"targets on {n} random ragged boards (R 3..8): every max-area answer of an "
+          f"independent brute force (rim = board cells with an off-board neighbour) is acceptable, depth equal; "
+          f"walls, targets and damage stay on the board ({n_multi} boards fill a rim cell: 2+ rim regions)")
+    R = 6
+    S = side(R)
+    m = np.zeros((S, S), np.uint8)  # two lobes, (q, r) within 2 of (-4, 0) and of (3, 0), and a neck (-1, 0), (0, 0)
+    m[_axial_dist(R, -4, 0) <= 2] = 1
+    m[_axial_dist(R, 3, 0) <= 2] = 1
+    m[R, R - 1:R + 1] = 1
+    w = np.zeros((S, S), np.uint8)
+    w[R, R] = 1  # wall (0, 0): the left lobe and (-1, 0) = 20 cells, the right lobe 19
+    f, _ = targets(w, R, m)
+    check(f[0].sum() == 19 and not f[0][:, :R + 1].any() and area_ratio(w, R, m) == 19 / 20,
+          f"a wall across a one-cell isthmus cuts a ragged board in two: the primary target fills the smaller side "
+          f"(19 cells) and leaves the larger (20) empty ({len(f)} acceptable: the two spans round the centroid are "
+          f"within EPS, so the other side is acceptable too)")
+
+
+def near_tie_checks() -> None:
+    """--near-tie: data.random_walls(near_tie=) biases bridge boards towards area ratio >= NEAR_RATIO."""
+    from .data import NEAR_RATIO, area_ratio
+
+    print("\n-- near-tie bridges (--near-tie; review item 2) --")
+    out = {}
+    for nt in (0.0, 0.5, 1.0):
+        rng = np.random.default_rng(99)
+        rs = np.array([area_ratio(random_walls(rng, 8, "bridge", near_tie=nt), 8) for _ in range(150)])
+        rs = rs[rs == rs]
+        out[nt] = float((rs >= NEAR_RATIO).mean())
+    a = np.random.default_rng(3)
+    b = np.random.default_rng(3)
+    same = all(np.array_equal(random_walls(a, 6), random_walls(b, 6, near_tie=0.0)) for _ in range(20))
+    check(out[0.0] < 0.4 and out[1.0] > 0.9 and out[0.0] < out[0.5] < out[1.0] and same,
+          f"share of bridge boards (2+ rim regions, R 8) with area ratio >= {NEAR_RATIO}: {out[0.0]:.2f} at "
+          f"near_tie 0, {out[0.5]:.2f} at 0.5, {out[1.0]:.2f} at 1; near_tie 0 draws the stream as before")
+
+
+def schedule_checks() -> None:
+    """--schedule time: lr_at with frac (the share of the time box used) instead of it / iters."""
+    from .train import lr_at
+
+    print("\n-- lr schedule by time (--schedule time) --")
+    check(lr_at(10, 10 ** 6, 1e-3, frac=0.59) == 1e-3 and abs(lr_at(10, 10 ** 6, 1e-3, frac=0.6) - 3e-4) < 1e-12
+          and abs(lr_at(10, 10 ** 6, 1e-3, frac=0.9) - 1e-4) < 1e-12
+          and abs(lr_at(10 ** 6 - 1, 10 ** 6, 1e-3, frac=0.1) - 1e-3) < 1e-12,
+          "lr_at(frac=): x1 before 60% of the time box, x0.3 from 60%, x0.1 from 85%, whatever it / iters is")
+    with tempfile.TemporaryDirectory() as tmp:
+        lines = _train_tiny(tmp, "sch", ["--iters", "100000", "--schedule", "time", "--minutes", "0.6",
+                                         "--warmup", "0", "--lr", "1e-3", "--lr-floor", "0"])
+    st = lines[0]["schedule"]
+    lrs = [(x["schedFrac"], x["lr"]) for x in lines if "schedFrac" in x]
+    stop = lines[-1]
+    good = all(abs(lr - 1e-3 * (1 if f < 0.6 else 0.3 if f < 0.85 else 0.1)) < 1e-9 or abs(f - 0.6) < 0.05
+               or abs(f - 0.85) < 0.05 for f, lr in lrs)
+    check(st["mode"] == "time" and st["boxMin"] == 0.6 and stop.get("stopped") == "time" and good
+          and any(lr < 1e-3 for _, lr in lrs),
+          f"a 0.6-minute run with --iters 100000 --schedule time: the start line says {st}; its lr decays on time "
+          f"({len(lrs)} lines, the last at schedFrac {lrs[-1][0] if lrs else None} with lr {lrs[-1][1] if lrs else None})")
+
+
+def _train_tiny(tmp, name, extra):
+    """Run nca.train in-process (cwd tmp) on a tiny config; returns its log lines."""
+    import contextlib
+    import io
+    import json
+    import os
+    import sys
+
+    import torch
+
+    from . import train
+    base = ["nca.train", "--name", name, "--R", "3", "4", "--batch", "4", "--pool-size", "16", "--hidden", "16",
+            "--eval-mults", "1", "--eval-every", "50", "--eval-n", "4", "--snap-every", "0", "--threads", "1",
+            "--device", "cpu"]
+    cwd, argv, nt = os.getcwd(), sys.argv, torch.get_num_threads()
+    try:
+        os.chdir(tmp)
+        sys.argv = base + extra
+        with contextlib.redirect_stdout(io.StringIO()):
+            train.main()
+        with open(f"runs/{name}/log.jsonl") as f:
+            return [json.loads(x) for x in f]
+    finally:
+        os.chdir(cwd)
+        sys.argv = argv
+        torch.set_num_threads(nt)
+
+
+def producer_checks() -> None:
+    """The data producer (nca/producer.py): inline, thread and process give the same run, bit for bit, and a
+    --resume rebuilds it exactly (weights, pool states, boards, bookkeeping)."""
+    import torch
+
+    print("\n-- the data producer (--producer; review item 5) --")
+    extra = ["--warmup", "0", "--lr", "5e-4", "--lr-floor", "5e-4", "--mask-mix", "0.5", "--near-tie", "0.5"]
+    load = lambda tmp, n: torch.load(f"{tmp}/runs/{n}/ckpt.pt", map_location="cpu", weights_only=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        lines = {}
+        for mode in ("inline", "thread", "process"):
+            lines[mode] = _train_tiny(tmp, mode, extra + ["--iters", "60", "--producer", mode])
+        _train_tiny(tmp, "res", extra + ["--iters", "30", "--producer", "process"])
+        _train_tiny(tmp, "res", extra + ["--iters", "60", "--producer", "inline", "--resume"])
+        a = load(tmp, "inline")
+        same = {}
+        for n in ("thread", "process", "res"):
+            b = load(tmp, n)
+            same[n] = (all(torch.equal(a["model"][k], b["model"][k]) for k in a["model"])
+                       and all(torch.equal(a["pool"][R]["state"], b["pool"][R]["state"]) for R in a["pool"])
+                       and all(np.array_equal(a["pool"][R][k], b["pool"][R][k]) for R in a["pool"]
+                               for k in ("walls", "fill", "depth", "mask", "born", "edits", "last"))
+                       and a["dataRng"] == b["dataRng"])
+        timed = [x for x in lines["process"] if "dataSec" in x]
+        ragged = any((a["pool"][R]["mask"] != mask(int(R))[None]).any() for R in a["pool"])
+    check(all(same.values()) and ragged,
+          f"60 iterations with --producer inline, thread, process, and process to 30 then --resume inline to 60: "
+          f"identical weights, pool states, boards (with ragged masks), bookkeeping and producer rng ({same})")
+    check(all(x["dataSec"] is not None and x["modelSec"] is not None and x["prodSec"] > 0 for x in timed),
+          f"every log line splits secPerIter into dataSec + modelSec, and has prodSec (e.g. {timed[-1]['dataSec']:.4f} "
+          f"+ {timed[-1]['modelSec']:.4f}, producer {timed[-1]['prodSec']:.4f} s)")
 
 
 if __name__ == "__main__":
