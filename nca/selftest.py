@@ -340,7 +340,7 @@ def main() -> None:
 
 
 def damage_checks() -> None:
-    """The training pool's damage kinds (data.damage_walls a-d, train.damage_state e)."""
+    """The training pool's damage kinds (data.damage_walls a-d, train.damage_state e, kind "spiral" f)."""
     import torch
 
     from .data import WALL_DAMAGE, damage_walls, disc
@@ -395,6 +395,26 @@ def damage_checks() -> None:
     check(nb >= 36 and nl >= 24, f"a stamped bridge splits an empty board into 2+ rim regions ({nb}/40), a stamped "
           f"loop fills something ({nl}/40; a blob run over the rim is open to the edge)")
 
+    # The "spiral" damage kind (producer.DAMAGE_KINDS' sixth): only adds walls, usually changes the board;
+    # and (kind "spiral-closed" itself, data._walls_spiral_closed) a closed spiral usually fills its
+    # corridor.
+    spiral_only_adds, spiral_changed, spiral_fills = True, 0, 0
+    n_spiral = 60
+    for _ in range(n_spiral):
+        R = int(rng.integers(3, 9))
+        on = mask(R) == 1
+        w = random_walls(rng, R)
+        d = damage_walls(rng, w, R, "spiral")
+        spiral_only_adds &= d.dtype == np.uint8 and d.shape == w.shape and set(np.unique(d)) <= {0, 1} \
+            and int(d[~on].sum()) == 0 and not ((d == 0) & (w == 1)).any()
+        spiral_changed += bool((d != w).any())
+    for _ in range(40):
+        closed = random_walls(rng, 8, kind="spiral-closed")
+        spiral_fills += bool(targets(closed, 8)[0][0].any())
+    check(spiral_only_adds and spiral_changed >= 0.9 * n_spiral,
+          f"spiral damage only adds walls and changes the board ({spiral_changed}/{n_spiral})")
+    check(spiral_fills >= 22, f"a closed spiral (kind spiral-closed) usually fills its corridor ({spiral_fills}/40)")
+
     # Edits pile up: three in a row change the board further (nothing toggles back).
     w = random_walls(rng, 6)
     w1 = damage_walls(rng, w, 6, "stamp")
@@ -440,8 +460,10 @@ def pool_stat_checks() -> None:
           f"(= the primary target fills a rim cell), density {st['density']}")
     ok_band = all(BAND[k][0] <= st[k] <= BAND[k][1] for k in BAND)
     calm = steer(st)
-    check(ok_band and calm["why"] == [] and calm["newMult"] == 1 and calm["p"] == [0.2] * 5,
-          "a fresh pool is in BAND, and steer leaves it alone (uniform damage, new boards as usual)")
+    uniform = [round(1 / len(DAMAGE_KINDS), 4)] * len(DAMAGE_KINDS)
+    check(ok_band and calm["why"] == [] and calm["newMult"] == 1 and calm["p"] == uniform,
+          f"a fresh pool is in BAND, and steer leaves it alone (uniform damage over {len(DAMAGE_KINDS)} kinds, "
+          f"new boards as usual)")
     i = {k: n for n, k in enumerate(DAMAGE_KINDS)}
     lo = steer({"fill": 0.2, "multiRim": 0.1, "density": 0.2})
     dense = steer({"fill": 0.6, "multiRim": 0.4, "density": 0.6})
@@ -1663,7 +1685,7 @@ def ragged_checks() -> None:
         got = {f.tobytes() for f in fills}
         n_ok += want <= got and np.array_equal(depth, bdepth) and not w[m == 0].any() and not fills[:, m == 0].any()
         n_multi += len(want) > 0 and fills[0][edge(m == 1)].any()
-        for kind in ("edit", "burst", "erase", "stamp"):
+        for kind in ("edit", "burst", "erase", "stamp", "spiral"):
             d = damage_walls(rng, w, R, kind, board=m)
             dmg_ok &= not d[m == 0].any()
         n += 1

@@ -1,0 +1,15 @@
+# Launch 6 (2026-10-06): a spiral fine-tune from launch 4's fb-r6816nt/best.pt (the review's queue, fb's
+# first stage: R 6 8 12 16, near-tie bridges). Spirals (data.py: closed, their knocked-out near-twin, open,
+# and sometimes rim-attached) are now a first-class ~12% of every pool's new boards by default -- no flag
+# needed -- so a fresh pool off this checkpoint sees them from iteration 0; fb-r6816nt itself never did.
+# Two independent runs, same hyperparameters as that stage (lr, radii, batch, pool, mask-mix, near-tie),
+# differing only in seed: a basic replicate against bad luck, same as plan.example.txt's own benchmark.
+# ~2.5 h wall (both runs share the one GPU) + SETUP_MIN -> ~2.9 h total.
+# Go / no-go: nca/evaluate.py's "spiral closed" / "spiral knockout" / "spiral open" sets on the pulled
+# best.pt files, same n/radii as the Pi baseline (n~100, R 8 and 16) plus a couple of larger radii (12, 16)
+# for headroom; compare against fb-r6816nt's own baseline (evaluated cold, before this fine-tune, since it
+# never trained on spirals) to see how much the fine-tune moved spiral exactness. The quick check's own
+# spiralClosed/spiralKnockout/spiralOpen (train.py heldout()) show the same thing per radius as it trains,
+# on the dashboard.
+sa | r6816sp | 150 | --R 6 8 12 16 --steps-mult 3 6 --lr 5e-5 --lr-floor 5e-6 --batch 16 --pool-size 512 --hidden 256 --channels 24 --mask-mix 0.5 --near-tie 0.5 --seed 1 --iters 400000 --collapse-frac 0.85 --eval-every 1000 --eval-n 64 --ckpt-every 1000 --snap-every 100 --init bucket:runs/fb-r6816nt/best.pt
+sb | r6816sp | 150 | --R 6 8 12 16 --steps-mult 3 6 --lr 5e-5 --lr-floor 5e-6 --batch 16 --pool-size 512 --hidden 256 --channels 24 --mask-mix 0.5 --near-tie 0.5 --seed 2 --iters 400000 --collapse-frac 0.85 --eval-every 1000 --eval-n 64 --ckpt-every 1000 --snap-every 100 --init bucket:runs/fb-r6816nt/best.pt
