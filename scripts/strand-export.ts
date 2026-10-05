@@ -11,6 +11,12 @@
  *   npx tsx scripts/strand-export.ts [--out data/strand] [--taps 32] [--crops 16] [--seed 1]
  *       [--eval-taps 64] [--eval-crops 16] [--crop-radius 8-14] [--rules 0-99] [--spectacle DIR]
  *
+ * With --rule-table it writes the v2 data instead (docs/spectacle-nca-options.md §5.2, docs/strand-data.md
+ * "v2"): the whole hex kernel as a rule table, the boards' geometry, and a parity sample walked by walkStrand:
+ *
+ *   npx tsx scripts/strand-export.ts --rule-table [--out data/strand-v2] [--l4-crops 2048] [--l4-eval-crops 64]
+ *       [--parity-big 1556] [--parity-taps 16] [--seed 1] [--crop-radius 8-14] [--spectacle DIR]
+ *
  * Conventions (identical to nca/hexgrid.py and src/hex.ts):
  *   axial (q, r); array index row = r - r0, col = q - q0 (r0, q0 stored per board, i.e. the
  *   "offset" of hexgrid.py is -r0 / -q0); direction d in 0..5 is src/hex.ts DIRS[d] as (dq, dr):
@@ -75,6 +81,7 @@ interface Spectacle {
   validEdgeSubsets(family: string): readonly { edges: readonly number[] }[];
   nonCrossingForTile(family: string, type: string, selected: ReadonlySet<number>): readonly number[];
   edgeLabels(family: string, type: string): readonly string[];
+  localChords(family: string, type: string, selected: ReadonlySet<number>, matchingIndex: number): readonly Segment[];
   HEX_LEAF_ORDER: readonly string[];
   HEX_PTS: readonly Pt[];
 }
@@ -742,6 +749,302 @@ function packFile(acc: Accum, rule: RuleRec, level: number): Buffer {
 }
 
 // ---------------------------------------------------------------------------------------------
+// v2 (--rule-table): the whole hex kernel for the rule-at-the-tap CA (docs/spectacle-nca-options.md §2, §5.2).
+// Writes, under --out (default data/strand-v2):
+//   rules-hex.json  per leaf type its six local edges' classes; per kernel subset (all 7, class 0 included)
+//                   and leaf type the non-crossing matchings in Spectacle's order and each one's local chords;
+//                   the v2 split's definition, per-subset check values and keyed samples (for nca/strand/rules.py)
+//   boards.npz      geometry only, per group (L2, L3 = the nine root patches; L4 = training crops; L4eval = eval
+//                   crops; L4full = the full Delta patch): tile type, rotation, index; mirror sign per board
+//   parity.npz      every rule of the six small subsets + a seeded sample of the fully packed one, each on one
+//                   board (L2 / L3 / L4 crop in turn): Spectacle's own chord rendering (15 bits per cell, from
+//                   chordTableFor + the tiles' transforms), its whole-board strand decomposition and --parity-taps
+//                   taps walked by walkStrand both ways (python -m nca.strand.rules --parity compares)
+
+const SPLIT_SALT_V2 = 'strand-split-v2';
+const HEX_MAJORS = [0, 1, 2, 3, 4, 5, 6, 8];
+
+interface SubsetTable {
+  edges: number[];
+  /** Per leaf type: its non-crossing matching indices in Spectacle's order ([0] when the type draws nothing). */
+  options: number[][];
+  /** Per leaf type, per option: the chords as [local edge of end 0, local edge of end 1]. */
+  localPairs: number[][][][];
+  count: number;
+}
+
+function midpointEdge(S: Spectacle): (p: Pt) => number {
+  const P = S.HEX_PTS;
+  const mids = P.map((p, k) => ({ x: (p.x + P[(k + 1) % 6].x) / 2, y: (p.y + P[(k + 1) % 6].y) / 2 }));
+  return (p: Pt): number => {
+    const k = mids.findIndex((m) => Math.abs(m.x - p.x) < EPS && Math.abs(m.y - p.y) < EPS);
+    if (k < 0) throw new Error(`chord end (${p.x}, ${p.y}) is not an edge midpoint`);
+    return k;
+  };
+}
+
+function ruleTableV2(S: Spectacle): { labels: string[][]; typeMajors: number[][]; subsets: SubsetTable[] } {
+  const order = S.HEX_LEAF_ORDER;
+  const edgeAt = midpointEdge(S);
+  const labels = order.map((t) => [...S.edgeLabels('hex', t)]);
+  const typeMajors = labels.map((ls) => ls.map((l) => Number(/^-?(\d+)\./.exec(l)![1])));
+  const subsets = S.validEdgeSubsets('hex')
+    .filter((v) => v.edges.length > 0)
+    .map(({ edges }) => {
+      const sel = new Set(edges);
+      const options = order.map((t) => {
+        const a = S.nonCrossingForTile('hex', t, sel);
+        return a.length ? [...a] : [0];
+      });
+      const localPairs = order.map((t, i) =>
+        options[i].map((m) => S.localChords('hex', t, sel, m).map(([a, b]) => [edgeAt(a), edgeAt(b)])),
+      );
+      return { edges: [...edges], options, localPairs, count: options.reduce((n, o) => n * o.length, 1) };
+    });
+  return { labels, typeMajors, subsets };
+}
+
+/** Rule `index` of a subset as digits (positions among each type's options): mixed radix, Delta most significant. */
+function digitsOf(sub: SubsetTable, index: number): number[] {
+  const d = new Array<number>(sub.options.length);
+  for (let t = sub.options.length - 1; t >= 0; t--) {
+    const n = sub.options[t].length;
+    d[t] = index % n;
+    index = Math.floor(index / n);
+  }
+  return d;
+}
+
+const ruleOfDigits = (sub: SubsetTable, digits: readonly number[]): PlayerRule => ({
+  family: 'hex',
+  subset: sub.edges,
+  matching: digits.map((k, t) => sub.options[t][k]),
+});
+
+/** Spectacle's ruleKey without the call (the split hashes all 1.95 M rules); checked against ruleKey below. */
+const keyOfDigits = (sub: SubsetTable, digits: readonly number[]): string =>
+  `hex|${sub.edges.join('')}|${digits.map((k, t) => sub.options[t][k]).join('.')}`;
+
+/**
+ * The v2 split, stratified by subset: of each subset's n rules, the round(0.2 n) with the smallest
+ * (splitHash(`strand-split-v2|` + ruleKey), index) are held out. Returns the check values rules.py must match.
+ */
+function splitV2(sub: SubsetTable): { n: number; k: number; thrHash: number; thrIndex: number; xor: number; sum: number } {
+  const n = sub.count;
+  if (n >= 2 ** 21) throw new Error('subset too big for the (hash, index) packing');
+  const keys = new Float64Array(n);
+  for (let i = 0; i < n; i++) keys[i] = splitHash(`${SPLIT_SALT_V2}|${keyOfDigits(sub, digitsOf(sub, i))}`) * 2 ** 21 + i;
+  const k = Math.round(HELDOUT_SHARE * n);
+  const thr = keys.slice().sort()[k - 1];
+  let xor = 0;
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    if (keys[i] <= thr) {
+      xor ^= i;
+      sum = (sum + i) % 2 ** 32;
+    }
+  }
+  return { n, k, thrHash: Math.floor(thr / 2 ** 21), thrIndex: thr % 2 ** 21, xor, sum };
+}
+
+function packBoards(prefix: string, boards: Board[], out: Record<string, [Arr, readonly number[]]>): void {
+  const B = boards.length;
+  const H = Math.max(...boards.map((b) => b.h));
+  const W = Math.max(...boards.map((b) => b.w));
+  const type = new Int8Array(B * H * W).fill(-1);
+  const rot = new Int8Array(B * H * W).fill(-1);
+  const tile = new Int32Array(B * H * W).fill(-1);
+  boards.forEach((b, bi) => {
+    b.old.forEach((t, i) => {
+      const o = bi * H * W + (b.ra[i] - b.r0) * W + (b.qa[i] - b.q0);
+      tile[o] = t;
+      type[o] = b.lat.field.types[t];
+      rot[o] = b.g[b.lat.rot[t]];
+    });
+  });
+  const i32 = (f: (b: Board) => number): Int32Array => Int32Array.from(boards.map(f));
+  const i8 = (f: (b: Board) => number): Int8Array => Int8Array.from(boards.map(f));
+  out[`${prefix}_type`] = [type, [B, H, W]];
+  out[`${prefix}_rot`] = [rot, [B, H, W]];
+  out[`${prefix}_tile`] = [tile, [B, H, W]];
+  out[`${prefix}_mirror`] = [i8((b) => b.mirror), [B]];
+  out[`${prefix}_root`] = [i8((b) => b.root), [B]];
+  out[`${prefix}_orient`] = [i8((b) => b.orient), [B]];
+  out[`${prefix}_h`] = [i32((b) => b.h), [B]];
+  out[`${prefix}_w`] = [i32((b) => b.w), [B]];
+  out[`${prefix}_tiles`] = [i32((b) => b.old.length), [B]];
+}
+
+async function mainV2(args: Record<string, string>, root: string): Promise<void> {
+  const t0 = performance.now();
+  const spectacleDir = resolve(root, args.spectacle ?? process.env.SPECTACLE_DIR ?? '../Spectacle');
+  const outDir = resolve(root, args.out ?? 'data/strand-v2');
+  const seed = Number(args.seed ?? 1);
+  const nCrops = Number(args['l4-crops'] ?? 2048);
+  const nEvalCrops = Number(args['l4-eval-crops'] ?? 64);
+  const nBig = Number(args['parity-big'] ?? 1556);
+  const parityTaps = Number(args['parity-taps'] ?? 16);
+  const [rlo, rhi] = range(args['crop-radius'] ?? '8-14');
+  const EVAL_SEED = 20261006;
+  const S = await loadSpectacle(spectacleDir);
+  const leaf = S.HEX_LEAF_ORDER;
+  mkdirSync(outDir, { recursive: true });
+
+  // The rule table, and the split.
+  const table = ruleTableV2(S);
+  const rng = mulberry32(seed * 7919 + 2);
+  const samples: { subset: number; index: number; digits: number[]; key: string; hash: number }[] = [];
+  table.subsets.forEach((sub, si) => {
+    for (let j = 0; j < 64; j++) {
+      const index = Math.floor(rng() * sub.count);
+      const digits = digitsOf(sub, index);
+      const key = S.ruleKey(ruleOfDigits(sub, digits));
+      if (key !== keyOfDigits(sub, digits)) throw new Error(`ruleKey ${key} != ${keyOfDigits(sub, digits)}`);
+      samples.push({ subset: si, index, digits, key, hash: splitHash(`${SPLIT_SALT_V2}|${key}`) });
+    }
+  });
+  const split = table.subsets.map(splitV2);
+  const tTable = performance.now();
+
+  // Boards (geometry only).
+  const lattice = (level: number, ri: number): Lattice => latticeOf(S, S.buildField({ family: 'hex', level, rootTile: leaf[ri] }));
+  const lats = new Map<string, Lattice>();
+  for (const level of [2, 3, 4]) for (let ri = 0; ri < leaf.length; ri++) lats.set(`${level}/${ri}`, lattice(level, ri));
+  const groups: Record<string, Board[]> = {
+    L2: leaf.map((_, ri) => boardOf(lats.get(`2/${ri}`)!, 2, ri, null)),
+    L3: leaf.map((_, ri) => boardOf(lats.get(`3/${ri}`)!, 3, ri, null)),
+    L4: [],
+    L4eval: [],
+    L4full: [boardOf(lats.get('4/0')!, 4, 0, null)],
+  };
+  for (const [name, n, s] of [['L4', nCrops, seed], ['L4eval', nEvalCrops, EVAL_SEED]] as const) {
+    const r = mulberry32((s * 1000003 + 4) >>> 0);
+    for (let k = 0; k < n; k++) {
+      const ri = Math.floor(r() * leaf.length);
+      groups[name].push(cropBoard(lats.get(`4/${ri}`)!, 4, ri, r, rlo, rhi));
+    }
+  }
+  const boardArrays: Record<string, [Arr, readonly number[]]> = {};
+  for (const [name, bs] of Object.entries(groups)) packBoards(name, bs, boardArrays);
+  writeFileSync(join(outDir, 'boards.npz'), npz(boardArrays));
+  const tBoards = performance.now();
+
+  // Parity: Spectacle's rendering and walks for a sample of rules from every subset.
+  const big = table.subsets.length - 1;
+  const picks: { subset: number; index: number }[] = [];
+  table.subsets.forEach((sub, si) => {
+    if (si !== big) for (let i = 0; i < sub.count; i++) picks.push({ subset: si, index: i });
+  });
+  const prng = mulberry32(seed * 7919 + 3);
+  const seen = new Set<number>();
+  while (seen.size < Math.min(nBig, table.subsets[big].count)) seen.add(Math.floor(prng() * table.subsets[big].count));
+  for (const i of [...seen].sort((a, b) => a - b)) picks.push({ subset: big, index: i });
+  const acc = newAccum();
+  const sGroup: number[] = [];
+  const sBoard: number[] = [];
+  const bits: Int16Array[] = [];
+  const order = ['L2', 'L3', 'L4'];
+  picks.forEach((pk, j) => {
+    const g = j % 3;
+    const bs = groups[order[g]];
+    const bi = Math.floor(prng() * bs.length);
+    const sub = table.subsets[pk.subset];
+    const at = acc.boards.length;
+    addBoard(S, acc, bs[bi], ruleOfDigits(sub, digitsOf(sub, pk.index)), parityTaps, prng);
+    const b = bs[bi];
+    const HW = b.h * b.w;
+    const out = new Int16Array(HW);
+    const ch = acc.chords[at];
+    for (let p = 0; p < 15; p++) for (let c = 0; c < HW; c++) if (ch[p * HW + c]) out[c] |= 1 << p;
+    bits.push(out);
+    acc.chords[at] = new Uint8Array(0); // keep memory flat: the bits are all parity needs
+    acc.chordStrand[at] = new Int32Array(0);
+    sGroup.push(g);
+    sBoard.push(bi);
+    if (j % 100 === 0) process.stdout.write(`\rparity ${j}/${picks.length}   `);
+  });
+  process.stdout.write('\n');
+  const B = acc.boards.length;
+  const H = Math.max(...acc.boards.map((b) => b.h));
+  const W = Math.max(...acc.boards.map((b) => b.w));
+  const chordBits = new Int16Array(B * H * W);
+  acc.boards.forEach((b, bi) => {
+    for (let r = 0; r < b.h; r++) for (let c = 0; c < b.w; c++) chordBits[(bi * H + r) * W + c] = bits[bi][r * b.w + c];
+  });
+  const T = acc.tap.board.length;
+  const N = acc.step.row.length;
+  const NS = acc.strandLen.length;
+  writeFileSync(
+    join(outDir, 'parity.npz'),
+    npz({
+      sample_subset: [Int8Array.from(picks.map((p) => p.subset)), [B]],
+      sample_index: [Int32Array.from(picks.map((p) => p.index)), [B]],
+      sample_group: [Int8Array.from(sGroup), [B]],
+      sample_board: [Int32Array.from(sBoard), [B]],
+      chord_bits: [chordBits, [B, H, W]],
+      strand_len: [Int32Array.from(acc.strandLen), [NS]],
+      strand_closed: [Uint8Array.from(acc.strandClosed), [NS]],
+      strand_board: [Int32Array.from(acc.strandBoard), [NS]],
+      tap_board: [Int32Array.from(acc.tap.board), [T]],
+      tap_row: [Int16Array.from(acc.tap.row), [T]],
+      tap_col: [Int16Array.from(acc.tap.col), [T]],
+      tap_d0: [Int8Array.from(acc.tap.d0), [T]],
+      tap_d1: [Int8Array.from(acc.tap.d1), [T]],
+      tap_closed: [Uint8Array.from(acc.tap.closed), [T]],
+      tap_ptr: [Int32Array.from(acc.tap.ptr), [T + 1]],
+      step_row: [Int16Array.from(acc.step.row), [N]],
+      step_col: [Int16Array.from(acc.step.col), [N]],
+      step_in: [Int8Array.from(acc.step.din), [N]],
+      step_out: [Int8Array.from(acc.step.dout), [N]],
+      step_index: [Int32Array.from(acc.step.index), [N]],
+    }),
+  );
+  const tEnd = performance.now();
+
+  const meta = {
+    version: 2,
+    generated: new Date().toISOString(),
+    spectacle: spectacleDir,
+    args: { seed, l4Crops: nCrops, l4EvalCrops: nEvalCrops, parityBig: nBig, parityTaps, cropRadius: [rlo, rhi], evalSeed: EVAL_SEED },
+    conventions: {
+      dirs_dq_dr: DIRS,
+      pairs: PAIRS,
+      leaf_order: leaf,
+      majors: HEX_MAJORS,
+      tile_rot: 'board direction of local edge k = (board_mirror * k + tile_rot) mod 6 (as v1)',
+      rule: 'a rule = (subset, digits): digit t = position of type t\'s matching among options[t]; index = digits in mixed radix, Delta most significant',
+      key: 'Spectacle ruleKey: hex|<subset digits>|<matching indices joined by .>',
+      split: `per subset, the round(${HELDOUT_SHARE} * n) rules with the smallest (fmix32(FNV-1a('${SPLIT_SALT_V2}|' + key)), index) are held out`,
+      boards: 'boards.npz: <group>_type/rot/tile [B,H,W] (-1 off board), <group>_mirror/root/orient/h/w/tiles [B]; groups L2, L3, L4 (training crops), L4eval (eval crops, seed evalSeed), L4full (the Delta patch)',
+      parity: 'parity.npz: sample s = rule (sample_subset, sample_index) on board (sample_group 0 L2 / 1 L3 / 2 L4, sample_board); chord_bits bit p = PAIRS[p]; strands and taps as v1 (strand_board / tap_board = sample)',
+    },
+    type_labels: table.labels,
+    type_majors: table.typeMajors,
+    subsets: table.subsets.map((sub, si) => ({
+      key: sub.edges.join(''),
+      edges: sub.edges,
+      count: sub.count,
+      options: sub.options,
+      local_pairs: sub.localPairs,
+      split: split[si],
+    })),
+    samples,
+    boards: Object.fromEntries(
+      Object.entries(groups).map(([k, bs]) => [k, { n: bs.length, box: [Math.max(...bs.map((b) => b.h)), Math.max(...bs.map((b) => b.w))], tiles: [Math.min(...bs.map((b) => b.old.length)), Math.max(...bs.map((b) => b.old.length))] }]),
+    ),
+    parity: { samples: B, taps: T, steps: N, strands: NS, stops: acc.stops },
+    timing_s: { table: (tTable - t0) / 1000, boards: (tBoards - tTable) / 1000, parity: (tEnd - tBoards) / 1000 },
+  };
+  writeFileSync(join(outDir, 'rules-hex.json'), JSON.stringify(meta, null, 1));
+  console.log(
+    `rules: ${table.subsets.map((s) => `${s.edges.join('')} ${s.count}`).join(', ')}; held out ${split.map((x) => x.k).join(' / ')}\n` +
+      `boards: ${Object.entries(meta.boards).map(([k, v]) => `${k} ${v.n} (box ${v.box})`).join(', ')}\n` +
+      `parity: ${B} rule-boards, ${T} taps, ${N} steps, ${NS} strands; walk stops ${JSON.stringify(acc.stops)}\n` +
+      `${((tEnd - t0) / 1000).toFixed(1)} s (table + split ${((tTable - t0) / 1000).toFixed(1)}, boards ${((tBoards - tTable) / 1000).toFixed(1)}, parity ${((tEnd - tBoards) / 1000).toFixed(1)})`,
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Main.
 
 function parseArgs(argv: string[]): Record<string, string> {
@@ -751,6 +1054,7 @@ function parseArgs(argv: string[]): Record<string, string> {
     if (!a.startsWith('--')) throw new Error(`unexpected argument ${a}`);
     const eq = a.indexOf('=');
     if (eq > 0) out[a.slice(2, eq)] = a.slice(eq + 1);
+    else if (i + 1 >= argv.length || argv[i + 1].startsWith('--')) out[a.slice(2)] = '1'; // a flag
     else out[a.slice(2)] = argv[++i];
   }
   return out;
@@ -765,6 +1069,7 @@ async function main(): Promise<void> {
   const here = dirname(fileURLToPath(import.meta.url));
   const root = resolve(here, '..');
   const args = parseArgs(process.argv.slice(2));
+  if (args['rule-table']) return mainV2(args, root);
   const spectacleDir = resolve(root, args.spectacle ?? process.env.SPECTACLE_DIR ?? '../Spectacle');
   const outDir = resolve(root, args.out ?? 'data/strand');
   const taps = Number(args.taps ?? 32);
