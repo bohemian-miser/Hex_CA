@@ -29,6 +29,7 @@
  *   see `orientMap`); every plane, direction and step of that board is in its frame.
  */
 
+import { execFileSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -1001,10 +1002,16 @@ async function mainV2(args: Record<string, string>, root: string): Promise<void>
   );
   const tEnd = performance.now();
 
+  let commit = 'unknown';
+  try {
+    commit = execFileSync('git', ['-C', spectacleDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  } catch {
+    // not a git checkout: the commit stays unknown
+  }
   const meta = {
     version: 2,
     generated: new Date().toISOString(),
-    spectacle: spectacleDir,
+    spectacle: { commit }, // not the checkout's path: this file travels (a private bucket, the VM)
     args: { seed, l4Crops: nCrops, l4EvalCrops: nEvalCrops, parityBig: nBig, parityTaps, cropRadius: [rlo, rhi], evalSeed: EVAL_SEED },
     conventions: {
       dirs_dq_dr: DIRS,

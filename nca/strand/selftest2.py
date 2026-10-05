@@ -15,7 +15,9 @@
   5. the quick check: the oracle state scores exact 1.0 (steps ratio 1, excess 0) for m1a and m1b, one step
      late excess 1, an extra edge exact < 0.5; the code probe reads an injected code back exactly and a
      random state at chance
-  6. training, every arm (a, c, c-bc, d, d-cs; one at --depth 2): the loss is finite and iteration 0's check
+  6. option E (nets.FrameNCA): a rotated and a mirrored board, inputs and tap, give the same per-cell outputs in
+     local frames (float64); zeroing the frames, or a plain conv on the D inputs, breaks it
+  7. training, every arm (a, c, c-bc, d, d-cs, e; two at --depth 2): the loss is finite and iteration 0's check
      runs; a forced collapse rolls back; --resume is bit-exact (3 + 3 = 6) and --ckpt-pool half resumes;
      m1b runs from an m1a checkpoint; pool.npz reads through nca.dashboard.pool_to_json
 """
@@ -33,7 +35,7 @@ from . import train as V1
 from . import train2 as T
 from .loader import load_meta
 from .rules import CODE_BITS, Boards, RuleTable, Strand, chord_planes, default_dir, same_strand
-from .walker import walk
+from .walker import DIRS, walk
 
 FAILS = []
 LEGACY = os.path.join(os.path.dirname(default_dir()), "strand")
@@ -124,12 +126,15 @@ def input_checks(tab, bd):
         x2 = pl(geo[None], codes([[s2, *d2]]), [tap])[0].numpy()
         n_static = T.STATIC[T.static_of(inputs)]
         st = slice(1, 1 + n_static)
-        ok = x1.shape == (T.n_inputs(inputs), 37, 37) and np.array_equal(x1[0], (geo >= 0).astype(np.float32))
+        n_planes = T.n_inputs(inputs) + (inputs == "e")  # E: + the frame plane (not an input feature)
+        ok = x1.shape == (n_planes, 37, 37) and np.array_equal(x1[0], (geo >= 0).astype(np.float32))
+        if inputs == "e":
+            ok &= np.array_equal(x1[-1], np.where(geo >= 0, geo % 12, 0).astype(np.float32))
         r, c = np.nonzero(geo >= 0)
         k = len(r) // 2
         ok &= np.allclose(x1[st, r[k], c[k]], tab.static[T.static_of(inputs)][geo[r[k], c[k]]])
         ok &= np.array_equal(x1[st], x2[st])  # the static planes don't see the rule
-        tp = x1[pl.tap_at:]
+        tp = x1[pl.tap_at:pl.tap_at + T.TAP]
         off = tp.copy()
         off[:, tap[0], tap[1]] = 0
         ok &= not off.any()
@@ -142,11 +147,12 @@ def input_checks(tab, bd):
                 not bc[:, geo < 0].any()
             ok &= not np.array_equal(x1[1 + n_static:pl.tap_at], x2[1 + n_static:pl.tap_at])
         else:
-            same = np.ones(len(x1), bool)
+            same = np.ones(len(x1), bool)  # (E's frame plane included: it doesn't see the rule either)
             same[pl.tap_at:pl.tap_at + CODE_BITS] = False
             ok &= np.array_equal(x1[same], x2[same])  # only the tap's code planes change with the rule
         check(f"inputs {inputs}: {x1.shape[0]} consts (mask, {n_static} static"
-              + (", 53 broadcast" if inputs == "c-bc" else "") + ", tap 59); static planes = the cell's "
+              + (", 53 broadcast" if inputs == "c-bc" else "") + ", tap 59" + (", frame" if inputs == "e" else "")
+              + "); static planes = the cell's "
               "(type, rot, mirror) row and blind to the rule; the tap planes on the tapped cell only, decoding to "
               "the rule and the chord", ok)
 
@@ -274,6 +280,73 @@ def oracle_checks(tab, bd):
           f"doesn't (exact {sc0['exact']}, digits {sc0['digits']})", sc["exact"] == 1.0 and sc0["exact"] < 0.05)
 
 
+def transform_board(geo, M):
+    """The board geo [h,w] under the lattice map M ((q, r) -> M(q, r); q = col, r = row): the new geo (square,
+    -1 off board), each old board cell's new (row, col), and the map of directions d -> M(d)."""
+    dmap = [DIRS.index(tuple(int(v) for v in M(*DIRS[d]))) for d in range(6)]
+    rows, cols = np.nonzero(geo >= 0)
+    qq, rr = M(cols, rows)
+    qq, rr = qq - qq.min(), rr - rr.min()
+    S = int(max(qq.max(), rr.max())) + 1
+    new = np.full((S, S), -1, np.int16)
+    for r0, c0, r1, c1 in zip(rows, cols, rr, qq):
+        g = int(geo[r0, c0])
+        m, rot = 1 - 2 * (g % 2), (g // 2) % 6
+        sig = [dmap[(m * k + rot) % 6] for k in range(6)]
+        new[r1, c1] = (g // 12) * 12 + sig[0] * 2 + (sig[1] != (sig[0] + 1) % 6)
+    return new, (rr, qq), dmap
+
+
+def frame_checks(tab, bd):
+    """Option E: rotating or mirroring a whole board (inputs, tap) gives the same per-cell outputs in local
+    frames -- the board-frame state at the moved cell, its directional channels moved with the directions."""
+    torch.manual_seed(0)
+    rng = np.random.default_rng(7)
+    geo0 = bd.board("L3", 4)
+    s, digits = 6, tab.digits_of(6, 123456)
+    S0 = max(geo0.shape)
+    geo = T.pad_geo(geo0, S0)
+    tap = T.random_chord(rng, tab.render_bits(s, digits, geo))
+    codes = T.Codes(tab)
+    C, steps = 13 + 12 + 10, 12
+
+    def run(inputs, g, tp, perturb_frames=False):
+        torch.manual_seed(1)
+        model = T.make_model(C, 24, [-2.0, 2.0], T.n_inputs(inputs), 2, inputs, 2).double()
+        with torch.no_grad():
+            model.w2.normal_(0, 0.3)  # a random update (the zero init would be the identity)
+            model.b2.normal_(0, 0.1)
+        cs = T.Planes(tab, inputs, torch.device("cpu"))(g[None], codes([[s, *digits]]), [tp]).double()
+        if perturb_frames:
+            cs[:, -1] = 0
+        st = T.fresh(cs[:, :1], C).double()
+        with torch.no_grad():
+            for _ in range(steps):
+                st = model.step(st, cs[:, :1], cs)
+        return st[0].numpy()
+
+    groups = [1, 7, 13, 19]  # edges, closed, the two hidden directional groups
+    rows, cols = np.nonzero(geo >= 0)
+    results = {}
+    for name, M in (("rotation", lambda q, r: (-r, q + r)), ("mirror", lambda q, r: (r, q))):
+        new, (rr, qq), dmap = transform_board(geo, M)
+        k = list(zip(rows.tolist(), cols.tolist())).index((tap[0], tap[1]))
+        tap2 = (int(rr[k]), int(qq[k]), dmap[tap[2]], dmap[tap[3]])
+        for inputs, pert in (("e", False), ("e", True), ("d", False)):
+            a, b = run(inputs, geo, tap, pert), run(inputs, new, tap2, pert)
+            want = a[:, rows, cols]
+            got = b[:, rr, qq].copy()
+            for g in groups:  # board channel g + d of the old cell is g + dmap[d] of the new one
+                got[g:g + 6] = got[[g + dmap[d] for d in range(6)]]
+            results[(name, inputs, pert)] = (float(np.abs(want - got).max()), float(np.abs(want).max()))
+    e_ok = all(results[(n, "e", False)][0] < 1e-9 and results[(n, "e", False)][1] > 0.1 for n in ("rotation", "mirror"))
+    neg = all(results[(n, i, p)][0] > 1e-3 for n in ("rotation", "mirror") for i, p in (("e", True), ("d", False)))
+    fmt = ", ".join(f"{n} {i}{' frames off' if p else ''}: {d:.1e}" for (n, i, p), (d, _) in results.items())
+    check(f"option E: a rotated / mirrored board gives the same outputs in local frames after {steps} steps "
+          f"(max |diff| over every cell and channel, float64: {fmt}); with the frames zeroed, or the D inputs on "
+          f"a plain conv, it does not", e_ok and neg)
+
+
 TINY = ["--levels", "2", "--eval-levels", "2", "--hidden", "8", "--channels", "16", "--batch", "4",
         "--pool-size", "8", "--eval-n", "6", "--eval-mult", "2", "--eval-cap", "30", "--steps-mult", "0.5", "1",
         "--bptt", "4", "--last-k", "2", "--threads", "1", "--snap-every", "0"]
@@ -284,7 +357,7 @@ def log_of(name):
 
 
 def runs():
-    for inputs, extra in (("a", []), ("c", []), ("c-bc", []), ("d", []), ("d-cs", ["--depth", "2"])):
+    for inputs, extra in (("a", []), ("c", []), ("c-bc", []), ("d", []), ("d-cs", ["--depth", "2"]), ("e", ["--depth", "2"])):
         name = f"arm-{inputs}"
         T.main(["--name", name, "--inputs", inputs, *TINY, *extra, "--iters", "3", "--eval-every", "50"])
         lg = log_of(name)
@@ -345,6 +418,7 @@ def main():
     target_checks(tab, bd)
     legacy_checks(tab)
     oracle_checks(tab, bd)
+    frame_checks(tab, bd)
     here = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:
         os.chdir(tmp)
