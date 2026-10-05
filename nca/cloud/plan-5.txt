@@ -1,0 +1,29 @@
+# Launch 5 (docs/spectacle-nca-plan.md §8): M1, the strand CA (nca/strand/train.py), as a width ablation.
+# Three runs at once on the one L4, identical but for --hidden (64 / 128 / 256; 32 state channels, 22 consts):
+#   l2   M1a on level-2 patches (55-63 tiles)                         45 min
+#   l3   M1a on levels 2 + 3 (the 433-496-tile patches)             150 min   (--init: l2's best.pt)
+#   l4   M1a on level 3 + level-4 crops (108-852 tiles)             150 min   (--init: l3's best.pt)
+#   m1b  M1b (per-edge closed flag, no tap) on levels 2 + 3 + 4     165 min   (--init: l4's best.pt)
+# = 510 min a run + SETUP_MIN 25 = ~8.9 h of VM (MAX_HOURS 12). The VM adds --schedule time, so the lr steps
+# (x0.3, x0.1) come at 60% / 85% of each stage's minutes and --iters is only a cap. Every quick check is on the
+# HELD-OUT rules at levels 3 and 4 (crops), read out after max(8 x side, longest ideal + 8) steps -- ~670 at
+# level 3 -- with 120 taps per level (40 per length bucket; m1b: 64 boards per level, ~10k strands); a check
+# should cost under 5% of a stage (~10-20 s every ~1000 iterations; l2's iterations are ~5x cheaper, so it
+# checks every 3000). Gate (plan §8): at +60 min held-out exact >= 0.8 and rising in at least one width; by
+# the end of l3, >= 0.95 at level 3. If 64 ties 256, the browser question is answered.
+# The data comes from the bucket (no Spectacle checkout on the VM); the lead puts it there first:
+#   tar -C data -czf /tmp/strand.tgz strand && gcloud storage cp --project=recipe-lanes-staging \
+#     /tmp/strand.tgz gs://recipe-lanes-staging-hexca-runs/data/strand.tgz
+# --module (first in the args) picks the trainer module; startup.sh strips it.
+m64  | l2  | 45  | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 2 --eval-levels 3 4 --hidden 64 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 3000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m64  | l3  | 150 | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 2 3 --eval-levels 3 4 --hidden 64 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m64  | l4  | 150 | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 3 4 --eval-levels 3 4 --hidden 64 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m64  | m1b | 165 | --module nca.strand.train --data bucket:data/strand.tgz --task m1b --levels 2 3 4 --eval-levels 3 4 --hidden 64 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 64 --ckpt-every 2000 --snap-every 500
+m128 | l2  | 45  | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 2 --eval-levels 3 4 --hidden 128 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 3000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m128 | l3  | 150 | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 2 3 --eval-levels 3 4 --hidden 128 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m128 | l4  | 150 | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 3 4 --eval-levels 3 4 --hidden 128 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m128 | m1b | 165 | --module nca.strand.train --data bucket:data/strand.tgz --task m1b --levels 2 3 4 --eval-levels 3 4 --hidden 128 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 64 --ckpt-every 2000 --snap-every 500
+m256 | l2  | 45  | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 2 --eval-levels 3 4 --hidden 256 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 3000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m256 | l3  | 150 | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 2 3 --eval-levels 3 4 --hidden 256 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m256 | l4  | 150 | --module nca.strand.train --data bucket:data/strand.tgz --task m1a --levels 3 4 --eval-levels 3 4 --hidden 256 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 120 --ckpt-every 2000 --snap-every 500
+m256 | m1b | 165 | --module nca.strand.train --data bucket:data/strand.tgz --task m1b --levels 2 3 4 --eval-levels 3 4 --hidden 256 --channels 32 --batch 32 --pool-size 256 --iters 1000000 --eval-every 1000 --eval-n 64 --ckpt-every 2000 --snap-every 500
