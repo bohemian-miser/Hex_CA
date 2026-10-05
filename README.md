@@ -275,52 +275,87 @@ half-settled board is never drawn as if it were finished.
 
 ## Trained NCA
 
-`nca/` and `web/nca.html` hold a second, learned answer to "fill every
-enclosed region" (no bridges, no owners, no smaller-side rule): a neural
-cellular automaton, distill.pub's [Growing Neural Cellular
-Automata](https://distill.pub/2020/growing-ca/) style, trained from
-scratch. Channel 0 is the wall input (re-imposed every step), channel 1
-the fill output (>0.5), 14 more hidden; each step every cell runs one
-network on itself and its six neighbours — a 7-tap convolution to 64
-hidden units, ReLU, a zero-init linear layer added back in: 10,896
-parameters. Enclosed = can't reach a non-wall rim cell through walls.
+`nca/` and `web/nca.html` hold a second, learned answer to the fill rule
+above, bridges included: a neural cellular automaton, distill.pub's [Growing
+Neural Cellular Automata](https://distill.pub/2020/growing-ca/) style.
+Channel 0 is the wall input (re-imposed every step), channel 1 the fill
+output (>0.5); the target is the hand-written CA's own rule — every enclosed
+region fills, and a rim-to-rim wall fills every rim region but the largest,
+by area or by the angular span of its rim contact, either acceptable when
+the two disagree. 16 channels; each step every cell runs one network on
+itself and its six neighbours (7 taps) over those channels plus 7 constant
+planes (the board mask, two angle coordinates round the centre, and the four
+rim-source products gating them), together with each state channel's own
+max and min over the 7 taps; 64 hidden units, ReLU, a zero-init linear layer
+added back in: 16,400 parameters.
 
-`nca/train.py`: phase 1 runs fresh from all-zero every iteration; phase 2
-(`--pool`) keeps a pool of boards between iterations and edits some each
-round — opening or closing a loop on a settled board — so it keeps
-working mid-draw, not just from a blank board. Loss is MSE on fill vs.
-the oracle, last 4 steps of a randomised run; Adam, per-parameter
-gradient normalisation, decayed lr. Shipped weights: 1,400 fresh-start
-iterations at R=6, 1,800 pool iterations at R=8 on an earlier generator,
-then 6,000 more at R=8 on the current one — ~0.8 s/iter on a Pi 5, ~2.5
-hours in all:
+Plain end-to-end training never learned the bridge half of that rule:
 
-    python -m nca.train --name p1 --R 6 --iters 1400
-    python -m nca.train --name p2 --pool --init runs/p1/ckpt.pt --R 8 --iters 1800 --lr 1e-3
-    python -m nca.train --name p3 --pool --init runs/p2/ckpt.pt --R 8 --iters 6000 --lr 1e-3
-    python -m nca.evaluate runs/p3/ckpt.pt
-    python -m nca.export runs/p3/ckpt.pt
+- **Fill loss alone**, MSE on channel 1 vs. the oracle: only failure mode
+  was "no side fills" — the smaller side crept towards 0.5 but never crossed
+  it; too indirect a signal, several steps downstream of a whole-board loss.
+- **+ angle inputs** (theta1/theta2 as constants): no better — after
+  hundreds of iterations the model had barely started using the new
+  columns, bridge accuracy unchanged from the angle-free runs.
+- **+ supervised floods** (`--aux`, channels 2–5 pulled towards the
+  max/min-angle targets directly): the floods themselves learn only slowly
+  (a cell starts at 0, below every target: "not reached" vs. "reached" has
+  to be learned from scratch) — and *exact* floods only get the simple rule
+  ~0.5 of bridge boards right anyway, so supervision alone wasn't enough.
+- **+ teacher forcing** (`--teach`, correct flood values fed back in each
+  step): teaches the one-step update, but free-running the state drifts on
+  settled cells and the floods never hold long enough to settle a verdict.
 
-(needs `torch` + `numpy`, see `nca/requirements.txt`). `nca/evaluate.py`,
-500 held-out boards, exact = every cell right, trivial = always-empty:
+So the shipped model is a hybrid: 26 of the 64 hidden units and the output
+rows of channels 2–7 are not trained — `install_floods` (`nca/model.py`)
+writes them by hand (four gated max-floods of the rim sources, channels
+2–5; the region's rim-angle span, channel 7; a board-wide max-flood of that
+span — the largest anywhere — channel 6) and freezes them, a gradient hook
+zeroing their rows. Only the readout (channel 1) and free channels (8..)
+train — 9,770 parameters — on the fill loss alone.
 
-| boards | R | exact @56 / @224 steps | trivial |
-|---|---|---|---|
-| mix | 8 | 0.998 / 0.998 | 0.428 |
-| mix | 11 | 0.998 / 1.000 | 0.396 |
-| page loops | 8 | 1.000 / 1.000 | 0.000 |
-| edit test (56+56 steps, no reset), mix / page loops | 8 | 1.000 / 1.000 | 0.450 / 0.282 |
+`nca/train.py`'s default (v6) recipe trains just that readout: a fresh
+model, R 6 8 10, steps [7R, 10R], batch 8, lr 2e-3 with decay, 4000
+iterations, ~2.5 s/iteration on a Pi 5 (chunked under `--minutes`, resumed
+to get there); best checkpoint by the quick held-out check at iteration
+3600:
 
-`src/nca.ts`, a hand-rolled float32 re-implementation of the PyTorch
-model, is pinned to it by a parity fixture (`tests/fixtures/nca-parity.json`,
-from `nca/export.py`): both agree to 1e-3 on every value
-(`tests/nca.test.ts`). Driving `web/nca.html` headless — hand-painted and
-multi-loop walls, live opens and closes, five "Random loop" presses in a
-row (walls accumulate; a full board makes it a no-op), R=14 (well past the
-trained radius) with a 127-cell loop and a small one, 2,000 idle steps on
-a settled board — found no wrong cell anywhere. The honest limit: none of
-that went past R=14 or a few thousand steps, so there's no evidence either
-way for the much larger boards the hand-written CA above is built for.
+    python -m nca.train --name v6-floods --iters 4000 --threads 2 --minutes 8.5 --eval-mults 8
+    python -m nca.evaluate runs/v6-floods/best.pt --radii 6 8 10 16 24 --n 300 --n-big 50
+    python -m nca.export runs/v6-floods/best.pt
+
+(needs `torch` + `numpy`). `nca/evaluate.py`, held-out boards at 8R steps,
+exact = every cell right against either acceptable target, trivial =
+always-empty:
+
+| R (n) | mix exact (trivial) | page loops | bridge exact | bins [0,.25) [.25,.5) [.5,.75) [.75,1] | both | none |
+|---|---|---|---|---|---|---|
+| 8 (300) | 0.930 (0.353) | 1.000 | 0.753 | 0.947 0.852 0.636 0.500 | 0.120 | 0.037 |
+| 24 (50) | 0.940 (0.220) | 1.000 | 0.840 | 1.000 1.000 0.333 0.692 | 0.060 | 0.060 |
+
+"both"/"none" is the share left with every side filled or 2+ empty — the
+failure that matters most. The near-even bin, [.75, 1], holds the exact
+ties (ratio 1) neither rule can break except by accepting either answer,
+and is the hardest bin almost everywhere.
+
+`src/nca.ts`, a hand-rolled float32 re-implementation, frozen floods
+included, is pinned to it by a parity fixture (`tests/fixtures/nca-parity.json`,
+from `nca/export.py`): both agree to 1e-3 (`tests/nca.test.ts`). The model
+needs a reset after an edit — its floods only ever grow, with no way to
+un-flood once a wall splits or opens a region, so there's no live-edit
+recipe for it. `pool: false` in the weights meta makes `web/nca.html` tick
+"Reset state on every edit" by default, matching how it was trained.
+
+Driving `dist/nca.html` headless past ~10R steps at R 8, 16, 32 found no
+wrong cell against the page's badge: loops, random bridges, an off-centre
+hand-painted rim-to-rim wall plus a loop painted onto the larger side (both
+the loop's interior and the smaller side filled), a wall through the exact
+centre (a tie — one side fills, either correct). Ten random bridges at R=8:
+9 exact, one thin-margin miss (right side, 10 of its cells short of 0.5) —
+zero "both", zero "none", against the table's 12%/3.7% at the same radius.
+At R=32 a bridge settled by ~260 steps in ~25 s on this machine (also a Pi
+5) at the page's max 600 steps/s, badge matching; no console errors. Honest
+limit: ~15 boards by hand, none of it past R=32.
 
 ### Licence
 
