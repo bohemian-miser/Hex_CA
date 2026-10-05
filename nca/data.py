@@ -431,11 +431,12 @@ _SHAPES = {"blob": _blob, "poly": _poly, "ring": _ring}
 _SHAPE_P = (0.45, 0.4, 0.15)
 
 
-def _closed(rng, R, on_board, first=None):
-    """1-3 closed shapes: side by side, overlapping (sharing walls), nested, or running over the rim."""
+def _closed(rng, R, on_board, first=None, count=None):
+    """1-3 closed shapes (or `count` of them): side by side, overlapping (sharing walls), nested, or running
+    over the rim."""
     walls = np.zeros_like(on_board)
     prev = None
-    for i in range(int(rng.choice((1, 2, 3), p=(0.5, 0.3, 0.2)))):
+    for i in range(count or int(rng.choice((1, 2, 3), p=(0.5, 0.3, 0.2)))):
         shape = first if i == 0 and first else rng.choice(list(_SHAPES), p=_SHAPE_P)
         if prev and rng.random() < 0.35:  # inside (or across) the last one
             pq, pr, ps = prev
@@ -826,6 +827,64 @@ def edit_walls(rng: np.random.Generator, walls: np.ndarray, R: int) -> np.ndarra
         row, col = pool[i]
         w[row, col] = not w[row, col]
     return (w & on_board).astype(np.uint8)
+
+
+# --------------------------------------------------------------------------
+# Damage: what the training pool does to a board between visits (train.py --damage), after which its
+# targets are recomputed. Edits pile up on the pool board; nothing toggles back.
+# --------------------------------------------------------------------------
+
+def disc(R: int, row: int, col: int, rad: float) -> np.ndarray:
+    """bool [S,S]: the array cells within hex distance rad of cell (row, col) (off-board ones included)."""
+    return _axial_dist(R, col - R, row - R) <= rad
+
+
+def _burst(rng, w, R, on_board):
+    """n ~ U[3, 20] random cell changes, each an addition (a random open cell walled) or a deletion (a random
+    wall opened), 50/50 -- so the wall density doesn't drift on average."""
+    w = w.copy()
+    for _ in range(int(rng.integers(3, 21))):
+        pick = on_board & (w != (rng.random() < 0.5))  # True: the open cells (an addition), False: the walls
+        if not pick.any():  # an empty board can't lose a wall, a full one can't gain one
+            pick = on_board
+        row, col = np.argwhere(pick)[rng.integers(int(pick.sum()))]
+        w[row, col] = not w[row, col]
+    return w
+
+
+def _erase(rng, w, R, on_board):
+    """Every wall within hex distance 1-3 of a random wall cell opened (nothing to erase on an empty board)."""
+    cells = np.argwhere(w if w.any() else on_board)
+    row, col = cells[rng.integers(len(cells))]
+    return w & ~disc(R, row, col, int(rng.integers(1, 4)))
+
+
+def _stamp(rng, w, R, on_board, p_bridge=0.5):
+    """w OR a freshly drawn circuit: a rim-to-rim bridge (_bridge) with probability p_bridge, else one closed
+    loop (_closed: a blob outline, a polygon or a ring)."""
+    new = _bridge(rng, R, on_board) if rng.random() < p_bridge else _closed(rng, R, on_board, count=1)
+    return w | new
+
+
+WALL_DAMAGE = ("edit", "burst", "erase", "stamp")
+
+
+def damage_walls(rng: np.random.Generator, walls: np.ndarray, R: int, kind: str, p_bridge: float = 0.5) -> np.ndarray:
+    """uint8 [S,S]: walls after one damage of `kind` (train.py --damage kinds a-d):
+      edit   a small wall edit (edit_walls: mostly one that opens, seals or shifts something)
+      burst  n ~ U[3, 20] random additions and deletions of wall cells, mixed (_burst)
+      erase  every wall inside a random disc of radius 1-3 opened (_erase)
+      stamp  a fresh closed loop or (with probability p_bridge) a rim-to-rim bridge ORed in (_stamp)
+    Stays on the board. Deterministic given rng."""
+    on_board = mask(R) == 1
+    w = walls.astype(bool) & on_board
+    if kind == "edit":
+        return edit_walls(rng, w.astype(np.uint8), R)
+    if kind == "stamp":
+        out = _stamp(rng, w, R, on_board, p_bridge)
+    else:
+        out = {"burst": _burst, "erase": _erase}[kind](rng, w, R, on_board)
+    return (out & on_board).astype(np.uint8)
 
 
 # --------------------------------------------------------------------------

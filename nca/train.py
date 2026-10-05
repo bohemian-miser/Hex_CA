@@ -1,75 +1,108 @@
-"""Train the hex fill NCA (spec v2: enclosed regions fill, and all rim regions but the largest;
-spec v3: every cell also sees the constant inputs mask, theta1, theta2 -- its angle round the centre;
-spec v4: and, per state channel, its max and min over the hex neighbourhood (--perception taps+pool,
-the default), and "largest" is by area or by the angular span of a region's rim cells).
+"""Train the hex fill NCA.
 
-The spec v6 recipe is the default (--floods): 7 consts (mask, theta1, theta2 and the rim sources src1, src1c,
-src2, src2c), channels 2..7 hand-written exact floods, frozen (model.install_floods), only the readout and the
-free channels trained, on the fill loss alone (no aux, no teacher forcing, no pool): a fresh model, R 6 8 10,
-steps [7R, 10R], last-k 8, batch 8, bridge-frac 0.25, lr 2e-3 with decay, clamp [-2, 2]:
-    python -m nca.train --name v6f --iters 4000 --threads 2 --minutes 8.5 --eval-mults 8
-The quick check then logs the comparative rule read off the (exact) channels once, at the start
-(arcCeiling: the readout's ceiling), not at every check.
-Older recipes need --no-floods (and their consts): v5 = --no-floods --n-consts 3 --aux --steps-mult 4 8 --teach 0 0;
-v5 + teacher forcing = the same with --aux-w 20 and no --teach (on by default with dense aux, runs/experiments.md);
-v4 = --no-floods --n-consts 3 --pool --aux --no-aux-dense --steps-mult 6 10 --last-k 16 --batch 16.
---init may name a checkpoint with fewer consts (a v1/v2 one has only the mask) or without the pool: its
-w1 is copied and the new const columns and w1pool start at zero, so training starts exactly at the old
-behaviour (checked and printed before the first iteration).
-Carry on an interrupted run (same --name; --iters may be raised):
-    python -m nca.train --name a2 --resume --iters 8000
+The default is the PURE recipe: a plain learned NCA trained the distill.pub "Growing NCA" way, with nothing
+written by hand. 16 state channels (ch0 = walls, re-imposed every step; ch1 = fill; the rest hidden), ONE
+const input (the mask: the board's shape, nothing else), perception = the 7 hex taps of a masked 3x3 conv
+(no pooled max/min), --hidden 96 units; no hand-written floods, no aux targets, no teacher forcing. The
+loss is the fill MSE alone.
 
-Each iteration draws one radius R from --R and runs T ~ U[a*R, b*R] steps
-(a, b = --steps-mult; never fewer than the batch's deepest rim depth + MARGIN).
-A board can have several acceptable targets (data.targets); the loss is the
-min over them of the per-board loss (MSE of ch1 over on-board cells, averaged
-over the last --last-k steps).
+It trains from a persistent pool per radius (--pool, --pool-size boards each). Each iteration draws one
+radius R from --R and a batch of --batch boards from that pool, each with the state it was left in:
+  - the worst of the batch (loss of its stored state) starts over from the fresh state on its board;
+  - batch/8 others are replaced by brand-new boards (random_walls; --bridge-frac of them kind "bridge");
+  - each of the rest, with probability --damage, gets ONE damage (kind drawn per board):
+      edit    a small wall edit (data.edit_walls)
+      burst   3-20 random wall additions and deletions, mixed
+      erase   every wall inside a random disc of radius 1-3 opened
+      stamp   a fresh closed loop or a rim-to-rim bridge ORed onto the board
+      state   distill's damage: every channel but the walls zeroed inside a random disc of radius
+              1..R/2 (walls and targets unchanged)
+    after a wall damage the board's targets are recomputed. Damage piles up on the pool board: nothing
+    toggles back to an original.
+Then T ~ U[a*R, b*R] steps run from the stored states (a, b = --steps-mult; never fewer than the batch's
+deepest rim depth + MARGIN), loss = min over each board's acceptable targets (data.targets; K_POOL kept,
+padded) of the fill MSE over on-board cells, averaged over the last --last-k steps; Adam with per-parameter
+gradient normalisation; states and boards go back into the pool (detached). A step whose loss or gradient
+is not finite is skipped and its boards start over (logged as "skipped"; 20 in a row stop the run).
 
---minutes stops before an iteration that would end past the limit, counting the
-slowest iteration so far and, if one is due, the last quick check's time (kept
-in the checkpoint), so a chunk keeps to the limit with its checks.
+Every 200 iterations the log has each pool's statistics (pool_stats: share of boards with a filled cell,
+with 2+ rim regions, mean wall density). While one leaves BAND the damage leans towards bringing it back and
+new boards come twice as fast (steer, logged as "steer" with the reason).
 
-Logs one JSON line per 50 iterations to runs/<name>/log.jsonl: loss, s/iter,
-peak RSS, and a quick held-out check at every trained radius read out at
-mult*R steps for each --eval-mults: exact on the training mix ("mix"), on the
-demo page's random loops ("page", never trained on), exact
-on bridge boards with 2+ rim regions ("bridge", also per radius), and on those
-the share where two or more sides stayed empty ("none") or every side filled
-("both"). Exact = equals any acceptable target. Checkpoints to
-runs/<name>/ckpt.pt every 200 iterations and at the end (atomically), and to
-runs/<name>/best.pt whenever the quick check's (mix + bridge) / 2 at the first
---eval-mults readout is the best so far (training swings; the best is kept).
+    python -m nca.train --name pure-a --R 4 5 6 --iters 20000 --minutes 8.5     # stage 1, in chunks:
+    python -m nca.train --name pure-a --resume --minutes 8.5                     # ... (exactly where it stopped)
+    python -m nca.train --name pure-b --init runs/pure-a/best.pt --R 6 8 10 --iters 20000 --minutes 8.5
+--init takes another checkpoint's weights (fresh optimiser, fresh pools, iteration 0, any --R): a stage of a
+curriculum. --resume carries a run on exactly (weights, optimiser, pools, rng, steering; --iters may be
+raised, which moves the lr decay).
 
---aux (training only; nothing in the model or export changes): hidden channels
-2..6 are also trained, weighted --aux-w, by an MSE over on-board cells towards
-the floods behind the comparative rule (spec v5): max theta1, max (1 - theta1),
-max theta2, max (1 - theta2) over the rim cells of the cell's region (ch 2..5),
-and the largest span of any region on the board (ch 6, on every cell); span =
-clip(min(ch2 + ch3 - 1, ch4 + ch5 - 1), 0, 1), and the rule: fill iff enclosed
-(max(ch2, ch4) < 0.25) or span < ch6 - EPS (data.arc_fill). With --aux-dense
-(the default) the target at step t of the rollout is data.aux_flood's F_t, the
-flood one hop per step from 0, and the loss is the mean over EVERY step 1..T;
---no-aux-dense is v4's: the steady state (data.aux_targets) over the last
---last-k steps (the only aux loss a --pool run can use: its samples don't start
-from 0). The quick check then also logs, per readout at m*R: auxDense (mean
-over steps 1..m*R against F_t), auxLast (at step m*R against F_{m*R}), both on
-mix and bridge boards (trivial all-zero values printed at the start), and the
-rule read off the model's own channels 2..6, exact against any acceptable
-target (arcMix, arcBridge). Channel 1 keeps its loss; channels 7.. stay free.
+The quick held-out check (every --eval-every iterations, and at iteration 0 of a fresh or --init run; fixed
+boards per trained radius, means over the radii): exact (= equals any acceptable target) from the fresh
+state at mult*R steps for each --eval-mults, on the training mix ("mix"), on bridge boards with 2+ rim regions
+("bridge", also per radius, with "none" / "both": the share where two or more sides stayed empty / every
+side filled, and "gap") and on the demo page's random loops ("page", never trained on); and the EDIT
+SEQUENCE ("edit": what the page does): a board of the mix settled from the fresh state for eval_mults[0]*R
+steps, then 3 successive wall damages (kinds edit, burst, erase, stamp), each followed by 6R steps WITHOUT a
+reset, exact against the edited board's targets after each ([e1, e2, e3]; editHold at the start: the share
+where the previous answer is still acceptable). best.pt keeps the best score = mean(mix, bridge, page,
+mean(edit)) at eval_mults[0]*R. --eval-n boards per set per radius (default 32, logged as evalN; kept on
+--resume unless given). The log (runs/<name>/log.jsonl, a line per 50 iterations) also has loss, s/iter, peak
+RSS and the damage counts; every line has "time" (unix seconds) and "device"; a clean end adds a line
+{"stopped": "time"} (the --minutes limit) or {"stopped": "done"} (--iters reached). nca.progress reads it.
 
---teach P0 P1 (v6, default 1.0 0.2; needs --aux with --aux-dense): teacher forcing with scheduled sampling.
-After each model step t of the rollout (its aux and fill losses taken on the model's own output first),
-each board, with probability p, has channels 2..6 REPLACED by the exact reference F_t (constants: no
-gradient flows back through them), and the rollout steps on from there. p falls linearly from P0 at
-iteration 0 to P1 at --iters (logged as teachP); a --resume with a new --iters (or a new --teach) carries
-on from the p it stopped at, down to the new P1 at the new --iters. --teach 0 0 is v5. The quick check adds
-auxTeach (the same dense MSE, read with p = 1: the one-step rule's error, apart from free-running drift),
-auxTeachCh (per channel 2..6), mixTeach / bridgeTeach (fill exact with the floods fed in), and the
-trivial start line adds holdDense (a model that copies F_{t-1} through: the one-step baseline).
+COLLAPSE GUARD. Two GPU runs at a constant lr 2e-3 (runs/ga-r456, runs/gb-r456) peaked by iteration 2000-4000
+and then collapsed (score 0.86 -> 0.24, later loss 2.2): the weights grew (w1 norm 17 -> 25..33) until 75-85% of
+the hidden-channel cells sat at the clamp, where the gradient is zero. So at every log line (each 50 iterations)
+the trainer checks: the window's loss non-finite (no finite step, or over 10% of its steps skipped) or above
+--collapse-loss-x (4) times the median of the previous 10 windows since the last fresh optimiser; and at a quick
+check, the best score so far >= 0.4 and the new score below --collapse-frac (0.6) of it. Either one is a
+ROLLBACK: the weights reload from best.pt, a fresh optimiser (with its warm-up), the lr scale halves (it
+multiplies the schedule; never below --lr-floor), every pool sample restarts from the fresh state on its current
+board, a checkpoint is written, and the log gets {"iteration", "rollback": iteration, "lrScale", "rollbacks",
+"reason", "restored": best.pt's iteration, "best"}. A collapse with --max-rollbacks (6) already made ends the
+run cleanly: {"stopped": "collapsed"} (exit 0; nca.progress: COLLAPSED). best.pt only ever gets a model with a
+higher score than every earlier one of the run (its score is kept in it, and a --resume takes the higher of
+the checkpoint's and best.pt's), never one from a window whose loss tripped the guard. The lr scale, the
+rollback count and the warm-up's start are kept in ckpt.pt (--resume restores them).
+
+LR: --lr (default 5e-4: 2e-3 collapsed, see above) x 1 to 60% of --iters, x0.3 to 85%, x0.1 after, x the
+rollback scale, never below --lr-floor (1e-5); and after every fresh optimiser (iteration 0 of a fresh or --init
+run, a rollback) a linear warm-up over --warmup (100) iterations. The log's "lr" is the one the window used last.
+
+--minutes stops before an iteration that would end past the limit, counting the slowest iteration so far
+and, if one is due, the last quick check's time (kept in the checkpoint), so a chunk keeps to the limit with
+its checks. Checkpoints (atomic) to runs/<name>/ckpt.pt every 200 iterations and at a stop.
+
+--device auto (cuda if torch sees a GPU, else cpu): the model, consts, pool states and batches live there;
+the board work (walls, targets, damage) stays numpy on the CPU. Checkpoints hold CPU tensors and every load
+maps to the CPU, so a run moves between the Pi and a GPU with --resume or --init (it carries on correctly,
+not bit-identically). On cuda: cudnn.benchmark on, TF32 off (float32 throughout). --threads defaults to
+min(4, cores) (the Pi's runs so far used 2).
+
+The older HYBRID recipes stay available (off by default):
+spec v6 (hand-written frozen floods, learned readout): --floods --n-consts 7 --perception taps+pool --no-pool
+--hidden 64 --batch 8 --steps-mult 7 10 --R 6 8 10 (the 7 consts are mask, theta1, theta2 and the rim sources
+src1, src1c, src2, src2c; channels 2..7 written by hand by model.install_floods, frozen).
+v5 = --n-consts 3 --perception taps+pool --no-pool --hidden 64 --batch 8 --aux --steps-mult 4 8 --teach 0 0;
+v5 + teacher forcing = the same with --aux-w 20 and no --teach; v4 = --n-consts 3 --perception taps+pool
+--pool --aux --no-aux-dense --hidden 64 --steps-mult 6 10 --last-k 16 (its pool now damages as above).
+--init may name a checkpoint with fewer consts or without the pool: its w1 is copied and the new const
+columns and w1pool start at zero (checked and printed before the first iteration).
+
+--aux (training only): hidden channels 2..6 are also trained, weighted --aux-w, by an MSE over on-board cells
+towards the floods behind the comparative rule (spec v5): max theta1, max (1 - theta1), max theta2,
+max (1 - theta2) over the rim cells of the cell's region (ch 2..5), and the largest span of any region on
+the board (ch 6); with --aux-dense (its default) the target at step t is data.aux_flood's F_t, the mean
+over EVERY step; --no-aux-dense: the steady state (data.aux_targets) over the last --last-k steps (the only
+aux loss a pool can use). The quick check then also logs auxDense, auxLast and the rule read off channels
+2..6 (arcMix, arcBridge, arcPage).
+--teach P0 P1 (needs --aux --aux-dense --no-pool; default 1.0 0.2): teacher forcing with scheduled sampling,
+channels 2..6 replaced by F_t with probability p after each step, p linear from P0 to P1 over --iters.
 """
 
 import argparse
 import json
+import math
 import os
 import resource
 import time
@@ -77,36 +110,129 @@ import time
 import numpy as np
 import torch
 
-from .data import EPS, N_AUX, aux_flood, aux_targets, edit_walls, pad_targets, page_loops, random_walls, targets
+from .data import (EPS, N_AUX, WALL_DAMAGE, aux_flood, aux_targets, damage_walls, disc, pad_targets, page_loops,
+                   random_walls, targets)
 from .evaluate import _bridge_board, boards, score, summarise
-from .hexgrid import CONST_NAMES
+from .hexgrid import CONST_NAMES, mask as hex_mask, rim
 from .model import PERCEPTIONS, HexNCA, const_stack, fresh_state, load_expanded
 
 MARGIN = 4      # extra steps past the deepest rim-region cell
 K_POOL = 4      # targets kept per pool board (K is 1 on ~95% of boards, 2 on ~4.5%)
 EVAL_N = 32     # held-out boards per set per radius for the quick log metric
 EVAL_SEED = 999 # same held-out boards whatever --seed is
+DAMAGE_KINDS = WALL_DAMAGE + ("state",)  # --damage kinds a-d (the walls) and e (the state)
+BAND = {"fill": (0.35, 0.8), "multiRim": (0.15, 1.0), "density": (0.0, 0.45)}  # pool_stats kept in these
+N_EDITS = 3     # the quick check's edit sequence: edits per board,
+EDIT_MULT = 6   # and EDIT_MULT*R steps after each
+STOP_SKIPS = 20 # non-finite steps in a row that stop the run
+LR = 5e-4      # --lr default: 2e-3 collapsed on the GPU (module docstring)
+COLLAPSE_MIN_BEST = 0.4  # the score rule of the collapse guard needs a best this good
+COLLAPSE_HISTORY = 10    # the loss rule compares with the median of this many earlier windows
+SNAP_N, SNAP_M = 48, 6  # pool.npz shows the first SNAP_N slots of each pool, the full state of the first SNAP_M
 
 
-def to_t(a):
-    """numpy [B,S,S] -> float tensor [B,1,S,S]; [B,K,S,S] -> [B,K,S,S]."""
+def to_t(a, device=None):
+    """numpy [B,S,S] -> float tensor [B,1,S,S]; [B,K,S,S] -> [B,K,S,S]; on `device` if given (on the CPU, .to
+    returns the tensor itself: no copy)."""
     t = torch.from_numpy(np.ascontiguousarray(a)).float()
-    return t.unsqueeze(1) if t.dim() == 3 else t
+    t = t.unsqueeze(1) if t.dim() == 3 else t
+    return t if device is None else t.to(device)
 
 
-def answers(walls, R):
-    """(fills uint8 [K_POOL,S,S], depth, aux float32 [5,S,S]) of one board: its targets padded to a fixed K
-    for the pool, and its aux targets."""
+def pick_device(name):
+    """torch.device for --device: auto = cuda if torch sees a GPU, else cpu; cuda without one is an error."""
+    if name == "auto":
+        name = "cuda" if torch.cuda.is_available() else "cpu"
+    if name == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("--device cuda: torch sees no CUDA device")
+    return torch.device(name)
+
+
+def to_cpu(x):
+    """x with every tensor in it (nested dicts, lists, tuples) on the CPU: what checkpoints hold, so one saved
+    on a GPU loads on the Pi and vice versa. On the CPU a tensor is returned as it is (no copy)."""
+    if torch.is_tensor(x):
+        return x.cpu()
+    if isinstance(x, dict):
+        y = type(x)((k, to_cpu(v)) for k, v in x.items())
+        if hasattr(x, "_metadata"):  # a state_dict's module versions
+            y._metadata = x._metadata
+        return y
+    if isinstance(x, (list, tuple)):
+        return type(x)(to_cpu(v) for v in x)
+    return x
+
+
+def model_to(model, device):
+    """model on `device`, with spec v6's frozen masks and values (plain attributes, not buffers) too."""
+    model.to(device)
+    if getattr(model, "frozen", None):
+        model.frozen = {k: v.to(device) for k, v in model.frozen.items()}
+        model.frozen_values = {k: v.to(device) for k, v in model.frozen_values.items()}
+    return model
+
+
+def answers(walls, R, aux=False):
+    """(fills uint8 [K_POOL,S,S], depth, aux float32 [5,S,S] or None) of one board: its targets padded to a
+    fixed K for the pool, and (only if asked) its aux targets."""
     f, d = targets(walls, R)
-    return pad_targets([f], K_POOL)[0], d, aux_targets(walls, R)
+    return pad_targets([f], K_POOL)[0], d, aux_targets(walls, R) if aux else None
 
 
-def draw(rng, R, n, bridge_frac=0.0):
-    """(walls [n,S,S], fills [n,K_POOL,S,S], depth [n,S,S], aux [n,5,S,S]) of n fresh boards from the training
-    mix, each drawn as kind "bridge" instead with probability bridge_frac."""
+def draw(rng, R, n, bridge_frac=0.0, aux=False):
+    """(walls [n,S,S], fills [n,K_POOL,S,S], depth [n,S,S], aux [n,5,S,S] or None) of n fresh boards from the
+    training mix, each drawn as kind "bridge" instead with probability bridge_frac."""
     walls = np.stack([random_walls(rng, R, "bridge" if rng.random() < bridge_frac else None) for _ in range(n)])
     fills, depth = zip(*(targets(w, R) for w in walls))
-    return walls, pad_targets(fills, K_POOL), np.stack(depth), np.stack([aux_targets(w, R) for w in walls])
+    return (walls, pad_targets(fills, K_POOL), np.stack(depth),
+            np.stack([aux_targets(w, R) for w in walls]) if aux else None)
+
+
+def damage_state(rng, state, R):
+    """distill's damage, in place on ONE board's state [C,S,S]: every channel but ch0 (the walls) zeroed inside
+    a disc of radius 1..max(1, R//2) round a random on-board cell. Returns the disc (bool [S,S])."""
+    cells = np.argwhere(hex_mask(R) == 1)
+    row, col = cells[rng.integers(len(cells))]
+    d = disc(R, row, col, int(rng.integers(1, max(1, R // 2) + 1)))
+    state[1:, torch.from_numpy(d).to(state.device)] = 0
+    return d
+
+
+def pool_stats(walls, fills, R):
+    """{fill, multiRim, density} of a pool (walls [n,S,S], fills [n,K,S,S]): the share of boards whose primary
+    target fills a cell, the share with 2+ rim regions (= the primary target fills a rim cell: with one rim
+    region no rim cell fills, with 2+ all but one rim region fill), the mean wall density on board."""
+    prim = fills[:, 0] > 0
+    return {"fill": round(float(prim.any((1, 2)).mean()), 3),
+            "multiRim": round(float(prim[:, rim(R)].any(1).mean()), 3),
+            "density": round(float(walls[:, hex_mask(R) == 1].mean()), 3)}
+
+
+def steer(stats):
+    """How a pool's damage leans, from its pool_stats: {p: probabilities over DAMAGE_KINDS, pBridge: share of
+    stamps that are bridges, newMult: new boards per batch x this, why: the stats out of BAND}. In band:
+    uniform, 0.5, 1. Out of band (each applies on top of the others):
+      fill share low       stamps x3 (a stamped loop or bridge fills something), erase and burst x0.5
+      fill share high      erase and burst x3, stamps x0.25
+      2+ rim regions low   stamps x2, and 0.9 of them bridges
+      density high         erase x3, no stamps
+    and any of them doubles the new boards."""
+    w = dict.fromkeys(DAMAGE_KINDS, 1.0)
+    p_bridge, why = 0.5, []
+    if stats["fill"] < BAND["fill"][0]:
+        w["stamp"], w["erase"], w["burst"] = 3 * w["stamp"], 0.5 * w["erase"], 0.5 * w["burst"]
+        why.append("fill low")
+    if stats["fill"] > BAND["fill"][1]:
+        w["stamp"], w["erase"], w["burst"] = 0.25 * w["stamp"], 3 * w["erase"], 3 * w["burst"]
+        why.append("fill high")
+    if stats["multiRim"] < BAND["multiRim"][0]:
+        w["stamp"], p_bridge = 2 * w["stamp"], 0.9
+        why.append("2+ rim low")
+    if stats["density"] > BAND["density"][1]:
+        w["stamp"], w["erase"] = 0.0, 3 * w["erase"]
+        why.append("density high")
+    p = np.array([w[k] for k in DAMAGE_KINDS])
+    return {"p": (p / p.sum()).round(4).tolist(), "pBridge": p_bridge, "newMult": 2 if why else 1, "why": why}
 
 
 def per_sample_loss(fill, fills, mk):
@@ -149,17 +275,61 @@ def arc_rule(state, walls, mk):
     return (mk > 0) & (walls == 0) & (enclosed | (span < c[:, 4:5] - EPS))
 
 
-def heldout(radii, consts):
-    """{set: {R: (walls, fills, sides, consts)}}: fixed boards for the quick check, mix, bridge and page (the
-    demo page's random loops, data.page_loops: never trained on). consts = {R: const stack [1,n,S,S]} (mask
-    first). Their aux floods are recomputed per check (aux_flood)."""
+def heldout(radii, consts, n=EVAL_N, device=None):
+    """{set: {R: (walls, fills, sides, consts)}}: fixed boards for the quick check, n per set per radius, mix,
+    bridge and page (the demo page's random loops, data.page_loops: never trained on). consts = {R: const stack
+    [1,n,S,S]} (mask first). Their aux floods are recomputed per check (aux_flood). A larger n keeps the first
+    EVAL_N boards of each set (the draws come in order) and adds more."""
     out = {"mix": {}, "bridge": {}, "page": {}}
     for R in radii:
         for name, gen, seed in (("mix", random_walls, EVAL_SEED), ("bridge", _bridge_board, EVAL_SEED + 50),
                                 ("page", page_loops, EVAL_SEED + 100)):
-            w, f, sides = boards(np.random.default_rng(seed + R), R, EVAL_N, gen)
-            out[name][R] = (to_t(w), torch.from_numpy(f) > 0, sides, consts[R])
+            w, f, sides = boards(np.random.default_rng(seed + R), R, n, gen)
+            out[name][R] = (to_t(w, device), (torch.from_numpy(f) > 0).to(device or "cpu"), sides, consts[R])
     return out
+
+
+def edit_sequence(R, cs, n=EVAL_N, seed=EVAL_SEED + 150, device=None):
+    """The quick check's fixed edit-sequence boards at radius R: n boards of the training mix, each damaged
+    N_EDITS times in succession (kinds edit, burst, erase, stamp, uniformly; data.damage_walls).
+    (stages: N_EDITS + 1 walls [n,1,S,S] (the board, then after each edit), fills: N_EDITS bool [n,K,S,S]
+    (each edited board's targets), cs, changed: N_EDITS shares where the primary target changed,
+    hold: N_EDITS shares where the previous primary is still acceptable -- what a model that ignores the
+    edit would score)."""
+    rng = np.random.default_rng(seed + R)
+    w = np.stack([random_walls(rng, R) for _ in range(n)])
+    stages, fills, changed, hold = [to_t(w, device)], [], [], []
+    prev = np.stack([targets(x, R)[0][0] for x in w])
+    for _ in range(N_EDITS):
+        w = np.stack([damage_walls(rng, x, R, WALL_DAMAGE[int(rng.integers(len(WALL_DAMAGE)))]) for x in w])
+        f = pad_targets([targets(x, R)[0] for x in w])
+        changed.append(float(np.mean([(f[i, 0] != prev[i]).any() for i in range(n)])))
+        hold.append(float(np.mean([(f[i] == prev[i]).all((1, 2)).any() for i in range(n)])))
+        stages.append(to_t(w, device))
+        fills.append((torch.from_numpy(f) > 0).to(device or "cpu"))
+        prev = f[:, 0]
+    return stages, fills, cs, changed, hold
+
+
+def exact_share(state, fills, mk):
+    """Share of boards whose fill (ch1 > 0.5) equals one of their targets fills [B,K,S,S] bool on board."""
+    wrong = (((state[:, 1:2] > 0.5) != fills) & (mk > 0)).flatten(2).sum(2)
+    return float((wrong.min(1).values == 0).float().mean())
+
+
+@torch.no_grad()
+def edit_eval(model, eseq, settle_mult):
+    """{edit: [exact after edit 1..N_EDITS] (mean over the radii), editByR: {R: [...]}}: each board of
+    edit_sequence settled from the fresh state for settle_mult*R steps, then each edit applied WITHOUT a
+    reset (only ch0 changes) and EDIT_MULT*R steps run, exact against the edited board's targets."""
+    by_r = {}
+    for R, (stages, fills, cs, _, _) in eseq.items():
+        state = model(fresh_state(stages[0], model.channels), stages[0], cs, settle_mult * R)
+        by_r[R] = []
+        for walls, f in zip(stages[1:], fills):
+            state = model(torch.cat([walls, state[:, 1:]], 1), walls, cs, EDIT_MULT * R)
+            by_r[R].append(round(exact_share(state, f, cs[:, :1]), 3))
+    return {"edit": [round(float(x), 4) for x in np.mean(list(by_r.values()), 0)], "editByR": by_r}
 
 
 def trivial_aux(held, mults):
@@ -171,10 +341,10 @@ def trivial_aux(held, mults):
            for m in mults}
     for per_r in held.values():
         for R, (walls, _, _, cs) in per_r.items():
-            w = walls[:, 0].numpy().astype(np.uint8)
-            F = torch.from_numpy(aux_flood(w, R, max(mults) * R))
-            blind = torch.from_numpy(aux_flood(np.zeros_like(w), R, max(mults) * R))
-            pad = torch.zeros(len(w), 2, *w.shape[-2:])
+            w = walls[:, 0].cpu().numpy().astype(np.uint8)
+            F = torch.from_numpy(aux_flood(w, R, max(mults) * R)).to(cs.device)
+            blind = torch.from_numpy(aux_flood(np.zeros_like(w), R, max(mults) * R)).to(cs.device)
+            pad = torch.zeros(len(w), 2, *w.shape[-2:], device=cs.device)
             for key, guess in (("aux", lambda t: torch.zeros_like(F[t])), ("blind", lambda t: blind[t]),
                                ("hold", lambda t: F[t - 1] if t else torch.zeros_like(F[t]))):
                 per_step = [float(aux_loss(torch.cat([pad, guess(t)], 1), F[t], cs[:, :1]).mean())
@@ -206,18 +376,19 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
         for R, (walls, fills, sides, cs) in per_r.items():
             mk = cs[:, :1]
             if aux or teach_check:
-                F = torch.from_numpy(aux_flood(walls[:, 0].numpy().astype(np.uint8), R, max(mults) * R))
+                F = torch.from_numpy(aux_flood(walls[:, 0].cpu().numpy().astype(np.uint8), R,
+                                               max(mults) * R)).to(walls.device)
             if teach_check:
                 state, done, per_ch = fresh_state(walls, model.channels), 0, []
                 for m in sorted(mults):
                     for t in range(done, m * R):
                         state = model.step(state, walls, cs)
                         per_ch.append(aux_loss_ch(state, F[t], mk))
-                        state = teach(state, F[t], torch.ones(len(state), dtype=torch.bool))
+                        state = teach(state, F[t], torch.ones(len(state), dtype=torch.bool, device=state.device))
                     done = m * R
                     ch = torch.stack(per_ch).mean(0)
                     res[m].setdefault("auxTeach", []).append(float(ch.mean()))
-                    res[m].setdefault("auxTeachCh", []).append(ch.numpy())
+                    res[m].setdefault("auxTeachCh", []).append(ch.cpu().numpy())
                     s = summarise(score(state[:, 1:2] > 0.5, fills, mk, sides), len(sides))
                     res[m].setdefault(name + "Teach", []).append(s["exact"])
             state, done, per_step = fresh_state(walls, model.channels), 0, []
@@ -238,7 +409,7 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
                 if name == "bridge":
                     res[m]["none"].append(s["none"])
                     res[m]["both"].append(s["both"])
-                    p, prim = state[:, 1].numpy(), fills[:, 0].numpy()
+                    p, prim = state[:, 1].cpu().numpy(), fills[:, 0].cpu().numpy()
                     res[m]["gap"].append(np.mean([p[b][np.isin(lab, ids) & prim[b]].mean()
                                                   - p[b][np.isin(lab, ids) & ~prim[b]].mean()
                                                   for b, (lab, ids, _) in enumerate(sides)]))
@@ -251,25 +422,124 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
     return out
 
 
-def lr_at(it: int, iters: int, lr: float) -> float:
-    """Step decay: full lr to 60%, x0.3 to 85%, x0.1 after."""
+def lr_at(it: int, iters: int, lr: float, scale: float = 1.0, floor: float = 0.0, warm_from=None,
+          warmup: int = 0) -> float:
+    """Step decay: full lr to 60%, x0.3 to 85%, x0.1 after; times `scale` (the collapse guard halves it at each
+    rollback), never below `floor`; then, `warmup` iterations from `warm_from` (a fresh optimiser; None = none),
+    a linear warm-up: x (it - warm_from + 1) / warmup."""
     f = it / max(1, iters)
-    return lr * (1.0 if f < 0.6 else 0.3 if f < 0.85 else 0.1)
+    x = max(floor, lr * scale * (1.0 if f < 0.6 else 0.3 if f < 0.85 else 0.1))
+    if warm_from is not None and warmup > 0 and 0 <= it - warm_from < warmup:
+        x *= (it - warm_from + 1) / warmup
+    return x
 
 
-def save_ckpt(path, model, opt, it, cfg, rng, pools=None, best=-1.0, eval_sec=0.0):
+def collapse_reason(score, best, frac, loss, history, skipped=0, steps=1, loss_x=4.0):
+    """Why the run counts as collapsed (a short string), or None. score: this log line's quick-check score
+    (None if there was none); best: the best score so far; loss: the window's mean loss over its finite steps
+    (None if it had none); history: the earlier windows' losses since the last fresh optimiser; skipped / steps:
+    the window's skipped (non-finite) and total steps."""
+    if loss is None or not math.isfinite(loss) or skipped > 0.1 * steps:
+        return f"loss not finite ({skipped} of {steps} steps skipped)"
+    if len(history) >= COLLAPSE_HISTORY:
+        med = float(np.median(history[-COLLAPSE_HISTORY:]))
+        if loss > loss_x * med:
+            return f"loss {loss:.4g} > {loss_x:g}x the median {med:.4g} of the previous {COLLAPSE_HISTORY} windows"
+    if score is not None and best >= COLLAPSE_MIN_BEST and score < frac * best:
+        return f"score {score:.4f} < {frac:g} x best {best:.4f}"
+    return None
+
+
+def best_score(run_dir):
+    """(score, iteration) of the model in runs/<name>/best.pt, or None without a readable one. The score is the
+    file's "best"; files from before the collapse guard have -1 there: then the log's last "best" at that
+    iteration (None if the log has none)."""
+    path = os.path.join(run_dir, "best.pt")
+    try:
+        b = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:  # noqa: BLE001 -- missing or unreadable: no best to keep
+        return None
+    score, it = b.get("best", -1.0), b.get("iteration", 0)
+    if score is None or score < 0:
+        score = None
+        try:
+            with open(os.path.join(run_dir, "log.jsonl")) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("iteration") == it and isinstance(rec.get("best"), (int, float)):
+                        score = float(rec["best"])
+        except OSError:
+            pass
+    return None if score is None else (float(score), it)
+
+
+def save_ckpt(path, model, opt, it, cfg, rng, pools=None, best=-1.0, eval_sec=0.0, steering=None, guard=None):
+    """Atomically (a temp file, then a rename): weights, optimiser, iteration, config, rng, pools, best score
+    (for best.pt: its own score), the last quick check's seconds, the pools' steering and the collapse guard's
+    state (guard = {lrScale, rollbacks, warmFrom}). Every tensor goes in on the CPU (to_cpu), so the file loads
+    on any device."""
     tmp = path + ".tmp"
-    torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "iteration": it,
-                "config": cfg, "rng": rng.bit_generator.state, "pool": pools, "best": best,
-                "evalSec": eval_sec}, tmp)
+    torch.save({"model": to_cpu(model.state_dict()), "opt": to_cpu(opt.state_dict()), "iteration": it,
+                "config": cfg, "rng": rng.bit_generator.state, "pool": to_cpu(pools), "best": best,
+                "evalSec": eval_sec, "steer": steering, **(guard or {})}, tmp)
     os.replace(tmp, path)
 
 
-def new_pool(rng, R, n, channels, bridge_frac):
-    """A pool of n boards at radius R: the walls as first drawn (orig), current walls, targets, depth, state."""
-    w, f, d, a = draw(rng, R, n, bridge_frac)
-    return {"orig": w.copy(), "walls": w, "fill": f, "depth": d, "aux": a,
-            "state": fresh_state(to_t(w), channels)}
+def new_pool(rng, R, n, channels, bridge_frac, aux=False, device=None):
+    """A pool of n fresh boards at radius R: walls, targets, depth, aux targets (only with aux), state (a
+    tensor on `device`; the rest numpy)."""
+    w, f, d, a = draw(rng, R, n, bridge_frac, aux)
+    pool = {"walls": w, "fill": f, "depth": d, "state": fresh_state(to_t(w, device), channels)}
+    if aux:
+        pool["aux"] = a
+    return bookkeeping(pool)
+
+
+def bookkeeping(pool, it=0):
+    """Add (where missing) a pool's per-sample bookkeeping, for pool.npz: loss (the sample's loss the last time
+    it was in a batch, NaN before), born (the iteration it last started from the fresh state), edits (damages
+    since then), last (kind of the last damage since then, an index into DAMAGE_KINDS; -1 none)."""
+    n = len(pool["walls"])
+    pool.setdefault("loss", np.full(n, np.nan, dtype=np.float32))
+    pool.setdefault("born", np.full(n, it, dtype=np.int64))
+    pool.setdefault("edits", np.zeros(n, dtype=np.int32))
+    pool.setdefault("last", np.full(n, -1, dtype=np.int8))
+    return pool
+
+
+def write_snapshot(path, it, pools, last_R, last_idx):
+    """runs/<name>/pool.npz for the live dashboard (nca/dashboard.py), atomically (a temp file, then a rename):
+    iteration, radii, last_R and last_idx (the batch that just ran), and per radius R the first n =
+    min(pool size, SNAP_N) slots of its pool: walls_R uint8 [n,S,S], fill_R float16 [n,S,S] (ch1 of the stored
+    state), target_R uint8 [n,S,S] (the acceptable target closest to the thresholded fill; the primary on a
+    tie), ntargets_R uint8 [n] (distinct acceptable targets), loss_R float32 [n] (NaN if never in a batch yet),
+    age_R int32 [n] (iterations since its last fresh start), edits_R int32 [n] (damages since then), damage_R
+    int8 [n] (the last one's kind: -1 none, then DAMAGE_KINDS' order: edit, burst, erase, stamp, state), and
+    state_R float16 [m,C,S,S], the full state of the first m = min(n, SNAP_M)."""
+    out = {"iteration": np.int64(it), "radii": np.array(sorted(pools), dtype=np.int64),
+           "last_R": np.int64(last_R), "last_idx": np.asarray(last_idx, dtype=np.int64)}
+    for R, P in pools.items():
+        n = min(len(P["walls"]), SNAP_N)
+        on = hex_mask(R) == 1
+        fill = P["state"][:n, 1].cpu().numpy()
+        fills = P["fill"][:n]  # [n,K,S,S]
+        wrong = (((fill > 0.5) & on)[:, None] != (fills > 0)).sum((2, 3))  # [n,K]; off board both are 0
+        out[f"walls_{R}"] = P["walls"][:n].astype(np.uint8)
+        out[f"fill_{R}"] = fill.astype(np.float16)
+        out[f"target_{R}"] = fills[np.arange(n), wrong.argmin(1)].astype(np.uint8)  # argmin: the first of a tie
+        out[f"ntargets_{R}"] = np.array([len({t.tobytes() for t in f}) for f in fills], dtype=np.uint8)
+        out[f"loss_{R}"] = P["loss"][:n].astype(np.float32)
+        out[f"age_{R}"] = (it - P["born"][:n]).astype(np.int32)
+        out[f"edits_{R}"] = P["edits"][:n].astype(np.int32)
+        out[f"damage_{R}"] = P["last"][:n].astype(np.int8)
+        out[f"state_{R}"] = P["state"][:min(n, SNAP_M)].cpu().numpy().astype(np.float16)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:  # a file object: savez would add ".npz" to a name
+        np.savez_compressed(f, **out)
+    os.replace(tmp, path)
 
 
 @torch.no_grad()
@@ -300,63 +570,100 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--name", required=True)
     p.add_argument("--R", type=int, nargs="+", default=[6, 8, 10], help="radii; each iteration uses one")
-    p.add_argument("--steps-mult", type=float, nargs=2, default=[7, 10], metavar=("A", "B"),
+    p.add_argument("--steps-mult", type=float, nargs=2, default=[6, 10], metavar=("A", "B"),
                    help="steps per iteration ~ U[A*R, B*R]")
     p.add_argument("--last-k", type=int, default=8, help="fill loss = mean over the last K steps")
     p.add_argument("--iters", type=int, default=None, help="total iterations, default 4000 (lr decay is relative to this)")
-    p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--lr", type=float, default=2e-3)
+    p.add_argument("--batch", type=int, default=16)
+    p.add_argument("--lr", type=float, default=None,
+                   help=f"peak learning rate (default {LR}; 2e-3 collapsed); with --resume it replaces the run's")
+    p.add_argument("--lr-floor", type=float, default=1e-5, help="the lr never goes below this (after decay and "
+                   "rollbacks; the warm-up still starts below it)")
+    p.add_argument("--warmup", type=int, default=100,
+                   help="linear lr warm-up over this many iterations after every fresh optimiser (0 = none)")
+    p.add_argument("--collapse-frac", type=float, default=0.6,
+                   help="collapse guard: roll back when a quick check scores below this share of the best so "
+                        f"far (once the best is >= {COLLAPSE_MIN_BEST})")
+    p.add_argument("--collapse-loss-x", type=float, default=4.0,
+                   help="collapse guard: roll back when a log window's loss is above this many times the median "
+                        f"of the {COLLAPSE_HISTORY} windows before it")
+    p.add_argument("--max-rollbacks", type=int, default=6,
+                   help="a collapse after this many rollbacks ends the run: {\"stopped\": \"collapsed\"}")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--hidden", type=int, default=64)
+    p.add_argument("--hidden", type=int, default=96)
     p.add_argument("--channels", type=int, default=16)
-    p.add_argument("--n-consts", type=int, default=7, choices=(1, 3, 7),
+    p.add_argument("--n-consts", type=int, default=1, choices=(1, 3, 7),
                    help="constant inputs, the first n of mask, theta1, theta2, src1, src1c, src2, src2c "
-                        "(1 = the v1/v2 model, 3 = v3-v5, 7 = v6: needed by --floods)")
-    p.add_argument("--floods", action=argparse.BooleanOptionalAction, default=True,
-                   help="spec v6 (default): channels 2..7 are the hand-written exact floods (model.install_floods), "
-                        "frozen; only the rest is trained. --no-floods: everything is learned (v1-v5)")
-    p.add_argument("--perception", default="taps+pool", choices=PERCEPTIONS,
-                   help="taps (spec v1-v3) or taps+pool (spec v4: plus each state channel's hex max and min)")
+                        "(1 = the mask alone: the pure default; 3 = v3-v5, 7 = v6: needed by --floods)")
+    p.add_argument("--floods", action=argparse.BooleanOptionalAction, default=False,
+                   help="hybrid spec v6: channels 2..7 are the hand-written exact floods (model.install_floods), "
+                        "frozen; only the rest is trained (needs --n-consts 7 --perception taps+pool). Off by default")
+    p.add_argument("--perception", default="taps", choices=PERCEPTIONS,
+                   help="taps (the default: a masked 3x3 conv) or taps+pool (hybrid spec v4: plus each state "
+                        "channel's hex max and min)")
     p.add_argument("--bridge-frac", type=float, default=0.25,
                    help="share of fresh boards drawn as kind \"bridge\" on top of the mix's own")
-    p.add_argument("--pool", action=argparse.BooleanOptionalAction, default=False,
-                   help="persistent sample pools (one per radius) with wall edits (v2-v4; v5 trains fresh starts only)")
+    p.add_argument("--pool", action=argparse.BooleanOptionalAction, default=True,
+                   help="persistent sample pools (one per radius) with damage (the default); --no-pool: fresh "
+                        "starts only (v5, v6)")
     p.add_argument("--pool-size", type=int, default=256, help="boards per radius")
-    p.add_argument("--edit-frac", type=float, default=0.5, help="pool: share of each batch given a wall edit")
+    p.add_argument("--damage", type=float, default=0.5,
+                   help="pool: probability that a board of the batch (not the restarted or new ones) gets one "
+                        "damage: edit, burst, erase, stamp or state")
     p.add_argument("--aux", action="store_true",
-                   help="also train channels 2..6 towards data.aux_targets (the floods of the comparative rule)")
+                   help="hybrid: also train channels 2..6 towards data.aux_targets (the floods of the comparative rule)")
     p.add_argument("--aux-dense", action=argparse.BooleanOptionalAction, default=True,
                    help="--aux targets per step: the flood F_t at every step t (spec v5, default), or with "
                         "--no-aux-dense the steady state over the last-k steps (v4)")
     p.add_argument("--aux-w", type=float, default=1.0, help="weight of the --aux loss")
     p.add_argument("--teach", type=float, nargs=2, default=None, metavar=("P0", "P1"),
-                   help="teacher forcing (spec v6; --aux --aux-dense only): after each step, with probability p "
-                        "per board, channels 2..6 := the reference F_t; p linear from P0 at iteration 0 to P1 at "
-                        "--iters (default 1.0 0.2; 0 0 = off). On --resume: anneal on from the current p to "
-                        "the new P1")
-    p.add_argument("--resume", action="store_true", help="carry on from runs/<name>/ckpt.pt")
-    p.add_argument("--init", help="start from this checkpoint's weights (fresh optimiser, iteration 0); "
-                   "it may have fewer consts: the new const columns start at zero")
+                   help="teacher forcing (spec v6; --aux --aux-dense --no-pool only): after each step, with "
+                        "probability p per board, channels 2..6 := the reference F_t; p linear from P0 at "
+                        "iteration 0 to P1 at --iters (default 1.0 0.2; 0 0 = off). On --resume: anneal on from "
+                        "the current p to the new P1")
+    p.add_argument("--resume", action="store_true", help="carry on from runs/<name>/ckpt.pt, exactly")
+    p.add_argument("--init", help="start from this checkpoint's weights (fresh optimiser, fresh pools, iteration 0; "
+                   "--R and the rest from this command line: a curriculum stage); it may have fewer consts or "
+                   "no pooled perception: the new weights start at zero")
     p.add_argument("--clamp", type=float, nargs=2, default=[-2.0, 2.0], metavar=("LO", "HI"),
-                   help="state clamp of a fresh model; [-2, 2] since v4: the --aux targets of the max channels sit "
-                        "at ~0.98, and under a clamp at 1 they stick there with no gradient (runs/experiments.md, v4)")
+                   help="state clamp of a fresh model ([-2, 2] since v4)")
     p.add_argument("--no-clamp", action="store_true")
     p.add_argument("--eval-mults", type=int, nargs="+", default=[8, 16], help="quick check read out at mult*R steps")
-    p.add_argument("--eval-every", type=int, default=50, help="quick check every this many iterations (a multiple of 50)")
+    p.add_argument("--eval-every", type=int, default=200, help="quick check every this many iterations (a multiple of 50)")
     p.add_argument("--minutes", type=float, default=0, help="stop (with a checkpoint) after this long; 0 = no limit")
-    p.add_argument("--threads", type=int, default=2, help="torch threads (at most 3 on the Pi)")
+    p.add_argument("--threads", type=int, default=None,
+                   help="torch threads (default min(4, cores); the Pi's runs used 2)")
+    p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
+                   help="auto = cuda if torch sees a GPU, else cpu. Checkpoints hold CPU tensors either way, so "
+                        "a run moves between the Pi and a GPU with --resume / --init (not bit-identically)")
+    p.add_argument("--eval-n", type=int, default=None,
+                   help=f"held-out boards per set per radius in the quick check (default {EVAL_N}, or what the "
+                        "resumed run used); a GPU run can afford more, which makes the check less noisy")
+    p.add_argument("--ckpt-every", type=int, default=200,
+                   help="write ckpt.pt every this many iterations (and at the end, and on a --minutes stop); "
+                        "a fast GPU run wants a larger number, since a checkpoint carries the pools")
+    p.add_argument("--snap-every", type=int, default=25,
+                   help="pool runs: write runs/<name>/pool.npz (write_snapshot, for nca/dashboard.py) every this "
+                        "many iterations and at every checkpoint; 0 = never")
     args = p.parse_args()
+    if args.eval_every % 50:
+        p.error("--eval-every must be a multiple of 50 (the log's period)")
     if args.floods and not args.resume and (args.n_consts != 7 or args.perception != "taps+pool" or args.aux
                                             or args.init):
-        p.error("--floods (the default) needs --n-consts 7, the taps+pool perception, no --aux and no --init "
-                "(channels 2..7 are written by hand); use --no-floods for the v1-v5 recipes")
+        p.error("--floods needs --n-consts 7, --perception taps+pool, no --aux and no --init "
+                "(channels 2..7 are written by hand)")
     if args.pool and args.aux and args.aux_dense and not args.resume:
         p.error("--aux-dense floods from the fresh state, but --pool samples carry their state on: "
-                "use --no-aux-dense with --pool")
+                "use --no-aux-dense with --pool, or --no-pool")
     if args.teach and any(args.teach) and not args.resume and not (args.aux and args.aux_dense and not args.pool):
-        p.error("--teach feeds in the reference flood F_t: it needs --aux --aux-dense and no --pool")
+        p.error("--teach feeds in the reference flood F_t: it needs --aux --aux-dense and --no-pool")
 
-    torch.set_num_threads(min(3, args.threads))
+    torch.set_num_threads(args.threads or min(4, os.cpu_count() or 1))
+    device = pick_device(args.device)
+    if device.type == "cuda":  # fixed shapes per radius: let cudnn pick its kernels; true float32, no TF32
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
     run_dir = os.path.join("runs", args.name)
     os.makedirs(run_dir, exist_ok=True)
     ckpt_path = os.path.join(run_dir, "ckpt.pt")
@@ -364,7 +671,7 @@ def main():
     start_it = 0
     ckpt = init = None
     if args.resume:
-        ckpt = torch.load(ckpt_path, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         cfg = ckpt["config"]
         start_it = ckpt["iteration"]
         p_now = teach_p(start_it, cfg)  # where the anneal stopped, on the schedule it was saved with
@@ -373,9 +680,17 @@ def main():
             cfg["teach"] = [cfg["teach"][0], args.teach[1]]
         if cfg.get("teach") and abs(teach_p(start_it, cfg) - p_now) > 1e-12:  # new --iters / P1: go on from here
             cfg["teachFrom"] = [start_it, p_now]
+        if args.lr:  # a new peak lr for the rest of the run (the schedule and the rollback scale still apply)
+            cfg["lr"] = args.lr
+        for k, v in (("lrFloor", 0.0), ("warmup", 0), ("collapseFrac", args.collapse_frac),
+                     ("collapseLossX", args.collapse_loss_x), ("maxRollbacks", args.max_rollbacks)):
+            cfg.setdefault(k, v)  # older checkpoints: no floor, no warm-up (the optimiser carries on), the guard on
+        if cfg.get("pool") and "damage" not in cfg:
+            p.error(f"{ckpt_path} is from the old pool (edits toggled back to the board as first drawn); "
+                    "start a new run, or --init from it")
     else:
         if args.init:
-            init = torch.load(args.init, weights_only=False)
+            init = torch.load(args.init, map_location="cpu", weights_only=False)
             ic = init["config"]
             if (ic["channels"], ic["hidden"]) != (args.channels, args.hidden):
                 p.error(f"--init {args.init} has channels={ic['channels']} hidden={ic['hidden']}, but this run asks "
@@ -394,8 +709,11 @@ def main():
             "fireRate": 1.0, "stepsMult": [a, b],
             "steps": {R: [int(round(a * R)), int(round(b * R))] for R in sorted(args.R)},
             "margin": MARGIN, "lastK": args.last_k,
-            "lr": args.lr, "batch": args.batch, "iters": args.iters or 4000, "seed": args.seed,
-            "bridgeFrac": args.bridge_frac, "pool": args.pool, "poolSize": args.pool_size, "editFrac": args.edit_frac, "init": args.init,
+            "lr": args.lr or LR, "lrFloor": args.lr_floor, "warmup": args.warmup, "collapseFrac": args.collapse_frac,
+            "collapseLossX": args.collapse_loss_x, "maxRollbacks": args.max_rollbacks, "batch": args.batch, "iters": args.iters or 4000, "seed": args.seed,
+            "bridgeFrac": args.bridge_frac, "pool": args.pool, "poolSize": args.pool_size,
+            "damage": args.damage if args.pool else None, "damageKinds": list(DAMAGE_KINDS) if args.pool else None,
+            "init": args.init,
             "loss": "min over acceptable targets of MSE(ch1, fill) over on-board cells, mean of the last lastK steps"
                     + ("" if not args.aux else
                        " + auxW * MSE(ch2..6, aux_flood F_t) over on-board cells, mean of every step t = 1..T"
@@ -413,15 +731,15 @@ def main():
     n_consts = cfg.get("nConsts", 1)  # checkpoints from before v3 have only the mask
     perception = cfg.setdefault("perception", "taps")  # and from before v4 no pool
     floods = cfg.get("floods", False)  # spec v6
+    eval_n = cfg["evalN"] = args.eval_n or cfg.get("evalN", EVAL_N)  # runs from before --eval-n used EVAL_N
+    torch.manual_seed(cfg["seed"])  # the init of a fresh model, on the CPU whatever the device (a loaded one overwrites it)
     model = HexNCA(cfg["channels"], cfg["hidden"], cfg["clamp"], cfg["fireRate"], n_consts, perception, floods)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     rng = np.random.default_rng(cfg["seed"])
     radii, B, last_k, bf = cfg["R"], cfg["batch"], cfg["lastK"], cfg.get("bridgeFrac", 0.0)
     use_aux, aux_w, dense = cfg.get("aux", False), cfg.get("auxW", 1.0), cfg.get("auxDense", False)
     consts = {R: const_stack(R, n_consts) for R in radii}  # [1,n,S,S] each, built once per radius
     if ckpt:
         model.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["opt"])
         rng.bit_generator.state = ckpt["rng"]
         assert not floods or all(torch.equal(getattr(model, k)[f], model.frozen_values[k][f])
                                  for k, f in model.frozen.items()), "the checkpoint's hand-written floods changed"
@@ -429,95 +747,182 @@ def main():
         load_expanded(model, init["model"])
         if init_consts < n_consts or "w1pool" not in init["model"] and perception == "taps+pool":
             print(json.dumps({"initExpansion": expansion_check(model, init, consts[radii[-1]])}), flush=True)
+    # Everything the model touches lives on the device from here; the board work stays numpy on the CPU. The
+    # optimiser comes after the move (Adam has no randomness), and loading its state moves that state too.
+    model_to(model, device)
+    consts = {R: c.to(device) for R, c in consts.items()}
+    opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+    if ckpt:
+        opt.load_state_dict(ckpt["opt"])
+    # The collapse guard's state (module docstring): kept in ckpt.pt; a fresh or --init run warms up from 0.
+    lr_scale = ckpt.get("lrScale", 1.0) if ckpt else 1.0
+    rollbacks = ckpt.get("rollbacks", 0) if ckpt else 0
+    warm_from = ckpt.get("warmFrom") if ckpt else 0
+    guard = lambda: {"lrScale": lr_scale, "rollbacks": rollbacks, "warmFrom": warm_from}
+    lr_of = lambda i: lr_at(i, cfg["iters"], cfg["lr"], lr_scale, cfg.get("lrFloor", 0.0), warm_from,
+                            cfg.get("warmup", 0))
 
-    held = heldout(radii, consts)
-    start = {"config": cfg, "startIteration": start_it}
+    held = heldout(radii, consts, eval_n, device)
+    eseq = {R: edit_sequence(R, consts[R], eval_n, device=device) for R in radii}
+    m0 = args.eval_mults[0]
+
+    def check():
+        """The quick check: {q<m>: ..., edit: [...], editByR: {...}, score} (see the module docstring)."""
+        rec = {f"q{m}": q for m, q in
+               quick_eval(model, held, args.eval_mults, aux=use_aux, arc=use_aux,
+                          teach_check=use_aux and dense and bool(cfg.get("teach"))).items()}
+        rec.update(edit_eval(model, eseq, m0))
+        q = rec[f"q{m0}"]
+        rec["score"] = round((q["mix"] + q["bridge"] + q["page"] + float(np.mean(rec["edit"]))) / 4, 4)
+        rec["evalN"] = eval_n  # boards per set per radius behind these shares (nca.progress's noise)
+        return rec
+
+    start = {"config": cfg, "startIteration": start_it,
+             "editChanged": [round(float(np.mean([e[3][k] for e in eseq.values()])), 3) for k in range(N_EDITS)],
+             "editHold": [round(float(np.mean([e[4][k] for e in eseq.values()])), 3) for k in range(N_EDITS)],
+             "evalN": eval_n, "threads": torch.get_num_threads(), "torch": torch.__version__,
+             "lrScale": lr_scale, "rollbacks": rollbacks}
+    if device.type == "cuda":
+        start["gpu"] = torch.cuda.get_device_name(device)
     if use_aux:
         start["trivialAux"] = {f"q{m}": q for m, q in trivial_aux(held, args.eval_mults).items()}
     if floods and not ckpt:  # the comparative rule read off the exact frozen floods: the readout's ceiling
         start["arcCeiling"] = {f"q{m}": {k: v for k, v in q.items() if k.startswith("arc")}
                                for m, q in quick_eval(model, held, args.eval_mults).items()}
-    print(json.dumps(start), flush=True)
+    log = open(os.path.join(run_dir, "log.jsonl"), "a")
 
-    pools = None
+    def emit(rec):
+        """A log line (and the same on stdout); every one says when (unix seconds) and on what device."""
+        rec["time"], rec["device"] = round(time.time(), 2), device.type
+        print(json.dumps(rec), flush=True)
+        log.write(json.dumps(rec) + "\n")
+        log.flush()
+
+    emit(start)  # at every (re)start: the config; its "iters" is the target (a --resume may raise it)
+
+    pools, steering = None, {}
     if cfg["pool"]:
         pools = ckpt["pool"] if ckpt and ckpt.get("pool") else \
-            {R: new_pool(rng, R, cfg["poolSize"], cfg["channels"], bf) for R in radii}
-        for R, P in pools.items():  # pools saved before --aux existed, or with v3's 4 aux planes
-            if "aux" not in P or P["aux"].shape[1] != N_AUX:
+            {R: new_pool(rng, R, cfg["poolSize"], cfg["channels"], bf, use_aux, device) for R in radii}
+        for R, P in pools.items():  # aux targets for a pool that lacks them (or has v3's 4 planes)
+            P["state"] = P["state"].to(device)
+            if use_aux and ("aux" not in P or P["aux"].shape[1] != N_AUX):
                 P["aux"] = np.stack([aux_targets(w, R) for w in P["walls"]])
+            bookkeeping(P, start_it)
+        steering = (ckpt or {}).get("steer") or {R: steer(pool_stats(P["walls"], P["fill"], R))
+                                                 for R, P in pools.items()}
 
     def n_steps(R, depth_max):
         t0, t1 = cfg["steps"][R]
         lo = max(t0, int(depth_max) + MARGIN)
         return int(rng.integers(lo, max(t1, lo) + 1))
 
-    log = open(os.path.join(run_dir, "log.jsonl"), "a")
-    t_win, losses, parts, taught = time.time(), [], [], []
+    snap_path, snap_failed, last = os.path.join(run_dir, "pool.npz"), [], [None]
+
+    def snapshot(it):
+        """pool.npz after the batch last[0] = (R, idx) ran; a failure is logged once and never stops training."""
+        if not pools or not args.snap_every or last[0] is None:
+            return
+        try:
+            write_snapshot(snap_path, it, pools, *last[0])
+        except Exception as e:  # noqa: BLE001 -- the dashboard is never worth a training run
+            if not snap_failed:
+                snap_failed.append(1)
+                emit({"iteration": it, "snapshotError": repr(e)})
+
     best = ckpt.get("best", -1.0) if ckpt else -1.0
+    best_path = os.path.join(run_dir, "best.pt")
+    on_disk = best_score(run_dir) if ckpt else None
+    if on_disk and on_disk[0] > best:  # best.pt can be newer than ckpt.pt: never overwrite it with a worse model
+        best = on_disk[0]
     # --minutes: stop BEFORE an iteration that (with the slowest iteration seen so far, plus the last quick
     # check's time if one is due after it) would end past the limit -- so the quick check keeps to it too.
     eval_sec = ckpt.get("evalSec", 0.0) if ckpt else 0.0
+    if not ckpt:  # iteration 0: where this run (or stage) starts from; also times the quick check
+        t_eval = time.time()
+        rec = {"iteration": 0, **check()}
+        eval_sec = rec["evalSec"] = round(time.time() - t_eval, 1)
+        if pools:
+            rec["pool"] = {R: pool_stats(P["walls"], P["fill"], R) for R, P in pools.items()}
+        best = rec["best"] = rec["score"]
+        save_ckpt(best_path, model, opt, 0, cfg, rng, best=best, eval_sec=eval_sec)
+        emit(rec)
+
+    t_win, losses, parts, taught = time.time(), [], [], []
+    kinds = dict.fromkeys(DAMAGE_KINDS, 0)
+    skipped = skip_run = 0
+    win_skipped, win_steps, history = 0, 0, []  # the collapse guard's loss windows (since the last fresh optimiser)
+    collapsed = False
     slowest = 0.0
     it = start_it
     while it < cfg["iters"]:
         due = (it + 1) % args.eval_every == 0 or it + 1 == cfg["iters"]
         if args.minutes and time.time() - t_start + slowest + (eval_sec if due else 0) > 60 * args.minutes:
             if it > start_it:
-                save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec)
-            print(json.dumps({"stopped": "time", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2),
-                              "slowestIterSec": round(slowest, 2), "evalSec": round(eval_sec, 1)}), flush=True)
+                save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering, guard())
+                snapshot(it)
+            # a clean end of this chunk (or time-boxed stage), in the log too: nca.progress reads it as FINISHED
+            emit({"stopped": "time", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2),
+                  "slowestIterSec": round(slowest, 2), "evalSec": round(eval_sec, 1)})
             break
         t_it = time.time()
         R = int(rng.choice(radii))
         cs = consts[R]
         mk = cs[:, :1]
         if cfg["pool"]:
-            P = pools[R]
-            n = len(P["orig"])
-            idx = rng.choice(n, B, replace=False)
-            tidx = torch.from_numpy(idx)
-            orig_np, walls_np, fill_np, depth_np = P["orig"][idx], P["walls"][idx], P["fill"][idx], P["depth"][idx]
-            aux_np = P["aux"][idx]
+            P, st = pools[R], steering[R]
+            idx = rng.choice(len(P["walls"]), B, replace=False)
+            tidx = torch.from_numpy(idx).to(device)
+            walls_np, fill_np, depth_np = P["walls"][idx], P["fill"][idx], P["depth"][idx]  # copies
+            aux_np = P["aux"][idx] if use_aux else None
             state = P["state"][tidx].clone()
             with torch.no_grad():
-                cur = per_sample_loss(state[:, 1:2], to_t(fill_np), mk).min(1).values.numpy()
+                cur = per_sample_loss(state[:, 1:2], to_t(fill_np, device), mk).min(1).values.cpu().numpy()
             order = np.argsort(-cur)  # worst first
-            # The worst sample starts over from the fresh state on its own board as first drawn
-            # (a new board instead, as in distill, drifts the pool towards the easy boards).
+            # The worst sample starts over from the fresh state on its board (a new board instead, as in
+            # distill, drifts the pool towards the easy boards).
             j = order[0]
-            walls_np[j] = orig_np[j]
-            fill_np[j], depth_np[j], aux_np[j] = answers(orig_np[j], R)
-            state[j] = fresh_state(to_t(orig_np[j][None]), cfg["channels"])[0]
-            # B//8 random others get brand-new boards (unbiased turnover).
+            state[j] = fresh_state(to_t(walls_np[j][None], device), cfg["channels"])[0]
+            fresh = [j]
+            # batch/8 random others get brand-new boards (twice as many while the pool is steered).
             rest = rng.permutation(order[1:])
-            n_new = max(1, B // 8)
-            w, f, d, a = draw(rng, R, n_new, bf)
+            n_new = min(len(rest), max(1, B // 8) * st["newMult"])
+            w, f, d, a = draw(rng, R, n_new, bf, use_aux)
             for k, j in enumerate(rest[:n_new]):
-                orig_np[j], walls_np[j], fill_np[j], depth_np[j], aux_np[j] = w[k], w[k], f[k], d[k], a[k]
-                state[j] = fresh_state(to_t(w[k][None]), cfg["channels"])[0]
-            # A random editFrac of the batch get a wall edit and carry on from their settled state
-            # (a user drawing on a settled board). Edits never pile up: a board as first drawn gets
-            # edit_walls of itself, an edited one goes back to how it was first drawn.
-            n_edit = min(len(rest) - n_new, int(round(B * cfg.get("editFrac", 0.5))))
-            for j in rest[n_new:n_new + n_edit]:
-                if np.array_equal(walls_np[j], orig_np[j]):
-                    walls_np[j] = edit_walls(rng, orig_np[j], R)
-                else:
-                    walls_np[j] = orig_np[j]
-                fill_np[j], depth_np[j], aux_np[j] = answers(walls_np[j], R)
-            walls, target = to_t(walls_np), to_t(fill_np)
+                walls_np[j], fill_np[j], depth_np[j] = w[k], f[k], d[k]
+                if use_aux:
+                    aux_np[j] = a[k]
+                state[j] = fresh_state(to_t(w[k][None], device), cfg["channels"])[0]
+                fresh.append(j)
+            P["born"][idx[fresh]], P["edits"][idx[fresh]], P["last"][idx[fresh]] = it, 0, -1
+            # Each of the rest, with probability --damage, gets one damage and carries on from its state.
+            for j in rest[n_new:]:
+                if rng.random() >= cfg["damage"]:
+                    continue
+                k = int(rng.choice(len(DAMAGE_KINDS), p=st["p"]))
+                kind = DAMAGE_KINDS[k]
+                kinds[kind] += 1
+                P["edits"][idx[j]] += 1
+                P["last"][idx[j]] = k
+                if kind == "state":
+                    damage_state(rng, state[j], R)
+                    continue
+                walls_np[j] = damage_walls(rng, walls_np[j], R, kind, st["pBridge"])
+                fill_np[j], depth_np[j], aux_j = answers(walls_np[j], R, use_aux)
+                if use_aux:
+                    aux_np[j] = aux_j
+            walls, target = to_t(walls_np, device), to_t(fill_np, device)
             state[:, 0:1] = walls
         else:
-            walls_np, fill_np, depth_np, aux_np = draw(rng, R, B, bf)
-            walls, target = to_t(walls_np), to_t(fill_np)
+            walls_np, fill_np, depth_np, aux_np = draw(rng, R, B, bf, use_aux)
+            walls, target = to_t(walls_np, device), to_t(fill_np, device)
             state = fresh_state(walls, cfg["channels"])
 
         T = n_steps(R, depth_np.max())
         if use_aux and dense:  # [T,B,5,S,S]: the reference flood at every step from the fresh state
-            aux_t = torch.from_numpy(aux_flood(walls_np, R, T))
+            aux_t = torch.from_numpy(aux_flood(walls_np, R, T)).to(device)
         elif use_aux:
-            aux_t = torch.from_numpy(np.ascontiguousarray(aux_np))
+            aux_t = torch.from_numpy(np.ascontiguousarray(aux_np)).to(device)
         acc = acc_aux = 0.0
         p_teach = teach_p(it, cfg) if use_aux and dense and not cfg["pool"] else 0.0
         n_taught = 0
@@ -530,7 +935,7 @@ def main():
                 if use_aux and not dense:
                     acc_aux = acc_aux + aux_loss(state, aux_t, mk) / last_k
             if p_teach > 0 and t < T - 1:  # teacher forcing: the losses above saw the model's own output
-                coin = torch.from_numpy(rng.random(B) < p_teach)
+                coin = torch.from_numpy(rng.random(B) < p_teach).to(device)
                 if coin.any():
                     state = teach(state, aux_t[t], coin)
                     n_taught += int(coin.sum())
@@ -539,50 +944,108 @@ def main():
 
         opt.zero_grad()
         loss.backward()
-        for prm in model.parameters():  # per-parameter gradient normalisation (distill notebook)
-            if prm.grad is not None:
-                prm.grad /= prm.grad.norm() + 1e-8
-        for g in opt.param_groups:
-            g["lr"] = lr_at(it, cfg["iters"], cfg["lr"])
-        opt.step()
-        model.restore_floods()  # spec v6: a no-op unless something besides the (masked) gradient moved them
+        finite = bool(torch.isfinite(loss)) and all(bool(torch.isfinite(prm.grad).all())
+                                                    for prm in model.parameters() if prm.grad is not None)
+        if finite:
+            skip_run = 0
+            for prm in model.parameters():  # per-parameter gradient normalisation (distill notebook)
+                if prm.grad is not None:
+                    prm.grad /= prm.grad.norm() + 1e-8
+            for g in opt.param_groups:
+                g["lr"] = lr_of(it)
+            opt.step()
+            model.restore_floods()  # spec v6: a no-op unless something besides the (masked) gradient moved them
+            losses.append(loss.item())
+            if use_aux:
+                parts.append((loss_fill.item(), acc_aux.mean().item()))
+        else:  # no step; the batch's boards start over from the fresh state
+            skipped, skip_run, win_skipped = skipped + 1, skip_run + 1, win_skipped + 1
+            state = fresh_state(walls, cfg["channels"])
+            if cfg["pool"]:
+                P["born"][idx], P["edits"][idx], P["last"][idx] = it, 0, -1
         it += 1
-        losses.append(loss.item())
-        if use_aux:
-            parts.append((loss_fill.item(), acc_aux.mean().item()))
+        win_steps += 1
         taught.append(n_taught / (B * max(1, T - 1)))
         slowest = max(slowest, time.time() - t_it)  # the iteration alone (no quick check, no checkpoint)
 
         if cfg["pool"]:
             P["state"][tidx] = state.detach()
-            P["orig"][idx], P["walls"][idx], P["fill"][idx], P["depth"][idx] = orig_np, walls_np, fill_np, depth_np
-            P["aux"][idx] = aux_np
+            P["walls"][idx], P["fill"][idx], P["depth"][idx] = walls_np, fill_np, depth_np
+            P["loss"][idx] = acc.detach().min(1).values.cpu().numpy()
+            if use_aux:
+                P["aux"][idx] = aux_np
+            last[0] = (R, idx)
+        if skip_run >= STOP_SKIPS:
+            emit({"iteration": it, "stopped": f"{STOP_SKIPS} non-finite steps in a row", "skipped": skipped})
+            raise SystemExit(f"{STOP_SKIPS} non-finite steps in a row; the last checkpoint is {ckpt_path}")
 
         if it % 50 == 0 or it == cfg["iters"]:
-            rec = {"iteration": it, "loss": float(np.mean(losses)),
-                   "secPerIter": (time.time() - t_win) / len(losses),
-                   "lr": lr_at(it - 1, cfg["iters"], cfg["lr"]),
+            rec = {"iteration": it, "loss": float(np.mean(losses)) if losses else None,
+                   "secPerIter": (time.time() - t_win) / max(1, len(taught)),
+                   "lr": lr_of(it - 1),
                    "maxRssMB": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024}
             if parts:
                 rec["lossFill"], rec["lossAux"] = (float(x) for x in np.mean(parts, 0))
             if cfg.get("teach"):  # p at the window's last iteration, and the share of steps actually taught
                 rec["teachP"], rec["taught"] = round(teach_p(it - 1, cfg), 4), round(float(np.mean(taught)), 4)
+            if cfg["pool"]:
+                rec["damage"] = kinds
+            if skipped:
+                rec["skipped"] = skipped
+            if it % 200 == 0 and cfg["pool"]:  # the pools' statistics, and the steering they set
+                rec["pool"] = {R: pool_stats(P["walls"], P["fill"], R) for R, P in pools.items()}
+                steering = {R: steer(s) for R, s in rec["pool"].items()}
+                if any(s["why"] for s in steering.values()):
+                    rec["steer"] = {R: s for R, s in steering.items() if s["why"]}
+            # The collapse guard (module docstring): the loss rule first, so a window that trips it never
+            # makes a best.pt; then the score rule at a quick check.
+            why = collapse_reason(None, best, cfg["collapseFrac"], rec["loss"], history, win_skipped, win_steps,
+                                  cfg["collapseLossX"])
             if it % args.eval_every == 0 or it == cfg["iters"]:
                 t_eval = time.time()
-                rec.update({f"q{m}": q for m, q in
-                            quick_eval(model, held, args.eval_mults, aux=use_aux, arc=not floods,
-                                       teach_check=use_aux and dense and bool(cfg.get("teach"))).items()})
+                rec.update(check())
                 eval_sec = rec["evalSec"] = round(time.time() - t_eval, 1)
-                q = rec[f"q{args.eval_mults[0]}"]
-                if (q["mix"] + q["bridge"]) / 2 > best:  # training swings: keep the best quick check too
-                    best = rec["best"] = (q["mix"] + q["bridge"]) / 2
-                    save_ckpt(os.path.join(run_dir, "best.pt"), model, opt, it, cfg, rng, eval_sec=eval_sec)
-            print(json.dumps(rec), flush=True)
-            log.write(json.dumps(rec) + "\n")
-            log.flush()
+                if rec["score"] > best and not why:  # training swings: keep the best quick check too
+                    best = rec["best"] = rec["score"]
+                    save_ckpt(best_path, model, opt, it, cfg, rng, best=best, eval_sec=eval_sec)
+                why = why or collapse_reason(rec["score"], best, cfg["collapseFrac"], 0.0, [], 0, 1)
+            emit(rec)
+            if rec["loss"] is not None and math.isfinite(rec["loss"]):
+                history.append(rec["loss"])
             t_win, losses, parts, taught = time.time(), [], [], []
-        if it % 200 == 0 or it == cfg["iters"]:
-            save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec)
+            kinds = dict.fromkeys(DAMAGE_KINDS, 0)
+            win_skipped = win_steps = 0
+            if why:
+                back = best_score(run_dir)
+                if rollbacks >= cfg["maxRollbacks"] or back is None:
+                    save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering, guard())
+                    emit({"iteration": it, "stopped": "collapsed", "reason": why, "rollbacks": rollbacks,
+                          "lrScale": lr_scale, "best": best,
+                          **({} if back else {"note": "no readable best.pt to roll back to"})})
+                    collapsed = True
+                    break
+                # Roll back: best.pt's weights, a fresh optimiser (warming up), half the lr, fresh pool states.
+                b = torch.load(best_path, map_location="cpu", weights_only=False)
+                model.load_state_dict(b["model"])
+                model.restore_floods()
+                opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+                lr_scale, rollbacks, warm_from, history = lr_scale / 2, rollbacks + 1, it, []
+                if pools:
+                    for P in pools.values():
+                        P["state"] = fresh_state(to_t(P["walls"], device), cfg["channels"])
+                        P["born"][:], P["edits"][:], P["last"][:], P["loss"][:] = it, 0, -1, np.nan
+                emit({"iteration": it, "rollback": it, "lrScale": lr_scale, "rollbacks": rollbacks, "reason": why,
+                      "restored": back[1], "best": best})
+                save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering, guard())
+                snapshot(it)
+                continue
+        if it % max(1, args.ckpt_every) == 0 or it == cfg["iters"]:
+            save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering, guard())
+            snapshot(it)
+        elif args.snap_every and it % args.snap_every == 0:
+            snapshot(it)
+    if it >= cfg["iters"] and not collapsed:  # the run reached its target: a clean end, in the log (nca.progress: FINISHED)
+        emit({"stopped": "done", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2)})
     log.close()
 
 

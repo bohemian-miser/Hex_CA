@@ -87,6 +87,10 @@ dl.readout dd { margin: 0; text-align: right; }
 .tile i { font-style: normal; color: var(--muted); }
 .tile.const { opacity: 0.85; cursor: default; }
 .tile.const canvas { cursor: default; }
+/* The Weights group: only with ?weights= (a training run's weights, from the dashboard's Play). */
+.group[hidden] { display: none; }
+.source { margin: 0; font: 13px/1.45 var(--mono); overflow-wrap: anywhere; }
+.source .err { display: block; color: var(--bad); }
 </style>
 <div class="wrap">
   <header>
@@ -100,6 +104,14 @@ dl.readout dd { margin: 0; text-align: right; }
       <div class="stage"><canvas id="board" aria-label="The hexagon field: drag to paint or erase walls"></canvas></div>
     </div>
     <div class="side">
+      <div class="group" id="weightsGroup" hidden>
+        <div class="label">Weights</div>
+        <p class="source" id="source" aria-live="polite"></p>
+        <div class="buttons">
+          <button id="reloadWeights" title="Fetch the run's weights again and swap them in: the walls stay, the state starts over">Reload weights</button>
+        </div>
+        <label class="check"><input type="checkbox" id="autoReload"> Reload every 2 minutes (if they changed)</label>
+      </div>
       <div class="group">
         <div class="label">Draw</div>
         <div class="views">

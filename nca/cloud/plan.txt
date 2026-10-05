@@ -1,0 +1,10 @@
+# Launch 3 (2026-10-05): larger boards, as an A/B on rollout length.
+# Launch 2's stage at R 6 8 10 with lr 3e-4 made both models WORSE than the weights they started from
+# (the larger model fell from 0.88 to 0.33 on bridges in 2,500 iterations), so: a much lower learning rate
+# (5e-5, where stage 1 ended), the small radii kept in the mix, and a tighter rollback (a 15% relative drop
+# in the held-out score reloads the best weights and halves the rate).
+# Both runs start from the larger model's stage-1 best (hidden 256, 24 channels; it carried over to
+# R 8-10 better than the small one). They differ ONLY in rollout length per iteration:
+#   ha: 6R-10R steps, as before.      hb: 3R-6R steps (pool states persist, so settling can span visits).
+ha | big | 290 | --R 5 6 8 10 --iters 200000 --lr 5e-5 --steps-mult 6 10 --collapse-frac 0.85 --batch 32 --pool-size 512 --hidden 256 --channels 24 --eval-every 500 --eval-n 128 --ckpt-every 1000 --snap-every 100 --init bucket:runs/gb-r456b/best.pt
+hb | big | 290 | --R 5 6 8 10 --iters 300000 --lr 5e-5 --steps-mult 3 6 --collapse-frac 0.85 --batch 32 --pool-size 512 --hidden 256 --channels 24 --eval-every 500 --eval-n 128 --ckpt-every 1000 --snap-every 100 --init bucket:runs/gb-r456b/best.pt

@@ -325,7 +325,416 @@ def main() -> None:
     aux_checks(rng)
     model_checks(rng)
     flood_checks(rng)
+    damage_checks()
+    pool_stat_checks()
+    device_checks()
+    snapshot_checks()
+    collapse_checks()
+    progress_checks()
     print("\nALL OK")
+
+
+def damage_checks() -> None:
+    """The training pool's damage kinds (data.damage_walls a-d, train.damage_state e)."""
+    import torch
+
+    from .data import WALL_DAMAGE, damage_walls, disc
+    from .train import damage_state
+
+    print("\n-- damage (train.py --damage) --")
+    rng = np.random.default_rng(777)
+    hexd = lambda R, a, b: max(abs(int(a[1]) - int(b[1])), abs(int(a[0]) - int(b[0])),
+                               abs(int(a[1]) - int(b[1]) + int(a[0]) - int(b[0])))
+    n_boards, on_ok, changed = 0, True, {k: 0 for k in WALL_DAMAGE}
+    burst_ok, burst_add, burst_del, erase_ok, stamp_ok = True, 0, 0, True, True
+    for _ in range(40):
+        R = int(rng.integers(3, 9))
+        on = mask(R) == 1
+        w = random_walls(rng, R)
+        for kind in WALL_DAMAGE:
+            d = damage_walls(np.random.default_rng(int(rng.integers(1 << 30))), w, R, kind)
+            on_ok &= d.dtype == np.uint8 and d.shape == w.shape and set(np.unique(d)) <= {0, 1} \
+                and int(d[~on].sum()) == 0
+            diff = d != w
+            changed[kind] += bool(diff.any())
+            if kind == "burst":
+                burst_ok &= 1 <= int(diff.sum()) <= 20
+                burst_add += int((diff & (d == 1)).sum())
+                burst_del += int((diff & (d == 0)).sum())
+            if kind == "erase":  # removed = exactly the walls inside a disc of radius 1-3 round one of the walls
+                removed = diff & (w == 1)
+                erase_ok &= not (diff & (d == 1)).any() and removed.any() == bool(w.any()) and (not w.any() or any(
+                    np.array_equal(removed, (w == 1) & disc(R, r0, c0, rad))
+                    for r0, c0 in np.argwhere(w == 1) for rad in (1, 2, 3)))
+            if kind == "stamp":
+                stamp_ok &= not (diff & (d == 0)).any()  # only adds walls
+        n_boards += 1
+    check(on_ok, f"damage_walls, every kind on {n_boards} boards (R 3-8): uint8 0/1, nothing off board")
+    check(changed["edit"] == n_boards, "edit (edit_walls) always changes the board")
+    check(burst_ok and burst_add > 0 and burst_del > 0,
+          f"burst changes 1-20 cells, additions ({burst_add}) and deletions ({burst_del}) mixed")
+    check(erase_ok and changed["erase"] >= n_boards - 2,
+          "erase only removes walls: exactly every wall within distance 1-3 of a wall cell (the disc's centre)")
+    check(stamp_ok and changed["stamp"] >= 0.9 * n_boards, f"stamp only adds walls (changed {changed['stamp']} of "
+          f"{n_boards} boards)")
+
+    # A stamp on an empty board: a bridge splits it into 2+ rim regions, a loop encloses something.
+    R, nb, nl = 8, 0, 0
+    on = mask(R) == 1
+    empty = np.zeros((side(R), side(R)), dtype=np.uint8)
+    for _ in range(40):
+        b = damage_walls(rng, empty, R, "stamp", p_bridge=1.0)
+        nb += len(_rim_regions(_labels(on & (b == 0), R), R)[0]) >= 2
+        loop = damage_walls(rng, empty, R, "stamp", p_bridge=0.0)
+        nl += bool(targets(loop, R)[0][0].any())
+    check(nb >= 36 and nl >= 24, f"a stamped bridge splits an empty board into 2+ rim regions ({nb}/40), a stamped "
+          f"loop fills something ({nl}/40; a blob run over the rim is open to the edge)")
+
+    # Edits pile up: three in a row change the board further (nothing toggles back).
+    w = random_walls(rng, 6)
+    w1 = damage_walls(rng, w, 6, "stamp")
+    w2 = damage_walls(rng, w1, 6, "stamp")
+    check(not np.array_equal(w1, w2) and ((w1 == 1) <= (w2 == 1)).all(), "damage applies to the board as it is "
+          "(a second stamp keeps the first)")
+
+    # State damage (distill's): zeroes channels 1.. inside the disc, nothing else.
+    ok, n_zeroed = True, 0
+    for _ in range(30):
+        R = int(rng.integers(3, 11))
+        S, on = side(R), mask(R) == 1
+        w = torch.from_numpy(random_walls(rng, R)).float()
+        st = torch.from_numpy((rng.random((16, S, S)) * 2 - 1).astype(np.float32)) * torch.from_numpy(on)
+        st[0] = w
+        before = st.clone()
+        dsc = damage_state(rng, st, R)
+        rad = max(hexd(R, a, b) for a in np.argwhere(dsc & on) for b in np.argwhere(dsc & on)) / 2
+        inside = torch.from_numpy(dsc)
+        ok &= torch.equal(st[0], before[0]) and torch.equal(st[:, ~inside], before[:, ~inside]) \
+            and bool((st[1:, inside] == 0).all()) and bool((dsc & on).any()) and rad <= max(1, R // 2)
+        n_zeroed += int((inside & torch.from_numpy(on)).sum())
+    check(ok, f"damage_state zeroes channels 1.. inside a disc of radius <= R/2 round an on-board cell, and only "
+          f"there; walls (ch0) untouched (30 boards, {n_zeroed} cells zeroed)")
+
+
+def pool_stat_checks() -> None:
+    """train.pool_stats against a direct count, and train.steer."""
+    from .train import BAND, DAMAGE_KINDS, K_POOL, draw, pool_stats, steer
+
+    print("\n-- pool statistics --")
+    rng = np.random.default_rng(778)
+    R = 6
+    on = mask(R) == 1
+    w, f, _, _ = draw(rng, R, 120, 0.25)
+    st = pool_stats(w, f, R)
+    multi = np.mean([len(_rim_regions(_labels(on & (x == 0), R), R)[0]) >= 2 for x in w])
+    fill = np.mean([targets(x, R)[0][0].any() for x in w])
+    dens = np.mean([x[on].mean() for x in w])
+    check(f.shape[1] == K_POOL and abs(st["multiRim"] - multi) < 1e-3 and abs(st["fill"] - fill) < 1e-3
+          and abs(st["density"] - dens) < 1e-3,
+          f"pool_stats = a direct count on 120 boards: fill {st['fill']}, 2+ rim regions {st['multiRim']} "
+          f"(= the primary target fills a rim cell), density {st['density']}")
+    ok_band = all(BAND[k][0] <= st[k] <= BAND[k][1] for k in BAND)
+    calm = steer(st)
+    check(ok_band and calm["why"] == [] and calm["newMult"] == 1 and calm["p"] == [0.2] * 5,
+          "a fresh pool is in BAND, and steer leaves it alone (uniform damage, new boards as usual)")
+    i = {k: n for n, k in enumerate(DAMAGE_KINDS)}
+    lo = steer({"fill": 0.2, "multiRim": 0.1, "density": 0.2})
+    dense = steer({"fill": 0.6, "multiRim": 0.4, "density": 0.6})
+    high = steer({"fill": 0.9, "multiRim": 0.4, "density": 0.2})
+    check(lo["p"][i["stamp"]] > 0.5 and lo["pBridge"] == 0.9 and lo["newMult"] == 2
+          and dense["p"][i["stamp"]] == 0 and dense["p"][i["erase"]] > 0.4 and dense["newMult"] == 2
+          and high["p"][i["stamp"]] < 0.05 and high["p"][i["erase"]] > 0.3,
+          "steer: fill or 2+ rim regions low -> more stamps (bridges), density high -> erase and no stamps, fill "
+          "high -> erase and burst; any of them doubles the new boards")
+
+
+def snapshot_checks() -> None:
+    """A 3-iteration pure training run (a subprocess, in a temp dir) writes runs/<name>/pool.npz to the
+    dashboard contract, and log.jsonl starts with the config and its --iters. The same seed again, split into 2
+    iterations and a --resume to 3 with --device cpu, ends bit-identical (weights, optimiser, rng, pools)."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    import torch
+
+    from .train import DAMAGE_KINDS
+
+    print("\n-- pool.npz snapshot (a 3-iteration run) --")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with tempfile.TemporaryDirectory() as tmp:
+        base = [sys.executable, "-m", "nca.train", "--R", "3", "4", "--batch", "8", "--pool-size", "64",
+                "--snap-every", "1", "--eval-mults", "1", "--hidden", "16", "--threads", "2"]
+
+        def train(*extra):
+            t = time.time()
+            res = subprocess.run(base + list(extra), cwd=tmp, env={**os.environ, "PYTHONPATH": root},
+                                 capture_output=True, text=True)
+            check(res.returncode == 0, f"python -m nca.train {' '.join(extra)} runs ({time.time() - t:.1f} s)"
+                  + ("" if res.returncode == 0 else ": " + res.stderr[-800:]))
+
+        train("--name", "snap", "--iters", "3")
+        with open(os.path.join(tmp, "runs", "snap", "log.jsonl")) as f:
+            lines = [json.loads(x) for x in f]
+        first = lines[0]
+        check(first["config"]["iters"] == 3 and first["config"]["R"] == [3, 4],
+              "log.jsonl's first line is the config, with the --iters target")
+        checks = [x for x in lines if "score" in x]
+        check(all(isinstance(x.get("time"), float) and abs(x["time"] - time.time()) < 3600 and x["device"] == "cpu"
+                  for x in lines) and [x["iteration"] for x in checks] == [0, 3]
+              and all(x["evalN"] == 32 for x in checks + [first]) and first["config"]["evalN"] == 32
+              and lines[-1]["stopped"] == "done" and lines[-1]["iteration"] == 3,
+              "every log line has time (unix s) and device; the checks and the config line evalN; the last line "
+              "is the clean end {stopped: done}")
+
+        train("--name", "split", "--iters", "2", "--device", "cpu")
+        train("--name", "split", "--iters", "3", "--resume", "--device", "cpu")
+        a, b = (torch.load(os.path.join(tmp, "runs", n, "ckpt.pt"), map_location="cpu", weights_only=False)
+                for n in ("snap", "split"))
+
+        def tensors(x):
+            if torch.is_tensor(x):
+                yield x
+            elif isinstance(x, dict):
+                for v in x.values():
+                    yield from tensors(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x:
+                    yield from tensors(v)
+
+        same = all(torch.equal(a["model"][k], b["model"][k]) for k in a["model"]) \
+            and all(torch.equal(x, y) for x, y in zip(tensors(a["opt"]["state"]), tensors(b["opt"]["state"]))) \
+            and a["rng"] == b["rng"] and a["iteration"] == b["iteration"] == 3
+        for R in (3, 4):
+            same &= torch.equal(a["pool"][R]["state"], b["pool"][R]["state"]) \
+                and all(np.array_equal(a["pool"][R][k], b["pool"][R][k], equal_nan=True)
+                        for k in ("walls", "fill", "depth", "loss", "born", "edits", "last"))
+        check(same, "seeded runs reproduce: 3 iterations straight = 2 iterations + --resume to 3 (--device cpu), "
+              "bit-identical weights, optimiser state, rng and pools")
+        check(all(t.device.type == "cpu" for t in tensors(a)) and len(list(tensors(a))) > 4,
+              "checkpoints hold CPU tensors only (they load on any device)")
+        z = np.load(os.path.join(tmp, "runs", "snap", "pool.npz"))
+        B, n, m, C = 8, 48, 6, 16
+        want = {"iteration": (np.int64, ()), "radii": (np.int64, (2,)), "last_R": (np.int64, ()),
+                "last_idx": (np.int64, (B,))}
+        for R in (3, 4):
+            S = side(R)
+            want.update({f"walls_{R}": (np.uint8, (n, S, S)), f"fill_{R}": (np.float16, (n, S, S)),
+                         f"target_{R}": (np.uint8, (n, S, S)), f"ntargets_{R}": (np.uint8, (n,)),
+                         f"loss_{R}": (np.float32, (n,)), f"age_{R}": (np.int32, (n,)),
+                         f"edits_{R}": (np.int32, (n,)), f"damage_{R}": (np.int8, (n,)),
+                         f"state_{R}": (np.float16, (m, C, S, S))})
+        bad = [k for k, (dt, sh) in want.items() if k not in z.files or z[k].dtype != dt or z[k].shape != sh]
+        check(not bad and sorted(z.files) == sorted(want),
+              f"pool.npz loads with np.load and has every key of the contract with its shape and dtype ({len(want)} "
+              f"keys)" + (f"; wrong: {bad}" if bad else ""))
+        ok = int(z["iteration"]) == 3 and list(z["radii"]) == [3, 4] and int(z["last_R"]) in (3, 4)
+        for R in (3, 4):
+            on = mask(R) == 1
+            ok &= not z[f"walls_{R}"][:, ~on].any() and not z[f"fill_{R}"][:, ~on].any() \
+                and not z[f"target_{R}"][:, ~on].any() and not z[f"state_{R}"][:, :, ~on].any()
+            ok &= bool((z[f"ntargets_{R}"] >= 1).all()) and bool((z[f"age_{R}"] >= 0).all()) \
+                and bool((z[f"age_{R}"] <= 3).all()) and bool((z[f"edits_{R}"] >= 0).all())
+            ok &= bool(((z[f"damage_{R}"] >= -1) & (z[f"damage_{R}"] < len(DAMAGE_KINDS))).all())
+            ok &= bool(((z[f"edits_{R}"] == 0) == (z[f"damage_{R}"] == -1)).all())
+            ok &= np.array_equal(z[f"state_{R}"][:, 1], z[f"fill_{R}"][:m])
+        lr = int(z["last_R"])
+        ok &= bool(np.isfinite(z[f"loss_{lr}"][z["last_idx"][z["last_idx"] < n]]).all())
+        check(ok, "...and its values make sense: off-board 0, ages 0..3, edits 0 iff no damage kind, the batch "
+              "that just ran has a loss, state_R[:, 1] = fill_R")
+
+
+def device_checks() -> None:
+    """The trainer's tensor code on torch's "meta" device, standing in for a GPU the Pi doesn't have: like CUDA,
+    meta raises on an elementwise op, cat or where that mixes it with a CPU tensor (and allows CPU indices and
+    0-dim scalars), so a tensor left on the CPU in a training step, the pools, the held-out sets or the edit
+    sequences fails here. Meta has no data, so .item() / .numpy() paths (the quick check's scoring) are not
+    covered; those all go through .cpu() first."""
+    import torch
+
+    from . import train as T
+    from .data import damage_walls
+    from .model import HexNCA, const_stack, fresh_state
+
+    print("\n-- device placement (meta device as a stand-in GPU) --")
+    dev = torch.device("meta")
+    rng = np.random.default_rng(0)
+    for perception, floods, n_consts in (("taps", False, 1), ("taps+pool", True, 7)):
+        model = HexNCA(16, 40, (-2.0, 2.0), 1.0, n_consts, perception, floods)
+        T.model_to(model, dev)
+        cs = {R: const_stack(R, n_consts).to(dev) for R in (3, 4)}
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        R, B = 4, 8
+        mk = cs[R][:, :1]
+        pool = T.new_pool(rng, R, 16, 16, 0.25, False, dev)
+        idx = rng.choice(16, B, replace=False)
+        tidx = torch.from_numpy(idx).to(dev)
+        state = pool["state"][tidx].clone()
+        walls_np, fill_np = pool["walls"][idx], pool["fill"][idx]
+        T.per_sample_loss(state[:, 1:2], T.to_t(fill_np, dev), mk).min(1)
+        state[0] = fresh_state(T.to_t(walls_np[0][None], dev), 16)[0]
+        T.damage_state(rng, state[1], R)
+        walls_np[2] = damage_walls(rng, walls_np[2], R, "stamp", 0.5)
+        walls, target = T.to_t(walls_np, dev), T.to_t(fill_np, dev)
+        state[:, 0:1] = walls
+        acc = 0.0
+        for t in range(6):
+            state = model.step(state, walls, cs[R])
+            if t >= 2:
+                acc = acc + T.per_sample_loss(state[:, 1:2], target, mk) / 4
+        T.teach(state, torch.zeros(B, 5, *state.shape[-2:], device=dev), torch.from_numpy(rng.random(B) < 0.5).to(dev))
+        T.arc_rule(state, walls, mk)
+        opt.zero_grad()
+        acc.min(1).values.mean().backward()  # through the spec v6 gradient hooks too
+        for prm in model.parameters():
+            prm.grad /= prm.grad.norm() + 1e-8
+        opt.step()
+        pool["state"][tidx] = state.detach()
+        held = T.heldout([3, 4], cs, 4, dev)
+        eseq = {r: T.edit_sequence(r, cs[r], 4, device=dev) for r in (3, 4)}
+        w, f, _, c = held["bridge"][3]
+        st = model(fresh_state(w, 16), w, c, 6)
+        ((st[:, 1:2] > 0.5) != f) & (c[:, :1] > 0)
+        stages, fills, cs3, _, _ = eseq[3]
+        st = model(torch.cat([stages[1], st[:, 1:]], 1), stages[1], cs3, 3)
+        ((st[:, 1:2] > 0.5) != fills[0]) & (cs3[:, :1] > 0)
+        on_dev = [*model.parameters(), *model.buffers(), pool["state"], w, f, stages[0], fills[0],
+                  *(t for s in opt.state.values() for t in s.values() if torch.is_tensor(t) and t.dim()),
+                  *getattr(model, "frozen", {}).values(), *getattr(model, "frozen_values", {}).values()]
+        check(all(t.device == dev for t in on_dev) and all(p.grad.device == dev for p in model.parameters()),
+              f"{perception}{' + floods' if floods else ''}: a pool training step (fresh, damage, rollout, loss, "
+              f"backward, Adam), the held-out sets and the edit sequence run on the device with nothing on the CPU")
+    seen = []
+    orig = torch.Tensor.cpu
+    torch.Tensor.cpu = lambda t: seen.append(t.device.type) or torch.zeros(t.shape)  # meta: nothing to copy
+    try:
+        sd = T.to_cpu({"model": model.state_dict(), "opt": opt.state_dict(), "pool": {R: pool}})
+    finally:
+        torch.Tensor.cpu = orig
+    n = len(model.state_dict()) + 1 + sum(torch.is_tensor(v) for s in opt.state_dict()["state"].values()
+                                          for v in s.values())
+    check(len(seen) == n and type(sd["model"]) is type(model.state_dict()) and hasattr(sd["model"], "_metadata"),
+          f"to_cpu (what save_ckpt writes) moves every tensor of the weights, optimiser and pools ({n})")
+
+
+def collapse_checks() -> None:
+    """The collapse guard and the lr schedule (nca.train). collapse_reason and lr_at on their own, then a forced
+    collapse: a tiny pool run in-process with the quick check's scores scripted (quick_eval / edit_eval patched)
+    0.7, 0.8, 0.3 at iterations 0, 50, 100 (--iters 100): a rollback to best.pt of 50, lr scale 0.5, ckpt.pt =
+    best.pt's weights; then --resume to 300 with 0.75, 0.2, 0.1: the scale comes back, a second rollback, then
+    {stopped: collapsed} (--max-rollbacks 2). best.pt stays the one of iteration 50 throughout."""
+    import contextlib
+    import hashlib
+    import io
+    import json
+    import os
+    import sys
+    import tempfile
+
+    import torch
+
+    from . import train
+    from .progress import analyse
+    from .train import collapse_reason, lr_at
+
+    print("\n-- the collapse guard --")
+    hist = [0.03] * 10
+    check(collapse_reason(None, 0.8, 0.6, 0.05, hist) is None and collapse_reason(0.5, 0.8, 0.6, 0.03, hist) is None,
+          "collapse_reason: loss 1.7x the median, or a score 0.62 of the best -> no collapse")
+    check("4x the median" in (collapse_reason(None, 0.8, 0.6, 0.13, hist) or "")
+          and collapse_reason(None, 0.8, 0.6, 0.13, hist[:9]) is None,
+          "...a loss 4.3x the median of the 10 windows before -> collapse (with 9 windows: not yet)")
+    check("not finite" in (collapse_reason(None, 0.8, 0.6, float("nan"), []) or "")
+          and "not finite" in (collapse_reason(None, 0.8, 0.6, None, []) or "")
+          and "not finite" in (collapse_reason(None, 0.8, 0.6, 0.03, [], skipped=6, steps=50) or ""),
+          "...a non-finite window loss, none at all, or over 10% of its steps skipped -> collapse")
+    check("score" in (collapse_reason(0.47, 0.8, 0.6, 0.03, hist) or "")
+          and collapse_reason(0.1, 0.39, 0.6, 0.03, hist) is None,
+          "...a score below 0.6 x best -> collapse, but only once the best is >= 0.4")
+    check(lr_at(0, 1000, 1e-3) == 1e-3 and abs(lr_at(700, 1000, 1e-3) - 3e-4) < 1e-12
+          and abs(lr_at(900, 1000, 1e-3) - 1e-4) < 1e-12,
+          "lr_at: the step decay as before (x1, x0.3 from 60%, x0.1 from 85%)")
+    check(abs(lr_at(0, 1000, 1e-3, warm_from=0, warmup=100) - 1e-5) < 1e-15
+          and abs(lr_at(149, 1000, 1e-3, 0.5, warm_from=100, warmup=100) - 2.5e-4) < 1e-12
+          and lr_at(200, 1000, 1e-3, 0.5, warm_from=100, warmup=100) == 5e-4
+          and lr_at(900, 1000, 1e-3, 1 / 64, floor=1e-5) == 1e-5,
+          "...x the rollback scale, a linear warm-up from a fresh optimiser, never below the floor")
+
+    scores = iter([0.7, 0.8, 0.3, 0.75, 0.2, 0.1])
+    seen = {}
+
+    def fake_quick(model, held, mults, **kw):
+        s = next(scores)
+        seen.setdefault("calls", []).append(s)
+        if s == 0.3:  # the check that collapses: best.pt as it is now
+            with open("runs/col/best.pt", "rb") as f:
+                seen["bestHash"] = hashlib.sha256(f.read()).hexdigest()
+        return {m: {"mix": s, "bridge": s, "page": s, "none": 0.0, "both": 0.0, "gap": 0.0, "bridgeByR": {}}
+                for m in mults}
+
+    def fake_edit(model, eseq, settle_mult):
+        s = seen["calls"][-1]
+        return {"edit": [s, s, s], "editByR": {}}
+
+    base = ["nca.train", "--name", "col", "--R", "3", "--batch", "4", "--pool-size", "16", "--hidden", "16",
+            "--eval-mults", "1", "--eval-every", "50", "--snap-every", "0", "--threads", "1", "--device", "cpu",
+            "--max-rollbacks", "2"]
+    real = train.quick_eval, train.edit_eval, os.getcwd(), sys.argv, torch.get_num_threads()
+    load = lambda p: torch.load(p, map_location="cpu", weights_only=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            train.quick_eval, train.edit_eval = fake_quick, fake_edit
+            os.chdir(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                sys.argv = base + ["--iters", "100"]
+                train.main()
+                a_ckpt, a_best = load("runs/col/ckpt.pt"), load("runs/col/best.pt")
+                sys.argv = base + ["--iters", "300", "--resume"]
+                train.main()
+            with open("runs/col/log.jsonl") as f:
+                lines = [json.loads(x) for x in f]
+            with open("runs/col/best.pt", "rb") as f:
+                end_hash = hashlib.sha256(f.read()).hexdigest()
+            end_best = load("runs/col/best.pt")
+            info = analyse("runs/col")
+        finally:
+            train.quick_eval, train.edit_eval = real[0], real[1]
+            os.chdir(real[2])
+            sys.argv = real[3]
+            torch.set_num_threads(real[4])
+    rb = [x for x in lines if "rollback" in x]
+    check(len(rb) == 2 and [x["iteration"] for x in rb] == [100, 200] and [x["lrScale"] for x in rb] == [0.5, 0.25]
+          and all(x["restored"] == 50 and "score" in x["reason"] for x in rb),
+          f"forced collapse: rollbacks at 100 and 200 (score 0.3, 0.2 < 0.6 x best 0.8), each to best.pt of 50, the "
+          f"lr scale 0.5 then 0.25 ({rb[0]['reason'] if rb else 'none'})")
+    check(a_ckpt["lrScale"] == 0.5 and a_ckpt["rollbacks"] == 1 and a_ckpt["warmFrom"] == 100
+          and all(torch.equal(a_ckpt["model"][k], a_best["model"][k]) for k in a_best["model"]),
+          "...the checkpoint written at the rollback has best.pt's weights, lrScale 0.5, rollbacks 1, warmFrom 100")
+    starts = [x for x in lines if "config" in x]
+    w150 = next(x for x in lines if x.get("iteration") == 150 and "loss" in x)
+    check(len(starts) == 2 and starts[1]["lrScale"] == 0.5 and starts[1]["rollbacks"] == 1
+          and abs(w150["lr"] - 5e-4 * 0.5 * 0.5) < 1e-12,
+          "...--resume keeps the scale: its start line says lrScale 0.5, rollbacks 1, and iteration 149 runs at "
+          f"5e-4 x 0.5 x warm-up 0.5 = {w150['lr']:.3g}")
+    check(lines[-1].get("stopped") == "collapsed" and lines[-1]["iteration"] == 250 and lines[-1]["rollbacks"] == 2
+          and not any(x.get("stopped") == "done" and x["iteration"] > 100 for x in lines),
+          "...a third collapse with --max-rollbacks 2 ends the run cleanly: {stopped: collapsed} at 250")
+    check(end_best["iteration"] == 50 and end_best["best"] == 0.8 and end_hash == seen.get("bestHash"),
+          "...best.pt is the one of iteration 50 (score 0.8 kept in it), byte-identical from before the first "
+          "rollback to the end")
+    check(info["verdict"] == "COLLAPSED" and info["exitCode"] == 5 and info["rollbacks"] == 2
+          and info["lrScale"] == 0.25,
+          f"...nca.progress: COLLAPSED (exit 5), rollbacks 2, lr scale 0.25 ({info['reason']})")
+
+
+def progress_checks() -> None:
+    """nca.progress's verdicts on synthetic logs (one per verdict)."""
+    from .progress import selftest as progress_selftest
+
+    print("\n-- nca.progress --")
+    progress_selftest()
 
 
 def _components(cells: np.ndarray) -> int:

@@ -189,7 +189,7 @@ def install_floods(model: HexNCA):
     model.frozen = frozen
     model.frozen_values = {name: getattr(model, name).detach().clone() for name in frozen}
     for name, m in frozen.items():
-        getattr(model, name).register_hook(lambda g, keep=(~m).to(torch.float32): g * keep)
+        getattr(model, name).register_hook(lambda g, keep=(~m).to(torch.float32): g * keep.to(g.device))
 
 
 def const_stack(R: int, n_consts: int = 3):
@@ -222,8 +222,8 @@ def load_expanded(model: HexNCA, sd) -> int:
 
 
 def fresh_state(walls, channels: int = 16):
-    """Fresh state: all zeros except ch0 = walls. walls [B,1,S,S] float."""
+    """Fresh state: all zeros except ch0 = walls. walls [B,1,S,S] float; the state is on walls' device."""
     B, _, S, _ = walls.shape
-    state = torch.zeros(B, channels, S, S, dtype=walls.dtype)
+    state = torch.zeros(B, channels, S, S, dtype=walls.dtype, device=walls.device)
     state[:, 0:1] = walls
     return state
