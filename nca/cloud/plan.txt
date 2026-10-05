@@ -1,0 +1,10 @@
+# Launch 1 (2026-10-05): two runs side by side on one Spot L4, about 5.6 h in all.
+#   ga: the Pi's pure-a weights (hidden 96, 16 channels), continued.
+#   gb: a larger model (hidden 256, 24 channels) from scratch, same schedule.
+# Curriculum by radius, each stage time-boxed; --iters is a guess at what the box reaches (lr decays at 60%/85%).
+ga | r456   |  70 | --R 4 5 6   --iters 40000 --batch 32 --pool-size 512 --eval-every 1000 --eval-n 128 --ckpt-every 1000 --snap-every 100 --init bucket:init/pure-a.pt
+ga | r6810  | 150 | --R 6 8 10  --iters 50000 --batch 32 --pool-size 512 --eval-every 1000 --eval-n 128 --ckpt-every 1000 --snap-every 100
+ga | r81012 |  90 | --R 8 10 12 --iters 20000 --batch 32 --pool-size 512 --eval-every 500 --eval-n 128 --ckpt-every 500 --snap-every 100
+gb | r456   |  70 | --R 4 5 6   --iters 40000 --batch 32 --pool-size 512 --hidden 256 --channels 24 --eval-every 1000 --eval-n 128 --ckpt-every 1000 --snap-every 100
+gb | r6810  | 150 | --R 6 8 10  --iters 50000 --batch 32 --pool-size 512 --hidden 256 --channels 24 --eval-every 1000 --eval-n 128 --ckpt-every 1000 --snap-every 100
+gb | r81012 |  90 | --R 8 10 12 --iters 20000 --batch 32 --pool-size 512 --hidden 256 --channels 24 --eval-every 500 --eval-n 128 --ckpt-every 500 --snap-every 100

@@ -59,7 +59,7 @@ def to_t(a):
 
 
 def load(path):
-    ck = torch.load(path, weights_only=False)
+    ck = torch.load(path, map_location="cpu", weights_only=False)  # a checkpoint from a GPU loads here too
     cfg = ck["config"]
     model = HexNCA(cfg["channels"], cfg["hidden"], cfg["clamp"], cfg["fireRate"], cfg.get("nConsts", 1),
                    cfg.get("perception", "taps"))  # checkpoints from before v4 have no pool
@@ -93,7 +93,7 @@ def score(pred, fills, mk, sides):
     on = mk > 0
     wrong = ((pred != fills) & on).flatten(2).sum(2)  # [B,K]
     best = wrong.argmin(1)
-    t = fills[torch.arange(len(best)), best].unsqueeze(1)  # [B,1,S,S], the closest target
+    t = fills[torch.arange(len(best), device=best.device), best].unsqueeze(1)  # [B,1,S,S], the closest target
     exact = wrong.min(1).values == 0
     c = np.zeros(8 + 2 * (len(BINS) - 1))
     c[0] = exact.sum().item()
@@ -102,7 +102,7 @@ def score(pred, fills, mk, sides):
     c[3] = (pred & t).sum().item()
     c[4] = (pred | t).sum().item()
     c[5] = (fills.flatten(2).sum(2) == 0).any(1).sum().item()
-    p = pred[:, 0].numpy()
+    p = pred[:, 0].cpu().numpy()
     for b, (lab, ids, ratio) in enumerate(sides):
         if len(ids) < 2:
             continue

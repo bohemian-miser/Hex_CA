@@ -147,7 +147,7 @@ def main():
     p.add_argument("--note", default="")
     args = p.parse_args()
 
-    ck = torch.load(args.ckpt, weights_only=False)
+    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)  # a checkpoint from a GPU loads here too
     cfg = ck["config"]
     model = HexNCA(cfg["channels"], cfg["hidden"], cfg["clamp"], cfg["fireRate"], cfg.get("nConsts", 1),
                    cfg.get("perception", "taps"))  # checkpoints from before v4 have no pool

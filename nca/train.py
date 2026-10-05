@@ -45,12 +45,20 @@ SEQUENCE ("edit": what the page does): a board of the mix settled from the fresh
 steps, then 3 successive wall damages (kinds edit, burst, erase, stamp), each followed by 6R steps WITHOUT a
 reset, exact against the edited board's targets after each ([e1, e2, e3]; editHold at the start: the share
 where the previous answer is still acceptable). best.pt keeps the best score = mean(mix, bridge, page,
-mean(edit)) at eval_mults[0]*R. The log (runs/<name>/log.jsonl, a line per 50 iterations) also has loss,
-s/iter, peak RSS and the damage counts.
+mean(edit)) at eval_mults[0]*R. --eval-n boards per set per radius (default 32, logged as evalN; kept on
+--resume unless given). The log (runs/<name>/log.jsonl, a line per 50 iterations) also has loss, s/iter, peak
+RSS and the damage counts; every line has "time" (unix seconds) and "device"; a clean end adds a line
+{"stopped": "time"} (the --minutes limit) or {"stopped": "done"} (--iters reached). nca.progress reads it.
 
 --minutes stops before an iteration that would end past the limit, counting the slowest iteration so far
 and, if one is due, the last quick check's time (kept in the checkpoint), so a chunk keeps to the limit with
 its checks. Checkpoints (atomic) to runs/<name>/ckpt.pt every 200 iterations and at a stop.
+
+--device auto (cuda if torch sees a GPU, else cpu): the model, consts, pool states and batches live there;
+the board work (walls, targets, damage) stays numpy on the CPU. Checkpoints hold CPU tensors and every load
+maps to the CPU, so a run moves between the Pi and a GPU with --resume or --init (it carries on correctly,
+not bit-identically). On cuda: cudnn.benchmark on, TF32 off (float32 throughout). --threads defaults to
+min(4, cores) (the Pi's runs so far used 2).
 
 The older HYBRID recipes stay available (off by default):
 spec v6 (hand-written frozen floods, learned readout): --floods --n-consts 7 --perception taps+pool --no-pool
@@ -100,10 +108,45 @@ STOP_SKIPS = 20 # non-finite steps in a row that stop the run
 SNAP_N, SNAP_M = 48, 6  # pool.npz shows the first SNAP_N slots of each pool, the full state of the first SNAP_M
 
 
-def to_t(a):
-    """numpy [B,S,S] -> float tensor [B,1,S,S]; [B,K,S,S] -> [B,K,S,S]."""
+def to_t(a, device=None):
+    """numpy [B,S,S] -> float tensor [B,1,S,S]; [B,K,S,S] -> [B,K,S,S]; on `device` if given (on the CPU, .to
+    returns the tensor itself: no copy)."""
     t = torch.from_numpy(np.ascontiguousarray(a)).float()
-    return t.unsqueeze(1) if t.dim() == 3 else t
+    t = t.unsqueeze(1) if t.dim() == 3 else t
+    return t if device is None else t.to(device)
+
+
+def pick_device(name):
+    """torch.device for --device: auto = cuda if torch sees a GPU, else cpu; cuda without one is an error."""
+    if name == "auto":
+        name = "cuda" if torch.cuda.is_available() else "cpu"
+    if name == "cuda" and not torch.cuda.is_available():
+        raise SystemExit("--device cuda: torch sees no CUDA device")
+    return torch.device(name)
+
+
+def to_cpu(x):
+    """x with every tensor in it (nested dicts, lists, tuples) on the CPU: what checkpoints hold, so one saved
+    on a GPU loads on the Pi and vice versa. On the CPU a tensor is returned as it is (no copy)."""
+    if torch.is_tensor(x):
+        return x.cpu()
+    if isinstance(x, dict):
+        y = type(x)((k, to_cpu(v)) for k, v in x.items())
+        if hasattr(x, "_metadata"):  # a state_dict's module versions
+            y._metadata = x._metadata
+        return y
+    if isinstance(x, (list, tuple)):
+        return type(x)(to_cpu(v) for v in x)
+    return x
+
+
+def model_to(model, device):
+    """model on `device`, with spec v6's frozen masks and values (plain attributes, not buffers) too."""
+    model.to(device)
+    if getattr(model, "frozen", None):
+        model.frozen = {k: v.to(device) for k, v in model.frozen.items()}
+        model.frozen_values = {k: v.to(device) for k, v in model.frozen_values.items()}
+    return model
 
 
 def answers(walls, R, aux=False):
@@ -128,7 +171,7 @@ def damage_state(rng, state, R):
     cells = np.argwhere(hex_mask(R) == 1)
     row, col = cells[rng.integers(len(cells))]
     d = disc(R, row, col, int(rng.integers(1, max(1, R // 2) + 1)))
-    state[1:, torch.from_numpy(d)] = 0
+    state[1:, torch.from_numpy(d).to(state.device)] = 0
     return d
 
 
@@ -209,20 +252,21 @@ def arc_rule(state, walls, mk):
     return (mk > 0) & (walls == 0) & (enclosed | (span < c[:, 4:5] - EPS))
 
 
-def heldout(radii, consts):
-    """{set: {R: (walls, fills, sides, consts)}}: fixed boards for the quick check, mix, bridge and page (the
-    demo page's random loops, data.page_loops: never trained on). consts = {R: const stack [1,n,S,S]} (mask
-    first). Their aux floods are recomputed per check (aux_flood)."""
+def heldout(radii, consts, n=EVAL_N, device=None):
+    """{set: {R: (walls, fills, sides, consts)}}: fixed boards for the quick check, n per set per radius, mix,
+    bridge and page (the demo page's random loops, data.page_loops: never trained on). consts = {R: const stack
+    [1,n,S,S]} (mask first). Their aux floods are recomputed per check (aux_flood). A larger n keeps the first
+    EVAL_N boards of each set (the draws come in order) and adds more."""
     out = {"mix": {}, "bridge": {}, "page": {}}
     for R in radii:
         for name, gen, seed in (("mix", random_walls, EVAL_SEED), ("bridge", _bridge_board, EVAL_SEED + 50),
                                 ("page", page_loops, EVAL_SEED + 100)):
-            w, f, sides = boards(np.random.default_rng(seed + R), R, EVAL_N, gen)
-            out[name][R] = (to_t(w), torch.from_numpy(f) > 0, sides, consts[R])
+            w, f, sides = boards(np.random.default_rng(seed + R), R, n, gen)
+            out[name][R] = (to_t(w, device), (torch.from_numpy(f) > 0).to(device or "cpu"), sides, consts[R])
     return out
 
 
-def edit_sequence(R, cs, n=EVAL_N, seed=EVAL_SEED + 150):
+def edit_sequence(R, cs, n=EVAL_N, seed=EVAL_SEED + 150, device=None):
     """The quick check's fixed edit-sequence boards at radius R: n boards of the training mix, each damaged
     N_EDITS times in succession (kinds edit, burst, erase, stamp, uniformly; data.damage_walls).
     (stages: N_EDITS + 1 walls [n,1,S,S] (the board, then after each edit), fills: N_EDITS bool [n,K,S,S]
@@ -231,15 +275,15 @@ def edit_sequence(R, cs, n=EVAL_N, seed=EVAL_SEED + 150):
     edit would score)."""
     rng = np.random.default_rng(seed + R)
     w = np.stack([random_walls(rng, R) for _ in range(n)])
-    stages, fills, changed, hold = [to_t(w)], [], [], []
+    stages, fills, changed, hold = [to_t(w, device)], [], [], []
     prev = np.stack([targets(x, R)[0][0] for x in w])
     for _ in range(N_EDITS):
         w = np.stack([damage_walls(rng, x, R, WALL_DAMAGE[int(rng.integers(len(WALL_DAMAGE)))]) for x in w])
         f = pad_targets([targets(x, R)[0] for x in w])
         changed.append(float(np.mean([(f[i, 0] != prev[i]).any() for i in range(n)])))
         hold.append(float(np.mean([(f[i] == prev[i]).all((1, 2)).any() for i in range(n)])))
-        stages.append(to_t(w))
-        fills.append(torch.from_numpy(f) > 0)
+        stages.append(to_t(w, device))
+        fills.append((torch.from_numpy(f) > 0).to(device or "cpu"))
         prev = f[:, 0]
     return stages, fills, cs, changed, hold
 
@@ -274,10 +318,10 @@ def trivial_aux(held, mults):
            for m in mults}
     for per_r in held.values():
         for R, (walls, _, _, cs) in per_r.items():
-            w = walls[:, 0].numpy().astype(np.uint8)
-            F = torch.from_numpy(aux_flood(w, R, max(mults) * R))
-            blind = torch.from_numpy(aux_flood(np.zeros_like(w), R, max(mults) * R))
-            pad = torch.zeros(len(w), 2, *w.shape[-2:])
+            w = walls[:, 0].cpu().numpy().astype(np.uint8)
+            F = torch.from_numpy(aux_flood(w, R, max(mults) * R)).to(cs.device)
+            blind = torch.from_numpy(aux_flood(np.zeros_like(w), R, max(mults) * R)).to(cs.device)
+            pad = torch.zeros(len(w), 2, *w.shape[-2:], device=cs.device)
             for key, guess in (("aux", lambda t: torch.zeros_like(F[t])), ("blind", lambda t: blind[t]),
                                ("hold", lambda t: F[t - 1] if t else torch.zeros_like(F[t]))):
                 per_step = [float(aux_loss(torch.cat([pad, guess(t)], 1), F[t], cs[:, :1]).mean())
@@ -309,18 +353,19 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
         for R, (walls, fills, sides, cs) in per_r.items():
             mk = cs[:, :1]
             if aux or teach_check:
-                F = torch.from_numpy(aux_flood(walls[:, 0].numpy().astype(np.uint8), R, max(mults) * R))
+                F = torch.from_numpy(aux_flood(walls[:, 0].cpu().numpy().astype(np.uint8), R,
+                                               max(mults) * R)).to(walls.device)
             if teach_check:
                 state, done, per_ch = fresh_state(walls, model.channels), 0, []
                 for m in sorted(mults):
                     for t in range(done, m * R):
                         state = model.step(state, walls, cs)
                         per_ch.append(aux_loss_ch(state, F[t], mk))
-                        state = teach(state, F[t], torch.ones(len(state), dtype=torch.bool))
+                        state = teach(state, F[t], torch.ones(len(state), dtype=torch.bool, device=state.device))
                     done = m * R
                     ch = torch.stack(per_ch).mean(0)
                     res[m].setdefault("auxTeach", []).append(float(ch.mean()))
-                    res[m].setdefault("auxTeachCh", []).append(ch.numpy())
+                    res[m].setdefault("auxTeachCh", []).append(ch.cpu().numpy())
                     s = summarise(score(state[:, 1:2] > 0.5, fills, mk, sides), len(sides))
                     res[m].setdefault(name + "Teach", []).append(s["exact"])
             state, done, per_step = fresh_state(walls, model.channels), 0, []
@@ -341,7 +386,7 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
                 if name == "bridge":
                     res[m]["none"].append(s["none"])
                     res[m]["both"].append(s["both"])
-                    p, prim = state[:, 1].numpy(), fills[:, 0].numpy()
+                    p, prim = state[:, 1].cpu().numpy(), fills[:, 0].cpu().numpy()
                     res[m]["gap"].append(np.mean([p[b][np.isin(lab, ids) & prim[b]].mean()
                                                   - p[b][np.isin(lab, ids) & ~prim[b]].mean()
                                                   for b, (lab, ids, _) in enumerate(sides)]))
@@ -362,18 +407,20 @@ def lr_at(it: int, iters: int, lr: float) -> float:
 
 def save_ckpt(path, model, opt, it, cfg, rng, pools=None, best=-1.0, eval_sec=0.0, steering=None):
     """Atomically (a temp file, then a rename): weights, optimiser, iteration, config, rng, pools, best score,
-    the last quick check's seconds and the pools' steering."""
+    the last quick check's seconds and the pools' steering. Every tensor goes in on the CPU (to_cpu), so the
+    file loads on any device."""
     tmp = path + ".tmp"
-    torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "iteration": it,
-                "config": cfg, "rng": rng.bit_generator.state, "pool": pools, "best": best,
+    torch.save({"model": to_cpu(model.state_dict()), "opt": to_cpu(opt.state_dict()), "iteration": it,
+                "config": cfg, "rng": rng.bit_generator.state, "pool": to_cpu(pools), "best": best,
                 "evalSec": eval_sec, "steer": steering}, tmp)
     os.replace(tmp, path)
 
 
-def new_pool(rng, R, n, channels, bridge_frac, aux=False):
-    """A pool of n fresh boards at radius R: walls, targets, depth, aux targets (only with aux), state."""
+def new_pool(rng, R, n, channels, bridge_frac, aux=False, device=None):
+    """A pool of n fresh boards at radius R: walls, targets, depth, aux targets (only with aux), state (a
+    tensor on `device`; the rest numpy)."""
     w, f, d, a = draw(rng, R, n, bridge_frac, aux)
-    pool = {"walls": w, "fill": f, "depth": d, "state": fresh_state(to_t(w), channels)}
+    pool = {"walls": w, "fill": f, "depth": d, "state": fresh_state(to_t(w, device), channels)}
     if aux:
         pool["aux"] = a
     return bookkeeping(pool)
@@ -405,7 +452,7 @@ def write_snapshot(path, it, pools, last_R, last_idx):
     for R, P in pools.items():
         n = min(len(P["walls"]), SNAP_N)
         on = hex_mask(R) == 1
-        fill = P["state"][:n, 1].numpy()
+        fill = P["state"][:n, 1].cpu().numpy()
         fills = P["fill"][:n]  # [n,K,S,S]
         wrong = (((fill > 0.5) & on)[:, None] != (fills > 0)).sum((2, 3))  # [n,K]; off board both are 0
         out[f"walls_{R}"] = P["walls"][:n].astype(np.uint8)
@@ -416,7 +463,7 @@ def write_snapshot(path, it, pools, last_R, last_idx):
         out[f"age_{R}"] = (it - P["born"][:n]).astype(np.int32)
         out[f"edits_{R}"] = P["edits"][:n].astype(np.int32)
         out[f"damage_{R}"] = P["last"][:n].astype(np.int8)
-        out[f"state_{R}"] = P["state"][:min(n, SNAP_M)].numpy().astype(np.float16)
+        out[f"state_{R}"] = P["state"][:min(n, SNAP_M)].cpu().numpy().astype(np.float16)
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:  # a file object: savez would add ".npz" to a name
         np.savez_compressed(f, **out)
@@ -499,7 +546,17 @@ def main():
     p.add_argument("--eval-mults", type=int, nargs="+", default=[8, 16], help="quick check read out at mult*R steps")
     p.add_argument("--eval-every", type=int, default=200, help="quick check every this many iterations (a multiple of 50)")
     p.add_argument("--minutes", type=float, default=0, help="stop (with a checkpoint) after this long; 0 = no limit")
-    p.add_argument("--threads", type=int, default=2, help="torch threads (at most 3 on the Pi)")
+    p.add_argument("--threads", type=int, default=None,
+                   help="torch threads (default min(4, cores); the Pi's runs used 2)")
+    p.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"),
+                   help="auto = cuda if torch sees a GPU, else cpu. Checkpoints hold CPU tensors either way, so "
+                        "a run moves between the Pi and a GPU with --resume / --init (not bit-identically)")
+    p.add_argument("--eval-n", type=int, default=None,
+                   help=f"held-out boards per set per radius in the quick check (default {EVAL_N}, or what the "
+                        "resumed run used); a GPU run can afford more, which makes the check less noisy")
+    p.add_argument("--ckpt-every", type=int, default=200,
+                   help="write ckpt.pt every this many iterations (and at the end, and on a --minutes stop); "
+                        "a fast GPU run wants a larger number, since a checkpoint carries the pools")
     p.add_argument("--snap-every", type=int, default=25,
                    help="pool runs: write runs/<name>/pool.npz (write_snapshot, for nca/dashboard.py) every this "
                         "many iterations and at every checkpoint; 0 = never")
@@ -516,7 +573,12 @@ def main():
     if args.teach and any(args.teach) and not args.resume and not (args.aux and args.aux_dense and not args.pool):
         p.error("--teach feeds in the reference flood F_t: it needs --aux --aux-dense and --no-pool")
 
-    torch.set_num_threads(min(3, args.threads))
+    torch.set_num_threads(args.threads or min(4, os.cpu_count() or 1))
+    device = pick_device(args.device)
+    if device.type == "cuda":  # fixed shapes per radius: let cudnn pick its kernels; true float32, no TF32
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.matmul.allow_tf32 = False
     run_dir = os.path.join("runs", args.name)
     os.makedirs(run_dir, exist_ok=True)
     ckpt_path = os.path.join(run_dir, "ckpt.pt")
@@ -524,7 +586,7 @@ def main():
     start_it = 0
     ckpt = init = None
     if args.resume:
-        ckpt = torch.load(ckpt_path, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         cfg = ckpt["config"]
         start_it = ckpt["iteration"]
         p_now = teach_p(start_it, cfg)  # where the anneal stopped, on the schedule it was saved with
@@ -538,7 +600,7 @@ def main():
                     "start a new run, or --init from it")
     else:
         if args.init:
-            init = torch.load(args.init, weights_only=False)
+            init = torch.load(args.init, map_location="cpu", weights_only=False)
             ic = init["config"]
             if (ic["channels"], ic["hidden"]) != (args.channels, args.hidden):
                 p.error(f"--init {args.init} has channels={ic['channels']} hidden={ic['hidden']}, but this run asks "
@@ -578,16 +640,15 @@ def main():
     n_consts = cfg.get("nConsts", 1)  # checkpoints from before v3 have only the mask
     perception = cfg.setdefault("perception", "taps")  # and from before v4 no pool
     floods = cfg.get("floods", False)  # spec v6
-    torch.manual_seed(cfg["seed"])  # the init of a fresh model (a loaded one overwrites it)
+    eval_n = cfg["evalN"] = args.eval_n or cfg.get("evalN", EVAL_N)  # runs from before --eval-n used EVAL_N
+    torch.manual_seed(cfg["seed"])  # the init of a fresh model, on the CPU whatever the device (a loaded one overwrites it)
     model = HexNCA(cfg["channels"], cfg["hidden"], cfg["clamp"], cfg["fireRate"], n_consts, perception, floods)
-    opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     rng = np.random.default_rng(cfg["seed"])
     radii, B, last_k, bf = cfg["R"], cfg["batch"], cfg["lastK"], cfg.get("bridgeFrac", 0.0)
     use_aux, aux_w, dense = cfg.get("aux", False), cfg.get("auxW", 1.0), cfg.get("auxDense", False)
     consts = {R: const_stack(R, n_consts) for R in radii}  # [1,n,S,S] each, built once per radius
     if ckpt:
         model.load_state_dict(ckpt["model"])
-        opt.load_state_dict(ckpt["opt"])
         rng.bit_generator.state = ckpt["rng"]
         assert not floods or all(torch.equal(getattr(model, k)[f], model.frozen_values[k][f])
                                  for k, f in model.frozen.items()), "the checkpoint's hand-written floods changed"
@@ -595,9 +656,16 @@ def main():
         load_expanded(model, init["model"])
         if init_consts < n_consts or "w1pool" not in init["model"] and perception == "taps+pool":
             print(json.dumps({"initExpansion": expansion_check(model, init, consts[radii[-1]])}), flush=True)
+    # Everything the model touches lives on the device from here; the board work stays numpy on the CPU. The
+    # optimiser comes after the move (Adam has no randomness), and loading its state moves that state too.
+    model_to(model, device)
+    consts = {R: c.to(device) for R, c in consts.items()}
+    opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+    if ckpt:
+        opt.load_state_dict(ckpt["opt"])
 
-    held = heldout(radii, consts)
-    eseq = {R: edit_sequence(R, consts[R]) for R in radii}
+    held = heldout(radii, consts, eval_n, device)
+    eseq = {R: edit_sequence(R, consts[R], eval_n, device=device) for R in radii}
     m0 = args.eval_mults[0]
 
     def check():
@@ -608,11 +676,15 @@ def main():
         rec.update(edit_eval(model, eseq, m0))
         q = rec[f"q{m0}"]
         rec["score"] = round((q["mix"] + q["bridge"] + q["page"] + float(np.mean(rec["edit"]))) / 4, 4)
+        rec["evalN"] = eval_n  # boards per set per radius behind these shares (nca.progress's noise)
         return rec
 
     start = {"config": cfg, "startIteration": start_it,
              "editChanged": [round(float(np.mean([e[3][k] for e in eseq.values()])), 3) for k in range(N_EDITS)],
-             "editHold": [round(float(np.mean([e[4][k] for e in eseq.values()])), 3) for k in range(N_EDITS)]}
+             "editHold": [round(float(np.mean([e[4][k] for e in eseq.values()])), 3) for k in range(N_EDITS)],
+             "evalN": eval_n, "threads": torch.get_num_threads(), "torch": torch.__version__}
+    if device.type == "cuda":
+        start["gpu"] = torch.cuda.get_device_name(device)
     if use_aux:
         start["trivialAux"] = {f"q{m}": q for m, q in trivial_aux(held, args.eval_mults).items()}
     if floods and not ckpt:  # the comparative rule read off the exact frozen floods: the readout's ceiling
@@ -621,6 +693,8 @@ def main():
     log = open(os.path.join(run_dir, "log.jsonl"), "a")
 
     def emit(rec):
+        """A log line (and the same on stdout); every one says when (unix seconds) and on what device."""
+        rec["time"], rec["device"] = round(time.time(), 2), device.type
         print(json.dumps(rec), flush=True)
         log.write(json.dumps(rec) + "\n")
         log.flush()
@@ -630,8 +704,9 @@ def main():
     pools, steering = None, {}
     if cfg["pool"]:
         pools = ckpt["pool"] if ckpt and ckpt.get("pool") else \
-            {R: new_pool(rng, R, cfg["poolSize"], cfg["channels"], bf, use_aux) for R in radii}
+            {R: new_pool(rng, R, cfg["poolSize"], cfg["channels"], bf, use_aux, device) for R in radii}
         for R, P in pools.items():  # aux targets for a pool that lacks them (or has v3's 4 planes)
+            P["state"] = P["state"].to(device)
             if use_aux and ("aux" not in P or P["aux"].shape[1] != N_AUX):
                 P["aux"] = np.stack([aux_targets(w, R) for w in P["walls"]])
             bookkeeping(P, start_it)
@@ -681,8 +756,9 @@ def main():
             if it > start_it:
                 save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering)
                 snapshot(it)
-            print(json.dumps({"stopped": "time", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2),
-                              "slowestIterSec": round(slowest, 2), "evalSec": round(eval_sec, 1)}), flush=True)
+            # a clean end of this chunk (or time-boxed stage), in the log too: nca.progress reads it as FINISHED
+            emit({"stopped": "time", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2),
+                  "slowestIterSec": round(slowest, 2), "evalSec": round(eval_sec, 1)})
             break
         t_it = time.time()
         R = int(rng.choice(radii))
@@ -691,17 +767,17 @@ def main():
         if cfg["pool"]:
             P, st = pools[R], steering[R]
             idx = rng.choice(len(P["walls"]), B, replace=False)
-            tidx = torch.from_numpy(idx)
+            tidx = torch.from_numpy(idx).to(device)
             walls_np, fill_np, depth_np = P["walls"][idx], P["fill"][idx], P["depth"][idx]  # copies
             aux_np = P["aux"][idx] if use_aux else None
             state = P["state"][tidx].clone()
             with torch.no_grad():
-                cur = per_sample_loss(state[:, 1:2], to_t(fill_np), mk).min(1).values.numpy()
+                cur = per_sample_loss(state[:, 1:2], to_t(fill_np, device), mk).min(1).values.cpu().numpy()
             order = np.argsort(-cur)  # worst first
             # The worst sample starts over from the fresh state on its board (a new board instead, as in
             # distill, drifts the pool towards the easy boards).
             j = order[0]
-            state[j] = fresh_state(to_t(walls_np[j][None]), cfg["channels"])[0]
+            state[j] = fresh_state(to_t(walls_np[j][None], device), cfg["channels"])[0]
             fresh = [j]
             # batch/8 random others get brand-new boards (twice as many while the pool is steered).
             rest = rng.permutation(order[1:])
@@ -711,7 +787,7 @@ def main():
                 walls_np[j], fill_np[j], depth_np[j] = w[k], f[k], d[k]
                 if use_aux:
                     aux_np[j] = a[k]
-                state[j] = fresh_state(to_t(w[k][None]), cfg["channels"])[0]
+                state[j] = fresh_state(to_t(w[k][None], device), cfg["channels"])[0]
                 fresh.append(j)
             P["born"][idx[fresh]], P["edits"][idx[fresh]], P["last"][idx[fresh]] = it, 0, -1
             # Each of the rest, with probability --damage, gets one damage and carries on from its state.
@@ -730,18 +806,18 @@ def main():
                 fill_np[j], depth_np[j], aux_j = answers(walls_np[j], R, use_aux)
                 if use_aux:
                     aux_np[j] = aux_j
-            walls, target = to_t(walls_np), to_t(fill_np)
+            walls, target = to_t(walls_np, device), to_t(fill_np, device)
             state[:, 0:1] = walls
         else:
             walls_np, fill_np, depth_np, aux_np = draw(rng, R, B, bf, use_aux)
-            walls, target = to_t(walls_np), to_t(fill_np)
+            walls, target = to_t(walls_np, device), to_t(fill_np, device)
             state = fresh_state(walls, cfg["channels"])
 
         T = n_steps(R, depth_np.max())
         if use_aux and dense:  # [T,B,5,S,S]: the reference flood at every step from the fresh state
-            aux_t = torch.from_numpy(aux_flood(walls_np, R, T))
+            aux_t = torch.from_numpy(aux_flood(walls_np, R, T)).to(device)
         elif use_aux:
-            aux_t = torch.from_numpy(np.ascontiguousarray(aux_np))
+            aux_t = torch.from_numpy(np.ascontiguousarray(aux_np)).to(device)
         acc = acc_aux = 0.0
         p_teach = teach_p(it, cfg) if use_aux and dense and not cfg["pool"] else 0.0
         n_taught = 0
@@ -754,7 +830,7 @@ def main():
                 if use_aux and not dense:
                     acc_aux = acc_aux + aux_loss(state, aux_t, mk) / last_k
             if p_teach > 0 and t < T - 1:  # teacher forcing: the losses above saw the model's own output
-                coin = torch.from_numpy(rng.random(B) < p_teach)
+                coin = torch.from_numpy(rng.random(B) < p_teach).to(device)
                 if coin.any():
                     state = teach(state, aux_t[t], coin)
                     n_taught += int(coin.sum())
@@ -789,7 +865,7 @@ def main():
         if cfg["pool"]:
             P["state"][tidx] = state.detach()
             P["walls"][idx], P["fill"][idx], P["depth"][idx] = walls_np, fill_np, depth_np
-            P["loss"][idx] = acc.detach().min(1).values.numpy()
+            P["loss"][idx] = acc.detach().min(1).values.cpu().numpy()
             if use_aux:
                 P["aux"][idx] = aux_np
             last[0] = (R, idx)
@@ -825,11 +901,13 @@ def main():
             emit(rec)
             t_win, losses, parts, taught = time.time(), [], [], []
             kinds = dict.fromkeys(DAMAGE_KINDS, 0)
-        if it % 200 == 0 or it == cfg["iters"]:
+        if it % max(1, args.ckpt_every) == 0 or it == cfg["iters"]:
             save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering)
             snapshot(it)
         elif args.snap_every and it % args.snap_every == 0:
             snapshot(it)
+    if it >= cfg["iters"]:  # the run reached its target: a clean end, in the log (nca.progress: FINISHED)
+        emit({"stopped": "done", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2)})
     log.close()
 
 

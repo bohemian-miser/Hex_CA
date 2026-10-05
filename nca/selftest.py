@@ -327,7 +327,9 @@ def main() -> None:
     flood_checks(rng)
     damage_checks()
     pool_stat_checks()
+    device_checks()
     snapshot_checks()
+    progress_checks()
     print("\nALL OK")
 
 
@@ -447,28 +449,71 @@ def pool_stat_checks() -> None:
 
 def snapshot_checks() -> None:
     """A 3-iteration pure training run (a subprocess, in a temp dir) writes runs/<name>/pool.npz to the
-    dashboard contract, and log.jsonl starts with the config and its --iters."""
+    dashboard contract, and log.jsonl starts with the config and its --iters. The same seed again, split into 2
+    iterations and a --resume to 3 with --device cpu, ends bit-identical (weights, optimiser, rng, pools)."""
     import json
     import os
     import subprocess
     import sys
     import tempfile
 
+    import torch
+
     from .train import DAMAGE_KINDS
 
     print("\n-- pool.npz snapshot (a 3-iteration run) --")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with tempfile.TemporaryDirectory() as tmp:
-        cmd = [sys.executable, "-m", "nca.train", "--name", "snap", "--R", "3", "4", "--iters", "3", "--batch", "8",
-               "--pool-size", "64", "--snap-every", "1", "--eval-mults", "1", "--hidden", "16"]
-        t = time.time()
-        res = subprocess.run(cmd, cwd=tmp, env={**os.environ, "PYTHONPATH": root}, capture_output=True, text=True)
-        check(res.returncode == 0, f"python -m nca.train ... --iters 3 runs ({time.time() - t:.1f} s)"
-              + ("" if res.returncode == 0 else ": " + res.stderr[-800:]))
+        base = [sys.executable, "-m", "nca.train", "--R", "3", "4", "--batch", "8", "--pool-size", "64",
+                "--snap-every", "1", "--eval-mults", "1", "--hidden", "16", "--threads", "2"]
+
+        def train(*extra):
+            t = time.time()
+            res = subprocess.run(base + list(extra), cwd=tmp, env={**os.environ, "PYTHONPATH": root},
+                                 capture_output=True, text=True)
+            check(res.returncode == 0, f"python -m nca.train {' '.join(extra)} runs ({time.time() - t:.1f} s)"
+                  + ("" if res.returncode == 0 else ": " + res.stderr[-800:]))
+
+        train("--name", "snap", "--iters", "3")
         with open(os.path.join(tmp, "runs", "snap", "log.jsonl")) as f:
-            first = json.loads(f.readline())
+            lines = [json.loads(x) for x in f]
+        first = lines[0]
         check(first["config"]["iters"] == 3 and first["config"]["R"] == [3, 4],
               "log.jsonl's first line is the config, with the --iters target")
+        checks = [x for x in lines if "score" in x]
+        check(all(isinstance(x.get("time"), float) and abs(x["time"] - time.time()) < 3600 and x["device"] == "cpu"
+                  for x in lines) and [x["iteration"] for x in checks] == [0, 3]
+              and all(x["evalN"] == 32 for x in checks + [first]) and first["config"]["evalN"] == 32
+              and lines[-1]["stopped"] == "done" and lines[-1]["iteration"] == 3,
+              "every log line has time (unix s) and device; the checks and the config line evalN; the last line "
+              "is the clean end {stopped: done}")
+
+        train("--name", "split", "--iters", "2", "--device", "cpu")
+        train("--name", "split", "--iters", "3", "--resume", "--device", "cpu")
+        a, b = (torch.load(os.path.join(tmp, "runs", n, "ckpt.pt"), map_location="cpu", weights_only=False)
+                for n in ("snap", "split"))
+
+        def tensors(x):
+            if torch.is_tensor(x):
+                yield x
+            elif isinstance(x, dict):
+                for v in x.values():
+                    yield from tensors(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x:
+                    yield from tensors(v)
+
+        same = all(torch.equal(a["model"][k], b["model"][k]) for k in a["model"]) \
+            and all(torch.equal(x, y) for x, y in zip(tensors(a["opt"]["state"]), tensors(b["opt"]["state"]))) \
+            and a["rng"] == b["rng"] and a["iteration"] == b["iteration"] == 3
+        for R in (3, 4):
+            same &= torch.equal(a["pool"][R]["state"], b["pool"][R]["state"]) \
+                and all(np.array_equal(a["pool"][R][k], b["pool"][R][k], equal_nan=True)
+                        for k in ("walls", "fill", "depth", "loss", "born", "edits", "last"))
+        check(same, "seeded runs reproduce: 3 iterations straight = 2 iterations + --resume to 3 (--device cpu), "
+              "bit-identical weights, optimiser state, rng and pools")
+        check(all(t.device.type == "cpu" for t in tensors(a)) and len(list(tensors(a))) > 4,
+              "checkpoints hold CPU tensors only (they load on any device)")
         z = np.load(os.path.join(tmp, "runs", "snap", "pool.npz"))
         B, n, m, C = 8, 48, 6, 16
         want = {"iteration": (np.int64, ()), "radii": (np.int64, (2,)), "last_R": (np.int64, ()),
@@ -498,6 +543,87 @@ def snapshot_checks() -> None:
         ok &= bool(np.isfinite(z[f"loss_{lr}"][z["last_idx"][z["last_idx"] < n]]).all())
         check(ok, "...and its values make sense: off-board 0, ages 0..3, edits 0 iff no damage kind, the batch "
               "that just ran has a loss, state_R[:, 1] = fill_R")
+
+
+def device_checks() -> None:
+    """The trainer's tensor code on torch's "meta" device, standing in for a GPU the Pi doesn't have: like CUDA,
+    meta raises on an elementwise op, cat or where that mixes it with a CPU tensor (and allows CPU indices and
+    0-dim scalars), so a tensor left on the CPU in a training step, the pools, the held-out sets or the edit
+    sequences fails here. Meta has no data, so .item() / .numpy() paths (the quick check's scoring) are not
+    covered; those all go through .cpu() first."""
+    import torch
+
+    from . import train as T
+    from .data import damage_walls
+    from .model import HexNCA, const_stack, fresh_state
+
+    print("\n-- device placement (meta device as a stand-in GPU) --")
+    dev = torch.device("meta")
+    rng = np.random.default_rng(0)
+    for perception, floods, n_consts in (("taps", False, 1), ("taps+pool", True, 7)):
+        model = HexNCA(16, 40, (-2.0, 2.0), 1.0, n_consts, perception, floods)
+        T.model_to(model, dev)
+        cs = {R: const_stack(R, n_consts).to(dev) for R in (3, 4)}
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        R, B = 4, 8
+        mk = cs[R][:, :1]
+        pool = T.new_pool(rng, R, 16, 16, 0.25, False, dev)
+        idx = rng.choice(16, B, replace=False)
+        tidx = torch.from_numpy(idx).to(dev)
+        state = pool["state"][tidx].clone()
+        walls_np, fill_np = pool["walls"][idx], pool["fill"][idx]
+        T.per_sample_loss(state[:, 1:2], T.to_t(fill_np, dev), mk).min(1)
+        state[0] = fresh_state(T.to_t(walls_np[0][None], dev), 16)[0]
+        T.damage_state(rng, state[1], R)
+        walls_np[2] = damage_walls(rng, walls_np[2], R, "stamp", 0.5)
+        walls, target = T.to_t(walls_np, dev), T.to_t(fill_np, dev)
+        state[:, 0:1] = walls
+        acc = 0.0
+        for t in range(6):
+            state = model.step(state, walls, cs[R])
+            if t >= 2:
+                acc = acc + T.per_sample_loss(state[:, 1:2], target, mk) / 4
+        T.teach(state, torch.zeros(B, 5, *state.shape[-2:], device=dev), torch.from_numpy(rng.random(B) < 0.5).to(dev))
+        T.arc_rule(state, walls, mk)
+        opt.zero_grad()
+        acc.min(1).values.mean().backward()  # through the spec v6 gradient hooks too
+        for prm in model.parameters():
+            prm.grad /= prm.grad.norm() + 1e-8
+        opt.step()
+        pool["state"][tidx] = state.detach()
+        held = T.heldout([3, 4], cs, 4, dev)
+        eseq = {r: T.edit_sequence(r, cs[r], 4, device=dev) for r in (3, 4)}
+        w, f, _, c = held["bridge"][3]
+        st = model(fresh_state(w, 16), w, c, 6)
+        ((st[:, 1:2] > 0.5) != f) & (c[:, :1] > 0)
+        stages, fills, cs3, _, _ = eseq[3]
+        st = model(torch.cat([stages[1], st[:, 1:]], 1), stages[1], cs3, 3)
+        ((st[:, 1:2] > 0.5) != fills[0]) & (cs3[:, :1] > 0)
+        on_dev = [*model.parameters(), *model.buffers(), pool["state"], w, f, stages[0], fills[0],
+                  *(t for s in opt.state.values() for t in s.values() if torch.is_tensor(t) and t.dim()),
+                  *getattr(model, "frozen", {}).values(), *getattr(model, "frozen_values", {}).values()]
+        check(all(t.device == dev for t in on_dev) and all(p.grad.device == dev for p in model.parameters()),
+              f"{perception}{' + floods' if floods else ''}: a pool training step (fresh, damage, rollout, loss, "
+              f"backward, Adam), the held-out sets and the edit sequence run on the device with nothing on the CPU")
+    seen = []
+    orig = torch.Tensor.cpu
+    torch.Tensor.cpu = lambda t: seen.append(t.device.type) or torch.zeros(t.shape)  # meta: nothing to copy
+    try:
+        sd = T.to_cpu({"model": model.state_dict(), "opt": opt.state_dict(), "pool": {R: pool}})
+    finally:
+        torch.Tensor.cpu = orig
+    n = len(model.state_dict()) + 1 + sum(torch.is_tensor(v) for s in opt.state_dict()["state"].values()
+                                          for v in s.values())
+    check(len(seen) == n and type(sd["model"]) is type(model.state_dict()) and hasattr(sd["model"], "_metadata"),
+          f"to_cpu (what save_ckpt writes) moves every tensor of the weights, optimiser and pools ({n})")
+
+
+def progress_checks() -> None:
+    """nca.progress's verdicts on synthetic logs (one per verdict)."""
+    from .progress import selftest as progress_selftest
+
+    print("\n-- nca.progress --")
+    progress_selftest()
 
 
 def _components(cells: np.ndarray) -> int:

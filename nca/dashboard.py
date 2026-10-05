@@ -2,8 +2,9 @@
 
 Reads, never writes, two files `nca/train.py` produces under `runs/<name>/`:
   log.jsonl  one JSON object per line: an optional first-line config (no "iteration" key),
-             then one record per logged iteration (iteration, loss, secPerIter, lr, and on
-             quick-check iterations nested dicts of numeric metrics -- whatever is there).
+             then one record per logged iteration (iteration, loss, secPerIter, lr, time, device,
+             and on quick-check iterations nested dicts of numeric metrics -- whatever is there);
+             a clean end is a last line {"iteration", "stopped": "time"|"done", ...}.
   pool.npz   a snapshot of the live sample pool, written atomically every --snap-every
              iterations; see the contract at the top of this module's docstring in the repo
              notes. May not exist yet (training not started, or no --pool), may vanish, may
@@ -23,9 +24,18 @@ Endpoints:
     GET /api/pool?run=N   the pool snapshot as JSON (see pool_to_json below), or an empty one
                           (200, radii: []) if there isn't one yet / it's unreadable right now
 
+Static copy (no server): python -m nca.dashboard --static OUT_DIR [--runs runs] [--only NAME ...]
+[--source pi|vm] writes OUT_DIR/index.html (the same page, with a flag baked in), runs-<source>.json
+(what /api/runs returns, each entry also carrying source and exported = unix seconds) and per run
+<name>/log.json and <name>/pool.json (what /api/log and /api/pool return). Opened from there the page
+fetches those relative files instead of /api/*: it merges runs-pi.json and runs-vm.json (a fixed list,
+so two publishers never write the same file and nothing is ever listed), polls every 15 s and shows
+the data's own time. nca/cloud/publish.sh uploads such a copy to the bucket.
+
 Stdlib + numpy only. Single process, single thread per request (ThreadingHTTPServer), no
-subprocesses, no writes anywhere, run names are checked against the actual directory listing
-before touching the filesystem with them.
+subprocesses, no writes anywhere (the server; --demo and --static write files once and exit or
+serve), run names are checked against the actual directory listing before touching the
+filesystem with them.
 """
 
 from __future__ import annotations
@@ -399,6 +409,48 @@ def build_demo(run_dir: Path, iters_total: int = 3000, last_iteration: int = 145
     tmp.replace(run_dir / "pool.npz")
 
 
+# ── static copy: the page plus the JSON the API would serve, for a plain file host ───────────────
+
+STATIC_SOURCES = ("pi", "vm")  # runs-<source>.json, the fixed list the static page merges (its RUN_LISTS)
+STATIC_FLAG = "var STATIC = false; /*STATIC*/"  # in PAGE_HTML; the static copy makes it true
+
+
+def _write_json(path: Path, obj) -> None:
+    """Atomically (a temp file, then a rename), the way the API serialises: NaN -> null, compact."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(sanitize(obj), separators=(",", ":"), allow_nan=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def export_static(out_dir: Path, runs_root: Path, only=None, source: str = "pi") -> list:
+    """Write the static copy (see the module docstring) of the runs under runs_root (only those named in
+    `only`, if given) into out_dir. Returns the runs-<source>.json entries."""
+    if source not in STATIC_SOURCES:
+        raise ValueError(f"--source must be one of {STATIC_SOURCES}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    runs = [r for r in api_runs(runs_root) if not only or r["name"] in only]
+    now = round(time.time(), 1)
+    for r in runs:
+        r["source"], r["exported"] = source, now
+        d = out_dir / r["name"]
+        d.mkdir(exist_ok=True)
+        config, records = parse_log(runs_root / r["name"] / "log.jsonl")
+        _write_json(d / "log.json", {"config": config, "records": records})
+        pool_path = runs_root / r["name"] / "pool.npz"
+        try:
+            pool = pool_to_json(pool_path) if pool_path.is_file() else EMPTY_POOL
+        except Exception:  # caught mid-replace or unreadable: an empty one, as the API does
+            pool = EMPTY_POOL
+        _write_json(d / "pool.json", pool)
+    _write_json(out_dir / f"runs-{source}.json", runs)  # after the runs' files, so it never names a missing one
+    page = PAGE_HTML.replace(STATIC_FLAG, "var STATIC = true;")
+    assert page != PAGE_HTML, "the static flag is missing from the page"
+    tmp = out_dir / "index.html.tmp"
+    tmp.write_text(page, encoding="utf-8")
+    tmp.replace(out_dir / "index.html")
+    return runs
+
+
 # ── HTTP ────────────────────────────────────────────────────────────────────────────────────
 
 
@@ -490,6 +542,11 @@ def main() -> None:
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--runs", default="runs", help="directory holding runs/<name>/{log.jsonl,pool.npz}")
     ap.add_argument("--demo", action="store_true", help="(re)write runs/_demo/ with fabricated data first")
+    ap.add_argument("--static", metavar="OUT_DIR", help="write a static copy of the page and its data to OUT_DIR "
+                    "and exit (no server); see the module docstring")
+    ap.add_argument("--only", nargs="+", metavar="NAME", help="--static: just these runs")
+    ap.add_argument("--source", default="pi", choices=STATIC_SOURCES,
+                    help="--static: which publisher this is (writes runs-<source>.json)")
     args = ap.parse_args()
 
     runs_root = Path(args.runs)
@@ -498,6 +555,13 @@ def main() -> None:
     if args.demo:
         build_demo(runs_root / "_demo")
         print(f"wrote demo run to {runs_root / '_demo'}", file=sys.stderr)
+
+    if args.static:
+        runs = export_static(Path(args.static), runs_root, args.only, args.source)
+        missing = sorted(set(args.only or []) - {r["name"] for r in runs})
+        print(f"wrote {args.static}: index.html, runs-{args.source}.json, {len(runs)} run(s)"
+              + (f"; no log.jsonl for {missing}" if missing else ""), file=sys.stderr)
+        return
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.runs_root = runs_root  # type: ignore[attr-defined]
@@ -517,6 +581,7 @@ PAGE_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>NCA training</title>
 <style>
 :root {
@@ -642,11 +707,42 @@ footer { color: var(--muted); font-size: 11px; margin-top: 20px; }
   </div>
 </div>
 
-<footer>polls every ~3s &middot; <span id="footerNote"></span></footer>
+<footer><span id="footerPoll">polls every ~3s</span> &middot; <span id="footerNote"></span></footer>
 
 <script>
 (function () {
 "use strict";
+
+// The static copy (python -m nca.dashboard --static) bakes in STATIC = true: the page then reads the
+// exported files next to it instead of /api/*, never lists anything, and polls every 15 s.
+var STATIC = false; /*STATIC*/
+var POLL_MS = STATIC ? 15000 : 3000;
+var RUN_LISTS = ["runs-pi.json", "runs-vm.json"];   // one per publisher (dashboard.STATIC_SOURCES)
+var SAFE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;      // a run name used as a relative path
+var listTimes = {};                                  // runs-<source>.json -> its exported time (static)
+function logURL(name) { return STATIC ? encodeURIComponent(name) + "/log.json" : "/api/log?run=" + encodeURIComponent(name); }
+function poolURL(name) { return STATIC ? encodeURIComponent(name) + "/pool.json" : "/api/pool?run=" + encodeURIComponent(name); }
+// The runs, newest log first: /api/runs, or (static) the publishers' lists merged, the newer entry winning a
+// name both have.
+function fetchRuns() {
+  if (!STATIC) return getJSON("/api/runs");
+  return Promise.all(RUN_LISTS.map(function (f) {
+    return getJSON(f).then(function (l) { return Array.isArray(l) ? l : []; }, function () { return []; });
+  })).then(function (lists) {
+    var byName = Object.create(null);
+    lists.forEach(function (l, i) {
+      listTimes[RUN_LISTS[i]] = null;
+      l.forEach(function (r) {
+        if (!r || typeof r.name !== "string" || !SAFE_NAME.test(r.name)) return;
+        if (typeof r.exported === "number") listTimes[RUN_LISTS[i]] = r.exported;
+        var old = byName[r.name];
+        if (!old || (r.mtime || 0) > (old.mtime || 0)) byName[r.name] = r;
+      });
+    });
+    return Object.keys(byName).map(function (k) { return byName[k]; })
+      .sort(function (a, b) { return (b.mtime || 0) - (a.mtime || 0); });
+  });
+}
 
 var PALETTE = ["#4e79a7","#f28e2b","#e15759","#76b7b2","#59a14f","#edc948","#b07aa1","#ff9da7","#9c755f","#bab0ac","#86bcb6","#d37295"];
 var colorMap = Object.create(null);
@@ -728,6 +824,11 @@ function updateHeader(run, cfg, records, runsMeta) {
   if (target && iter != null) { bar.style.width = Math.max(0, Math.min(100, 100 * iter / target)) + "%"; }
   else { bar.style.width = "0%"; }
 
+  // a clean end ({"stopped": ...}) is the last line but has no loss or s/iter: read those off the last
+  // record that has them
+  for (var li = records.length - 1; li >= 0; li--) {
+    if (typeof records[li].secPerIter === "number") { last = Object.assign({}, records[li], { iteration: last.iteration }); break; }
+  }
   var spi = last && typeof last.secPerIter === "number" ? last.secPerIter : null;
   document.getElementById("statSpi").textContent = spi != null ? spi.toFixed(2) + " s" : "-";
   var lr = last && typeof last.lr === "number" ? last.lr : configNumber(cfg, ["lr"]);
@@ -742,7 +843,13 @@ function updateHeader(run, cfg, records, runsMeta) {
   // estimated from the last two records' iteration delta x the last record's secPerIter.
   var badge = document.getElementById("staleBadge");
   if (run && run.mtime != null) {
-    var age = Date.now() / 1000 - run.mtime;
+    var dataTime = run.mtime;
+    if (STATIC) {  // the data's own time: the last log line's "time" (the trainer writes one), else the file's
+      for (var ti = records.length - 1; ti >= 0; ti--) {
+        if (typeof records[ti].time === "number") { dataTime = Math.max(records[ti].time, 0); break; }
+      }
+    }
+    var age = Date.now() / 1000 - dataTime;
     var expected = null;
     if (records.length >= 2 && spi) {
       var dIter = records[records.length - 1].iteration - records[records.length - 2].iteration;
@@ -750,7 +857,8 @@ function updateHeader(run, cfg, records, runsMeta) {
     }
     if (expected == null && spi) expected = 50 * spi; // fallback: the common 50-iteration cadence
     var ratio = expected ? age / expected : 0;
-    badge.textContent = "updated " + fmtDuration(age) + " ago";
+    badge.textContent = (STATIC ? "data from " + new Date(dataTime * 1000).toLocaleString() + ", " : "updated ")
+      + fmtDuration(age) + " ago";
     badge.className = "badge " + (ratio >= 5 ? "bad" : ratio >= 2 ? "amber" : "ok");
   } else {
     badge.textContent = "-";
@@ -765,7 +873,9 @@ function updateHeader(run, cfg, records, runsMeta) {
 }
 
 // ---- numeric flattening for charts ----------------------------------------------------------
-var INFRA_KEYS = { iteration: 1, loss: 1, secPerIter: 1, lr: 1, maxRssMB: 1, evalSec: 1 };
+// time (unix seconds), evalN and a stop line's minutes / slowestIterSec are bookkeeping, not metrics to plot
+var INFRA_KEYS = { iteration: 1, loss: 1, secPerIter: 1, lr: 1, maxRssMB: 1, evalSec: 1, time: 1, evalN: 1,
+                   minutes: 1, slowestIterSec: 1, startIteration: 1 };
 // Walk a record's own (non-infra) fields; numeric leaves become dotted-path metrics, grouped by
 // their top-level key. A top-level key containing "pool" (any case) is pool-statistics, not a
 // quick-check metric -- e.g. a future "poolStats": {...} record field.
@@ -1288,25 +1398,31 @@ function pickActiveRun(runs) {
 }
 
 function poll() {
-  getJSON("/api/runs").then(function (runs) {
+  fetchRuns().then(function (runs) {
     state.runs = runs;
     populateRunSelect(runs);
     var active = pickActiveRun(runs);
     state.activeRun = active;
     var runMeta = runs.find(function (r) { return r.name === active; }) || null;
-    document.getElementById("footerNote").textContent = runs.length + " run" + (runs.length === 1 ? "" : "s") + " found";
+    var note = runs.length + " run" + (runs.length === 1 ? "" : "s") + " found";
+    if (STATIC) {
+      note += Object.keys(listTimes).map(function (f) {
+        return " \u00b7 " + f + ": " + (listTimes[f] ? "exported " + fmtDuration(Date.now() / 1000 - listTimes[f]) + " ago" : "none");
+      }).join("");
+    }
+    document.getElementById("footerNote").textContent = note;
     if (!active) {
       updateHeader(null, {}, [], runs);
       updateCharts([]);
       return;
     }
-    getJSON("/api/log?run=" + encodeURIComponent(active)).then(function (log) {
+    getJSON(logURL(active)).then(function (log) {
       state.config = log.config || {};
       state.records = log.records || [];
       updateHeader(runMeta, state.config, state.records, runs);
       updateCharts(state.records);
     }).catch(function () { /* transient: keep showing the last good data */ });
-    getJSON("/api/pool?run=" + encodeURIComponent(active)).then(function (pool) {
+    getJSON(poolURL(active)).then(function (pool) {
       if (!pool || !pool.radii || !pool.radii.length) {
         state.pool = null;
         var section = document.getElementById("poolSection");
@@ -1322,8 +1438,9 @@ function poll() {
   }).catch(function () { /* server hiccup: try again next tick */ });
 }
 
+if (STATIC) document.getElementById("footerPoll").textContent = "static copy, polls every 15 s";
 poll();
-setInterval(poll, 3000);
+setInterval(poll, POLL_MS);
 window.addEventListener("resize", function () {
   lossChart.draw(); metricChart.draw(); poolStatsChart.draw();
   if (state.pool) renderPool(state.pool);

@@ -1,0 +1,20 @@
+# A plan: one training stage per line,   run-name | stage-name | minutes | nca.train args
+#   - lines with the same run-name are one run's stages, in order: a later stage starts with --init from the
+#     previous stage's ckpt.pt (unless its own args name an --init), or --resume once it has a ckpt.pt of its own
+#   - different run-names run at the same time, a process each, sharing the one GPU (and the 4 vCPUs:
+#     --threads defaults to 4 / number of runs)
+#   - a stage lives in runs/<run>-<stage>; names are lowercase letters, digits and '-'
+#   - minutes: the stage's time box (passed as --minutes, less what an earlier, preempted try used). Each
+#     run's minutes + SETUP_MIN (25) must fit in MAX_HOURS (6 h). The lr decays at 60% / 85% of --iters,
+#     so pick --iters the minutes can reach (benchmark first), or the decay never comes.
+#   - bucket:PATH is a file in the bucket, fetched first (put it there with gcloud storage cp)
+#   - don't pass --name, --resume, --minutes or --device: the VM sets them
+#
+# First launch: a ~20-minute benchmark (3 runs at once; read it/s off watch.sh / the dashboard).
+bench-b16  | s1 | 20 | --R 4 5 6 --iters 100000 --batch 16 --eval-every 200 --eval-n 128 --init bucket:init/pure-a.pt
+bench-b64  | s1 | 20 | --R 4 5 6 --iters 100000 --batch 64 --pool-size 1024 --eval-every 200 --eval-n 128 --init bucket:init/pure-a.pt
+bench-r810 | s1 | 20 | --R 6 8 10 --iters 100000 --batch 16 --eval-every 200 --eval-n 128 --init bucket:init/pure-a.pt
+
+# A curriculum (comment the benchmark out first): pure-a's weights, then R 4/5/6, then 6/8/10.
+# pure-b | r456  | 120 | --R 4 5 6 --iters 120000 --batch 16 --eval-every 500 --eval-n 128 --init bucket:init/pure-a.pt
+# pure-b | r6810 | 200 | --R 6 8 10 --iters 150000 --batch 16 --eval-every 500 --eval-n 128
