@@ -6,7 +6,8 @@ max(|q|, |r|, |q+r|) <= R. Stored in a square array S x S, S = 2R+1, cell
 always dead (every state channel is 0 there).
 
 This file (and nca/data.py) must agree with the TS side, src/nca.ts: same
-array layout, same six neighbour offsets, same kernel mask.
+array layout, same six neighbour offsets, same kernel mask, same constant
+inputs (consts).
 """
 
 import numpy as np
@@ -57,3 +58,29 @@ def rim(R: int) -> np.ndarray:
     q, r = _qr_grid(R)
     dist = np.maximum(np.maximum(np.abs(q), np.abs(r)), np.abs(q + r))
     return dist == R
+
+
+# The model's constant input planes, in the order they follow the state channels
+# (spec v3: mask, theta1, theta2; spec v6 adds the rim sources of the four hand-written
+# floods). A model takes a prefix: a v1 model only the mask, a v3-v5 one the first 3.
+CONST_NAMES = ("mask", "theta1", "theta2", "src1", "src1c", "src2", "src2c")
+
+
+def consts(R: int) -> np.ndarray:
+    """float32 [7,S,S] = (mask, theta1, theta2, src1, src1c, src2, src2c), spec v3 + v6 §1.
+
+    Cell centre of axial (q, r), pointy-top: x = sqrt(3) * (q + r/2), y = 1.5 * r.
+    theta1 = ((atan2(y, x) / (2 pi)) + 1) mod 1, in [0, 1) (the centre cell: atan2(0, 0) = 0, so 0);
+    theta2 = (theta1 + 0.5) mod 1 (so 0.5 at the centre). With rim = 1 on the cells at hex distance R:
+    src1 = rim * theta1, src1c = rim * (1 - theta1), src2 = rim * theta2, src2c = rim * (1 - theta2).
+    Double precision, stored as float32; off-board cells are 0 in every plane.
+    """
+    q, r = _qr_grid(R)
+    q, r = np.broadcast_arrays(q.astype(np.float64), r.astype(np.float64))
+    x = np.sqrt(3.0) * (q + r / 2.0)
+    y = 1.5 * r
+    t1 = np.mod(np.arctan2(y, x) / (2.0 * np.pi) + 1.0, 1.0)
+    t2 = np.mod(t1 + 0.5, 1.0)
+    m = mask(R).astype(np.float64)
+    e = rim(R).astype(np.float64)
+    return np.stack([m, t1 * m, t2 * m, e * t1, e * (1.0 - t1), e * t2, e * (1.0 - t2)]).astype(np.float32)

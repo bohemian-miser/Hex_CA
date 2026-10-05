@@ -8,16 +8,35 @@
 // (that one pads a ring); it is the Python side's, nca/hexgrid.py.
 //
 // One step, every on-board cell at once (synchronous, double-buffered):
-//   x = concat(state, mask)                  17 channels
-//   h = relu(conv3x3_hexmasked(x) + b1)      17 -> H, 7 taps (corners k=0, 8 are zero)
+//   x = concat(state, consts)                C + K channels (K consts: version 1
+//                                             is just "mask"; version 2 and 3 are
+//                                             "mask", "theta1", "theta2" — spec v3's
+//                                             angle round the board centre)
+//   pool                                      version 3 only ("taps+pool", spec v4
+//                                             §1): per state channel, the max and the
+//                                             min over the on-board taps among the 7
+//                                             (self + 6 neighbours; off-board taps
+//                                             excluded, not zero; corners never taps)
+//   h = relu(conv3x3_hexmasked(x) + w1pool·pool + b1)   C+K -> H, 7 taps (corners
+//                                             k=0, 8 are zero)
 //   d = conv1x1(h) + b2                      H -> C
 //   state = state + d · fire                 fire = 1 when fireRate is 1
 //   state = clamp(state, lo, hi)             when the export has a clamp
 //   state[ch0] = wall; state *= mask
+//
+// Every const is the same at every step (it depends only on the board, not the
+// state), so its whole contribution — every tap, every const channel — folds
+// into a per-cell bias once, at construction; only the state channels (taps and,
+// in version 3, their per-channel pools) are gathered fresh out of `src` on
+// every tap (see HexNCA's `bias` and `w1r`).
+
+import { coordsOf, indexOf, makeBoard } from './hex.js';
+import { randomLine } from './lines.js';
 
 /** What the weights were trained on (nca/export.py writes it); every field optional. */
 export interface NCAMeta {
-  trainedR?: number;
+  /** One radius, or the radii of mixed-size training. */
+  trainedR?: number | number[];
   steps?: [number, number];
   iterations?: number;
   /** Trained with the persistent pool and wall edits: the state may be kept across edits. */
@@ -27,12 +46,23 @@ export interface NCAMeta {
 }
 
 export interface NCAWeights {
+  /** 1 (consts implied ["mask"]), 2 (consts carried explicitly, spec v3), or 3 (+ w1pool, spec v4). */
+  version: number;
   channels: number;
   hidden: number;
+  /** The constant input channels, in the order baked into w1's extra columns. Version 1: ["mask"]. */
+  consts: string[];
+  /** 'taps' (versions 1–2) or 'taps+pool' (version 3, spec v4 §1: `w1pool` on top of the tap convolution). */
+  perception: 'taps' | 'taps+pool';
   clamp: [number, number] | null;
   fireRate: number;
-  /** H × (C + 1) × 9, index ((h·(C+1)) + c)·9 + k, k = (drow+1)·3 + (dcol+1); c = C is the mask. */
+  /**
+   * H × (C + K) × 9, index ((h·(C+K)) + c)·9 + k, k = (drow+1)·3 + (dcol+1);
+   * c < C is a state channel, c >= C is the (c − C)-th const (`consts` order).
+   */
   w1: Float32Array;
+  /** Version 3 only: H × 2C, index h·2C + j; j < C is the max of state channel j over the on-board taps, j >= C the min of channel j − C. */
+  w1pool?: Float32Array;
   b1: Float32Array;
   /** C × H, index o·H + h. */
   w2: Float32Array;
@@ -50,6 +80,8 @@ const TAPS: ReadonlyArray<readonly [number, number]> = [
   [-1, 0], [-1, 1], [0, -1], [0, 0], [0, 1], [1, -1], [1, 0],
 ];
 const tapK = ([dr, dc]: readonly [number, number]) => (dr + 1) * 3 + (dc + 1);
+/** Index of the self tap ([0, 0]) within TAPS: always on board, so a cell's pool always has at least this one value. */
+const SELF_TAP = TAPS.findIndex(([dr, dc]) => dr === 0 && dc === 0);
 
 export const side = (R: number): number => 2 * R + 1;
 
@@ -95,36 +127,102 @@ function posInt(j: Record<string, unknown>, key: string, min: number): number {
   return v;
 }
 
+/** The const inputs this reader knows how to build (see `buildConst`). */
+const KNOWN_CONSTS = new Set(['mask', 'theta1', 'theta2', 'src1', 'src1c', 'src2', 'src2c']);
+
 /** The exported JSON (web/nca-weights.json) as typed arrays, checked against the spec's format. */
 export function loadWeights(json: unknown): NCAWeights {
   if (typeof json !== 'object' || json === null || Array.isArray(json)) throw new Error('nca weights: not an object');
   const j = json as Record<string, unknown>;
-  if (j.version !== 1) throw new Error(`nca weights: unsupported version ${String(j.version)}`);
+  const version = j.version;
+  if (version !== 1 && version !== 2 && version !== 3) throw new Error(`nca weights: unsupported version ${String(version)}`);
+  let consts: string[];
+  if (version === 1) {
+    consts = ['mask']; // v1 files don't carry a `consts` field: the mask is implied.
+  } else {
+    const rawConsts = j.consts;
+    if (!Array.isArray(rawConsts) || rawConsts.length === 0 || !rawConsts.every((v) => typeof v === 'string')) {
+      throw new Error('nca weights: consts must be a non-empty array of strings');
+    }
+    for (const name of rawConsts) if (!KNOWN_CONSTS.has(name)) throw new Error(`nca weights: unknown const '${name}'`);
+    consts = rawConsts as string[];
+  }
+  const perception: 'taps' | 'taps+pool' = version === 3 ? 'taps+pool' : 'taps';
+  if (version === 3 && j.perception !== 'taps+pool') {
+    throw new Error(`nca weights: version 3 requires perception "taps+pool", got ${JSON.stringify(j.perception)}`);
+  }
   const C = posInt(j, 'channels', 2);
   const H = posInt(j, 'hidden', 1);
   let clamp: [number, number] | null = null;
   if (j.clamp !== null && j.clamp !== undefined) {
-    const c = j.clamp;
-    if (!Array.isArray(c) || c.length !== 2 || !c.every((v) => typeof v === 'number' && Number.isFinite(v)) || !(c[0] < c[1])) {
+    const cl = j.clamp;
+    if (!Array.isArray(cl) || cl.length !== 2 || !cl.every((v) => typeof v === 'number' && Number.isFinite(v)) || !(cl[0] < cl[1])) {
       throw new Error('nca weights: clamp must be null or [lo, hi] with lo < hi');
     }
-    clamp = [c[0], c[1]];
+    clamp = [cl[0], cl[1]];
   }
   const fireRate = j.fireRate ?? 1;
   if (typeof fireRate !== 'number' || !(fireRate > 0 && fireRate <= 1)) throw new Error('nca weights: fireRate must be in (0, 1]');
-  const w1 = floats(j, 'w1', H * (C + 1) * 9);
+  const K = consts.length;
+  const w1 = floats(j, 'w1', H * (C + K) * 9);
   for (let i = 0; i < w1.length; i += 9) {
     if (w1[i] !== 0 || w1[i + 8] !== 0) throw new Error('nca weights: a corner tap (k = 0 or 8) is not zero');
   }
+  const w1pool = version === 3 ? floats(j, 'w1pool', H * 2 * C) : undefined;
   const meta = j.meta;
   if (meta !== undefined && (typeof meta !== 'object' || meta === null || Array.isArray(meta))) {
     throw new Error('nca weights: meta must be an object');
   }
   return {
-    channels: C, hidden: H, clamp, fireRate,
-    w1, b1: floats(j, 'b1', H), w2: floats(j, 'w2', C * H), b2: floats(j, 'b2', C),
+    version, channels: C, hidden: H, consts, perception, clamp, fireRate,
+    w1, w1pool, b1: floats(j, 'b1', H), w2: floats(j, 'w2', C * H), b2: floats(j, 'b2', C),
     meta: (meta ?? {}) as NCAMeta,
   };
+}
+
+/**
+ * One constant input's values over a radius-R board's S×S array (spec v3,
+ * src* added in v6 §1): "mask" is 1 on board else 0; "theta1"/"theta2" encode
+ * a cell's angle round the board centre (pointy-top axial → Cartesian, atan2
+ * in double precision, stored float32; theta2 = theta1 + 0.5 mod 1).
+ * "src1"/"src1c"/"src2"/"src2c" gate theta1/theta2 (and its complement) by
+ * rim(cell) = 1 iff on board and hex distance == R: src1 = rim·theta1,
+ * src1c = rim·(1 − theta1), src2 = rim·theta2, src2c = rim·(1 − theta2) — all
+ * computed in double, stored float32. Off-board slots are 0 for every const;
+ * the src* consts are additionally 0 on-board off the rim.
+ */
+export function buildConst(name: string, R: number): Float32Array {
+  const S = side(R);
+  const N = S * S;
+  const out = new Float32Array(N);
+  const mask = boardMask(R);
+  if (name === 'mask') {
+    for (let i = 0; i < N; i++) out[i] = mask[i];
+    return out;
+  }
+  if (name === 'theta1' || name === 'theta2' || name === 'src1' || name === 'src1c' || name === 'src2' || name === 'src2c') {
+    for (let row = 0; row < S; row++) {
+      for (let col = 0; col < S; col++) {
+        const i = row * S + col;
+        if (!mask[i]) continue; // stays 0
+        const q = col - R;
+        const r = row - R;
+        const x = Math.sqrt(3) * (q + r / 2);
+        const y = 1.5 * r;
+        const theta1 = (Math.atan2(y, x) / (2 * Math.PI) + 1) % 1;
+        if (name === 'theta1') { out[i] = theta1; continue; }
+        const theta2 = (theta1 + 0.5) % 1;
+        if (name === 'theta2') { out[i] = theta2; continue; }
+        if (hexDist(q, r) !== R) continue; // off the rim: stays 0
+        if (name === 'src1') out[i] = theta1;
+        else if (name === 'src1c') out[i] = 1 - theta1;
+        else if (name === 'src2') out[i] = theta2;
+        else out[i] = 1 - theta2; // src2c
+      }
+    }
+    return out;
+  }
+  throw new Error(`nca weights: unknown const '${name}'`);
 }
 
 // ── The automaton ───────────────────────────────────────────────────────────
@@ -142,6 +240,8 @@ export class HexNCA {
   readonly cells: Int32Array;
   /** The wall picture, 0/1 per slot (always 0 off the board). */
   readonly walls: Uint8Array;
+  /** The const inputs (`weights.consts` order), each S² floats, 0 off the board. */
+  readonly consts: Float32Array[];
   /** C × S² floats, channel-major: channel c of slot i at c·N + i. */
   state: Float32Array;
   /** Steps since the last reset. */
@@ -153,15 +253,29 @@ export class HexNCA {
   private readonly rand: () => number;
   /** Per cell, the 7 taps' slots (−1 off the array or off the board: those read zero). */
   private readonly taps: Int32Array;
-  /** Per cell and hidden unit: b1 plus the mask channel's taps, which never change. */
+  /** Per cell and hidden unit: b1 plus every const channel's taps, which never change. */
   private readonly bias: Float32Array;
-  /** w1 without the mask channel, regrouped [h][tap][c] to match the gathered input (doubles: faster to read here). */
+  /** 2C when `perception` is 'taps+pool' (max then min per state channel), else 0. */
+  private readonly poolWidth: number;
+  /**
+   * w1 (and, when `poolWidth` > 0, w1pool) without the const channels, eight hidden units
+   * interleaved: [h / 8][feature][h % 8], H padded to a multiple of 8 with zero units (doubles:
+   * faster to read here). Feature index f < T·C is tap t = f / C, channel c = f % C; f >= T·C is
+   * the pool feature f − T·C (max of channel j for f − T·C = j < C, min of channel j for
+   * f − T·C = C + j).
+   */
   private readonly w1r: Float64Array;
   /** w2 transposed, [h][o]. */
   private readonly w2t: Float32Array;
   private readonly b2: Float32Array;
+  /** T·C tap features, then (when pooling) 2C pool features: `w1r`'s feature layout. */
   private readonly x: Float64Array;
+  /** The hidden units' dot products for one cell, before bias and relu. */
+  private readonly z: Float64Array;
   private readonly d: Float64Array;
+  /** Per-channel max/min scratch for the pool features (length 0 when `perception` is 'taps'). */
+  private readonly pmax: Float64Array;
+  private readonly pmin: Float64Array;
 
   /** `rand` is only drawn on when fireRate < 1 (each cell fires with that chance, all channels together). */
   constructor(w: NCAWeights, R: number, rand: () => number = Math.random) {
@@ -180,6 +294,7 @@ export class HexNCA {
     this.rand = rand;
     this.mask = boardMask(R);
     this.walls = new Uint8Array(N);
+    this.consts = w.consts.map((name) => buildConst(name, R));
     this.state = new Float32Array(C * N);
     this.next = new Float32Array(C * N);
 
@@ -201,28 +316,47 @@ export class HexNCA {
       }
     }
 
-    const C1 = C + 1;
-    this.w1r = new Float64Array(H * T * C);
+    const K = w.consts.length;
+    const CK = C + K;
+    const H8 = Math.ceil(H / 8) * 8;
+    const TC = T * C;
+    const PW = this.poolWidth = w.perception === 'taps+pool' ? 2 * C : 0;
+    const W = TC + PW;
+    this.w1r = new Float64Array(H8 * W);
     for (let h = 0; h < H; h++) {
       for (let t = 0; t < T; t++) {
         const k = tapK(TAPS[t]);
-        for (let c = 0; c < C; c++) this.w1r[(h * T + t) * C + c] = w.w1[(h * C1 + c) * 9 + k];
+        for (let c = 0; c < C; c++) this.w1r[((h >> 3) * W + t * C + c) * 8 + (h & 7)] = w.w1[(h * CK + c) * 9 + k];
+      }
+      if (PW > 0) {
+        const w1pool = w.w1pool!;
+        for (let f = 0; f < PW; f++) this.w1r[((h >> 3) * W + TC + f) * 8 + (h & 7)] = w1pool[h * PW + f];
       }
     }
-    // The mask channel is 1 at every on-board tap and 0 elsewhere: fold it into a per-cell bias.
+    // Every const (mask, and in versions 2–3 theta1/theta2) is the same at every step: fold its
+    // whole contribution — every tap, every const channel — into a per-cell bias. The pool
+    // features depend on the state, so they are not foldable and are computed fresh each step.
     this.bias = new Float32Array(M * H);
     for (let ci = 0; ci < M; ci++) {
       for (let h = 0; h < H; h++) {
         let b = w.b1[h];
-        for (let t = 0; t < T; t++) if (this.taps[ci * T + t] >= 0) b += w.w1[(h * C1 + C) * 9 + tapK(TAPS[t])];
+        for (let t = 0; t < T; t++) {
+          const j = this.taps[ci * T + t];
+          if (j < 0) continue;
+          const k = tapK(TAPS[t]);
+          for (let c = 0; c < K; c++) b += w.w1[(h * CK + (C + c)) * 9 + k] * this.consts[c][j];
+        }
         this.bias[ci * H + h] = b;
       }
     }
     this.w2t = new Float32Array(H * C);
     for (let o = 0; o < C; o++) for (let h = 0; h < H; h++) this.w2t[h * C + o] = w.w2[o * H + h];
     this.b2 = w.b2;
-    this.x = new Float64Array(T * C);
+    this.x = new Float64Array(W);
+    this.z = new Float64Array(H8);
     this.d = new Float64Array(C);
+    this.pmax = new Float64Array(PW > 0 ? C : 0);
+    this.pmin = new Float64Array(PW > 0 ? C : 0);
   }
 
   /** The fresh state: zeros, except channel 0 = the walls. */
@@ -252,7 +386,10 @@ export class HexNCA {
     const N = this.N;
     const T = TAPS.length;
     const TC = T * C;
-    const { cells, taps, bias, w1r, w2t, b2, walls, x, d } = this;
+    const PW = this.poolWidth;
+    const { cells, taps, bias, w1r, w2t, b2, walls, x, z, d, pmax, pmin } = this;
+    const H8 = z.length;
+    const W = TC + PW;
     const lo = this.clamp ? this.clamp[0] : -Infinity;
     const hi = this.clamp ? this.clamp[1] : Infinity;
     const fireRate = this.fireRate;
@@ -270,25 +407,54 @@ export class HexNCA {
             if (j < 0) for (let c = 0; c < C; c++) x[base + c] = 0;
             else for (let c = 0; c < C; c++) x[base + c] = src[c * N + j];
           }
+          if (PW > 0) {
+            // Per state channel, the max and min over the on-board taps among the 7 (self
+            // always on board; off-board taps excluded, not the 0 the gather above filled in).
+            const selfBase = SELF_TAP * C;
+            for (let c = 0; c < C; c++) pmax[c] = pmin[c] = x[selfBase + c];
+            for (let t = 0; t < T; t++) {
+              if (t === SELF_TAP || taps[ci * T + t] < 0) continue;
+              const base = t * C;
+              for (let c = 0; c < C; c++) {
+                const v = x[base + c];
+                if (v > pmax[c]) pmax[c] = v;
+                if (v < pmin[c]) pmin[c] = v;
+              }
+            }
+            for (let c = 0; c < C; c++) {
+              x[TC + c] = pmax[c];
+              x[TC + C + c] = pmin[c];
+            }
+          }
           for (let o = 0; o < C; o++) d[o] = b2[o];
           const bOff = ci * H;
-          for (let u = 0; u < H; u++) {
-            // The dot product of 7·C inputs, eight running sums (about 1.5× faster in V8 than one).
-            const wOff = u * TC;
+          // The W-input dot products (W = 7·C tap features, + 2C pool features when
+          // pooling), eight hidden units at a time: each input is read once for all
+          // eight (about 1.5× faster in V8 than a unit at a time).
+          for (let u = 0, wo = 0; u < H8; u += 8) {
             let a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0;
-            let f = 0;
-            for (; f + 7 < TC; f += 8) {
-              a0 += w1r[wOff + f] * x[f];
-              a1 += w1r[wOff + f + 1] * x[f + 1];
-              a2 += w1r[wOff + f + 2] * x[f + 2];
-              a3 += w1r[wOff + f + 3] * x[f + 3];
-              a4 += w1r[wOff + f + 4] * x[f + 4];
-              a5 += w1r[wOff + f + 5] * x[f + 5];
-              a6 += w1r[wOff + f + 6] * x[f + 6];
-              a7 += w1r[wOff + f + 7] * x[f + 7];
+            for (let f = 0; f < W; f++, wo += 8) {
+              const xf = x[f];
+              a0 += w1r[wo] * xf;
+              a1 += w1r[wo + 1] * xf;
+              a2 += w1r[wo + 2] * xf;
+              a3 += w1r[wo + 3] * xf;
+              a4 += w1r[wo + 4] * xf;
+              a5 += w1r[wo + 5] * xf;
+              a6 += w1r[wo + 6] * xf;
+              a7 += w1r[wo + 7] * xf;
             }
-            for (; f < TC; f++) a0 += w1r[wOff + f] * x[f];
-            const a = bias[bOff + u] + (a0 + a1 + a2 + a3) + (a4 + a5 + a6 + a7);
+            z[u] = a0;
+            z[u + 1] = a1;
+            z[u + 2] = a2;
+            z[u + 3] = a3;
+            z[u + 4] = a4;
+            z[u + 5] = a5;
+            z[u + 6] = a6;
+            z[u + 7] = a7;
+          }
+          for (let u = 0; u < H; u++) {
+            const a = bias[bOff + u] + z[u];
             if (a > 0) {
               const w2Off = u * C;
               for (let o = 0; o < C; o++) d[o] += w2t[w2Off + o] * a;
@@ -313,42 +479,107 @@ export class HexNCA {
 // ── The oracle ──────────────────────────────────────────────────────────────
 
 /**
- * The spec's target: 1 on every on-board non-wall cell that is NOT joined,
- * through on-board non-wall cells (6-connected), to a non-wall rim cell; 0 on
- * walls, outside cells and off the board. A breadth-first search from the rim.
+ * The spec's targets (v4 §2), the primary first. Regions are the 6-connected
+ * components of on-board non-wall cells; a region holding a rim cell is a rim
+ * region, the rest are enclosed. Every enclosed region fills. Every rim region
+ * fills too, except one: the one with the most cells, or whose rim cells span
+ * the widest angular arc round the board's centre (within `SPAN_EPS` of the
+ * widest) — the second measure replaces v2's rimcount with the angular span
+ * of a region's rim cells (`buildConst`'s theta1/theta2: the narrower of the
+ * two, so the branch cut in whichever one wraps through the region's arc
+ * never inflates it). Each such region gives one acceptable target; the
+ * primary leaves out the one with the most cells, then the widest span, then
+ * the lowest cell index. With a single rim region nothing but the enclosed
+ * regions fills. Walls and off-board slots are 0 in every target.
  */
-export function enclosed(walls: ArrayLike<number>, R: number): Uint8Array {
+const SPAN_EPS = 0.02;
+
+export function targets(walls: ArrayLike<number>, R: number): Uint8Array[] {
   const S = side(R);
   const N = S * S;
-  const outside = new Uint8Array(N);
+  const mask = boardMask(R);
+  const theta1 = buildConst('theta1', R);
+  const theta2 = buildConst('theta2', R);
+  // Regions by breadth-first search, numbered in order of their lowest cell index.
+  const region = new Int32Array(N).fill(-1);
+  const area: number[] = [];
+  const rim: number[] = [];
+  const span: number[] = [];
   const queue = new Int32Array(N);
-  let head = 0;
-  let tail = 0;
-  for (let i = 0; i < N; i++) {
-    const [q, r] = cellCoords(R, i);
-    if (hexDist(q, r) === R && !walls[i]) {
-      outside[i] = 1;
-      queue[tail++] = i;
+  for (let s0 = 0; s0 < N; s0++) {
+    if (!mask[s0] || walls[s0] || region[s0] >= 0) continue;
+    const id = area.length;
+    let head = 0;
+    let tail = 0;
+    let cells = 0;
+    let rimCells = 0;
+    let t1min = Infinity;
+    let t1max = -Infinity;
+    let t2min = Infinity;
+    let t2max = -Infinity;
+    region[s0] = id;
+    queue[tail++] = s0;
+    while (head < tail) {
+      const i = queue[head++];
+      const row = Math.floor(i / S);
+      const col = i % S;
+      cells++;
+      if (hexDist(col - R, row - R) === R) {
+        rimCells++;
+        if (theta1[i] < t1min) t1min = theta1[i];
+        if (theta1[i] > t1max) t1max = theta1[i];
+        if (theta2[i] < t2min) t2min = theta2[i];
+        if (theta2[i] > t2max) t2max = theta2[i];
+      }
+      for (const [dr, dc] of NEIGHBOURS) {
+        const r2 = row + dr;
+        const c2 = col + dc;
+        if (r2 < 0 || r2 >= S || c2 < 0 || c2 >= S) continue;
+        const j = r2 * S + c2;
+        if (!mask[j] || walls[j] || region[j] >= 0) continue;
+        region[j] = id;
+        queue[tail++] = j;
+      }
     }
+    area.push(cells);
+    rim.push(rimCells);
+    span.push(rimCells > 0 ? Math.min(t1max - t1min, t2max - t2min) : 0);
   }
-  while (head < tail) {
-    const i = queue[head++];
-    const row = Math.floor(i / S);
-    const col = i % S;
-    for (const [dr, dc] of NEIGHBOURS) {
-      const r2 = row + dr;
-      const c2 = col + dc;
-      if (r2 < 0 || r2 >= S || c2 < 0 || c2 >= S) continue;
-      const j = r2 * S + c2;
-      if (outside[j] || walls[j] || hexDist(c2 - R, r2 - R) > R) continue;
-      outside[j] = 1;
-      queue[tail++] = j;
-    }
+  // The rim regions in the primary's order: most cells, then widest span, then lowest index.
+  const rims = area.map((_, id) => id).filter((id) => rim[id] > 0)
+    .sort((a, b) => area[b] - area[a] || span[b] - span[a] || a - b);
+  let maxArea = 0;
+  let maxSpan = 0;
+  for (const id of rims) {
+    maxArea = Math.max(maxArea, area[id]);
+    maxSpan = Math.max(maxSpan, span[id]);
   }
-  const fill = new Uint8Array(N);
-  for (let i = 0; i < N; i++) {
+  const unfilled = rims.filter((id) => area[id] === maxArea || span[id] >= maxSpan - SPAN_EPS);
+  if (!unfilled.length) unfilled.push(-1); // no rim region at all: everything fills
+  return unfilled.map((x) => {
+    const fill = new Uint8Array(N);
+    for (let i = 0; i < N; i++) if (region[i] >= 0 && region[i] !== x) fill[i] = 1;
+    return fill;
+  });
+}
+
+/**
+ * A random bridge for the page: src/lines.ts's randomLine (a cheapest path
+ * under random costs, so straight, curved or wandering) from one rim cell to
+ * another through the interior, round the walls already there. Its cells in
+ * drawing order, or null when there is no way across.
+ */
+export function randomBridge(walls: ArrayLike<number>, R: number, rand: () => number): number[] | null {
+  const board = makeBoard(R);
+  const blocked = new Set<number>();
+  for (let i = 0; i < walls.length; i++) {
+    if (!walls[i]) continue;
     const [q, r] = cellCoords(R, i);
-    if (hexDist(q, r) <= R && !walls[i] && !outside[i]) fill[i] = 1;
+    if (hexDist(q, r) <= R) blocked.add(indexOf(board, q, r));
   }
-  return fill;
+  const line = randomLine(board, rand, { blocked, wiggle: rand() * 3 });
+  return line && line.map((slot) => {
+    const [q, r] = coordsOf(board, slot);
+    return cellIndex(R, q, r);
+  });
 }

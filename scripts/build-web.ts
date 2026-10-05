@@ -51,7 +51,7 @@ writeFileSync('dist/index.html', documentOf(page,
   'One local cellular-automaton rule on a hexagon field: the inside of every drawn loop fills, and so does the smaller side of every line from edge to edge.'));
 const nca = await bundle('web/nca.html', 'web/nca.ts');
 writeFileSync('dist/nca.html', documentOf(nca,
-  'A neural cellular automaton on a hexagon field, trained to fill every region the drawn walls enclose.'));
+  'A neural cellular automaton on a hexagon field, trained to fill every region the drawn walls enclose and the smaller side of every wall from edge to edge.'));
 
 for (const f of ['dist/hex-ca.html', 'dist/index.html', 'dist/nca.html']) {
   console.log(`${f} ${(readFileSync(f).length / 1024).toFixed(1)} KB`);

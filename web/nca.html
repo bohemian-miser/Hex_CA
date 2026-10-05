@@ -85,11 +85,13 @@ dl.readout dd { margin: 0; text-align: right; }
 .tile canvas { display: block; width: 100%; aspect-ratio: 1 / 0.92; cursor: pointer; }
 .tile b { font-weight: 500; }
 .tile i { font-style: normal; color: var(--muted); }
+.tile.const { opacity: 0.85; cursor: default; }
+.tile.const canvas { cursor: default; }
 </style>
 <div class="wrap">
   <header>
     <h1>Fill, as a trained neural CA</h1>
-    <p>Paint walls on the hexagon field. Every cell runs the same small neural network on itself and its six neighbours, step after step; it was trained, not written, to make every enclosed region read 1 on its fill channel and everything else 0. The badge checks it against a flood fill done the ordinary way. <a href="index.html">Hand-written CA</a> · <a href="https://github.com/bohemian-miser/Hex_CA">Source on GitHub</a></p>
+    <p>The rule: every region the walls enclose fills, and a wall from edge to edge fills its smaller side. Paint walls on the hexagon field; every cell runs the same small neural network on itself and its six neighbours, step after step, trained rather than written to follow that rule on its fill channel. The badge checks it against the rule computed the ordinary way. <a href="index.html">Hand-written CA</a> · <a href="https://github.com/bohemian-miser/Hex_CA">Source on GitHub</a></p>
   </header>
 
   <div class="bench">
@@ -106,9 +108,10 @@ dl.readout dd { margin: 0; text-align: right; }
         </div>
         <div class="buttons">
           <button id="loop">Random loop</button>
+          <button id="bridge">Random bridge</button>
           <button id="clear">Clear walls</button>
         </div>
-        <label class="slider" for="radius">Radius <input type="range" id="radius" min="4" max="14" value="8"><output id="radiusOut">8</output></label>
+        <label class="slider" for="radius">Radius <input type="range" id="radius" min="4" max="32" value="8"><output id="radiusOut">8</output></label>
       </div>
       <div class="group">
         <div class="label">Run</div>

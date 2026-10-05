@@ -1,8 +1,9 @@
 // The trained NCA's page (web/nca.html): paint walls, run the network, and
-// check its fill channel against the oracle. The weights are bundled in.
+// check its fill channel against the oracle (any of its acceptable targets).
+// The weights are bundled in.
 
 import weightsJson from './nca-weights.json';
-import { HexNCA, cellCoords, cellIndex, enclosed, hexDist, loadWeights } from '../src/nca.js';
+import { HexNCA, cellCoords, cellIndex, hexDist, loadWeights, randomBridge, targets } from '../src/nca.js';
 import { coordsOf, indexOf, makeBoard } from '../src/hex.js';
 import { randomLoop, rng } from '../src/lines.js';
 
@@ -22,16 +23,23 @@ const LEVELS = 32;
 const GRID_MS = 100;
 const READOUT_MS = 150;
 
+/** The radius slider's top (web/nca.html's max too): about 40 ms a step there in Chromium on a Raspberry Pi 5. */
+const MAX_R = 32;
+/** A board this many steps per unit of radius past its last edit has had time to settle. */
+const SETTLE_PER_R = 8;
+
 const clampInt = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, Math.round(v)));
 const settings = {
-  radius: clampInt(typeof meta.trainedR === 'number' ? meta.trainedR : 8, 4, 14),
+  radius: clampInt(typeof meta.trainedR === 'number' ? meta.trainedR : 8, 4, MAX_R),
   speed: 60,
 };
 
 let m: HexNCA;
-/** enclosed() of the current walls, and how many cells it fills. */
-let oracle: Uint8Array = new Uint8Array(0);
-let oracleCount = 0;
+/** targets() of the current walls (the primary first), and how many cells each fills. */
+let oracles: Uint8Array[] = [];
+let oracleCounts: number[] = [];
+/** The step count at the last wall change (0 after a reset): live edits don't restart the count. */
+let editedAt = 0;
 let playing = true;
 let tool: 'wall' | 'erase' = 'wall';
 /** The channel on the big board, or null for the fill view. */
@@ -62,9 +70,9 @@ function newModel(R: number): void {
 }
 
 function wallsChanged(): void {
-  oracle = enclosed(m.walls, m.R);
-  oracleCount = 0;
-  for (const i of m.cells) oracleCount += oracle[i];
+  oracles = targets(m.walls, m.R);
+  oracleCounts = oracles.map((t) => m.cells.reduce((n, i) => n + t[i], 0));
+  editedAt = m.steps;
   notice = '';
   stateChanged();
 }
@@ -239,12 +247,12 @@ const CORNERS = Array.from({ length: 6 }, (_, k) => {
   return [Math.cos(a), Math.sin(a)] as const;
 });
 
+/** A path of hexagons, each closed by a line back to its first corner: closePath() costs more the longer the path is in Chromium, and a big board's path is long. */
 function hexes(cells: readonly number[], s: number): void {
   ctx.beginPath();
   for (const i of cells) {
     ctx.moveTo(cx[i] + s * CORNERS[0][0], cy[i] + s * CORNERS[0][1]);
-    for (let k = 1; k < 6; k++) ctx.lineTo(cx[i] + s * CORNERS[k][0], cy[i] + s * CORNERS[k][1]);
-    ctx.closePath();
+    for (let k = 1; k <= 6; k++) ctx.lineTo(cx[i] + s * CORNERS[k % 6][0], cy[i] + s * CORNERS[k % 6][1]);
   }
 }
 
@@ -266,12 +274,16 @@ class Fills {
   }
 }
 
-/** On-board cells where the thresholded fill and the oracle disagree. */
+/** On-board cells where the thresholded fill and the closest of the oracle's targets disagree. */
 function differing(): number[] {
   const fill = m.channel(1);
-  const out: number[] = [];
-  for (const i of m.cells) if ((fill[i] > 0.5 ? 1 : 0) !== oracle[i]) out.push(i);
-  return out;
+  let best: number[] = [];
+  oracles.forEach((target, k) => {
+    const out: number[] = [];
+    for (const i of m.cells) if ((fill[i] > 0.5 ? 1 : 0) !== target[i]) out.push(i);
+    if (k === 0 || out.length < best.length) best = out;
+  });
+  return best;
 }
 
 function draw(): void {
@@ -320,7 +332,11 @@ function draw(): void {
 // ── Channel tiles ───────────────────────────────────────────────────────────
 
 const NAMES = Array.from({ length: C }, (_, c) => (c === 0 ? 'wall' : c === 1 ? 'fill' : 'hidden'));
-interface Tile { c: number; el: HTMLButtonElement; cv: HTMLCanvasElement; ctx: CanvasRenderingContext2D; range: HTMLElement; text: string }
+/**
+ * A state-channel tile is clickable (shows that channel on the board, diverging scale);
+ * a const tile (mask, and in version 2 theta1/theta2) just shows its value, plain 0…1 scale.
+ */
+interface Tile { kind: 'state' | 'const'; index: number; el: HTMLButtonElement; cv: HTMLCanvasElement; ctx: CanvasRenderingContext2D; range: HTMLElement; text: string }
 const tiles: Tile[] = [];
 /** Device pixel → cell index (−1 for none), shared by every tile. */
 let mini: { map: Int32Array; img: ImageData; px: Uint32Array; R: number; w: number; h: number } | null = null;
@@ -340,8 +356,24 @@ function buildTiles(): void {
     el.append(cv, head, range);
     el.addEventListener('click', () => show(c));
     box.append(el);
-    tiles.push({ c, el, cv, ctx: cv.getContext('2d')!, range, text: '' });
+    tiles.push({ kind: 'state', index: c, el, cv, ctx: cv.getContext('2d')!, range, text: '' });
   }
+  weights.consts.forEach((name, k) => {
+    // A disabled button, not a plain div, so it keeps the same card chrome (background,
+    // border) as the clickable tiles above — just inert, with no click handler.
+    const el = document.createElement('button');
+    el.className = 'tile const';
+    el.type = 'button';
+    el.disabled = true;
+    el.title = `Constant input: ${name} (0…1, not shown on the board)`;
+    const cv = document.createElement('canvas');
+    const head = document.createElement('span');
+    head.innerHTML = `<i>${name}</i>`;
+    const range = document.createElement('i');
+    el.append(cv, head, range);
+    box.append(el);
+    tiles.push({ kind: 'const', index: k, el, cv, ctx: cv.getContext('2d')!, range, text: '' });
+  });
 }
 
 function miniLayout(): NonNullable<typeof mini> | null {
@@ -368,18 +400,21 @@ function drawGrid(): void {
   const g = miniLayout();
   if (!g) return;
   gridDirty = false;
-  const lut = ramps(colours()).div.map(pixel);
+  const rp = ramps(colours());
+  const divLut = rp.div.map(pixel);
+  const fillLut = rp.fill.map(pixel);
   const tone = new Uint32Array(m.N);
   const fmt = (v: number) => (Math.abs(v) < 0.005 ? '0' : v.toFixed(2));
   for (const t of tiles) {
-    const v = m.channel(t.c);
+    const v = t.kind === 'state' ? m.channel(t.index) : m.consts[t.index];
+    const lut = t.kind === 'state' ? divLut : fillLut;
     let lo = Infinity;
     let hi = -Infinity;
     for (const i of m.cells) {
       const x = v[i];
       if (x < lo) lo = x;
       if (x > hi) hi = x;
-      tone[i] = lut[divLevel(x) + LEVELS];
+      tone[i] = lut[t.kind === 'state' ? divLevel(x) + LEVELS : fillLevel(x)];
     }
     const { map, px } = g;
     for (let p = 0; p < map.length; p++) px[p] = map[p] < 0 ? 0 : tone[map[p]];
@@ -391,7 +426,7 @@ function drawGrid(): void {
 
 function show(c: number | null): void {
   shown = c;
-  for (const t of tiles) t.el.setAttribute('aria-pressed', String(t.c === c));
+  for (const t of tiles) if (t.kind === 'state') t.el.setAttribute('aria-pressed', String(t.index === c));
   $('showFill').setAttribute('aria-pressed', String(c === null));
   legend();
   dirty = true;
@@ -416,13 +451,16 @@ function readout(): void {
   const badge = off === 0
     ? '<span class="pill good">Matches oracle</span>'
     : `<span class="pill bad">Differs from oracle (${off} cell${off === 1 ? '' : 's'})</span>`;
+  const settling = m.steps - editedAt < SETTLE_PER_R * m.R ? ' (still settling)' : '';
   const rows: Array<[string, string]> = [
-    ['Step', String(m.steps)],
+    ['Step', `${m.steps}${settling}`],
     ['Filled', `${filled} / ${m.cells.length}`],
-    ['Oracle fills', String(oracleCount)],
+    ['Oracle fills', oracleCounts.join(' or ')],
     ['Steps/s', String(stepsPerSec)],
     ['ms/step', msPerStep ? msPerStep.toFixed(2) : '—'],
   ];
+  // More than one acceptable target (area and rimcount disagree, or a tie): any one of those sides may stay unfilled.
+  if (oracles.length > 1) rows.splice(3, 0, ['Oracle', oracles.length === 2 ? 'either side' : `any of ${oracles.length}`]);
   $('readout').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   if (badge !== shownBadge) $('verdict').innerHTML = shownBadge = badge;
   $('status').innerHTML = notice || (resetOnEdit
@@ -431,12 +469,14 @@ function readout(): void {
 }
 
 function metaLine(): string {
-  const parts: string[] = [];
-  if (typeof meta.trainedR === 'number') parts.push(`trained at R=${meta.trainedR}`);
+  const parts: string[] = [`version ${weights.version}`];
+  if (typeof meta.trainedR === 'number' || Array.isArray(meta.trainedR)) parts.push(`trained at R=${[meta.trainedR].flat().join(', ')}`);
   if (Array.isArray(meta.steps)) parts.push(`${meta.steps[0]}–${meta.steps[1]} steps`);
   if (typeof meta.iterations === 'number') parts.push(`${meta.iterations} iterations`);
   parts.push(meta.pool === true ? 'edit-trained (pool)' : meta.pool === false ? 'fresh starts only' : 'pool not recorded');
   parts.push(`${C} channels, ${weights.hidden} hidden, clamp ${weights.clamp ? `[${weights.clamp.join(', ')}]` : 'none'}`);
+  parts.push(`perception: ${weights.perception}`);
+  parts.push(`consts: ${weights.consts.join(', ')}`);
   const note = typeof meta.note === 'string' && meta.note ? ` · “${meta.note}”` : '';
   return `Weights: ${parts.join(' · ')}${note}`;
 }
@@ -523,15 +563,22 @@ function addLoop(): void {
     blocked.add(indexOf(board, q, r));
   }
   const loop = randomLoop(board, rng((Math.random() * 2 ** 32) >>> 0), { blocked });
-  if (!loop) {
-    notice = 'No room for another loop here: clear some walls or raise the radius.';
-    readoutDirty = true;
-    return;
-  }
+  if (!loop) return noRoom('another loop');
   edit(loop.map((slot) => {
     const [q, r] = coordsOf(board, slot);
     return cellIndex(m.R, q, r);
   }), 1);
+}
+
+function addBridge(): void {
+  const bridge = randomBridge(m.walls, m.R, rng((Math.random() * 2 ** 32) >>> 0));
+  if (!bridge) return noRoom('a bridge');
+  edit(bridge, 1);
+}
+
+function noRoom(what: string): void {
+  notice = `No room for ${what} here: clear some walls or raise the radius.`;
+  readoutDirty = true;
 }
 
 bindSlider('radius', () => newModel(settings.radius));
@@ -544,9 +591,11 @@ $('step').addEventListener('click', () => {
 });
 $('reset').addEventListener('click', () => {
   m.reset();
+  editedAt = 0;
   stateChanged();
 });
 $('loop').addEventListener('click', addLoop);
+$('bridge').addEventListener('click', addBridge);
 $('clear').addEventListener('click', () => edit(Array.from(m.cells), 0));
 $('showFill').addEventListener('click', () => show(null));
 const resetBox = $<HTMLInputElement>('resetOnEdit');
@@ -584,7 +633,7 @@ new MutationObserver(restyle).observe(document.documentElement, { attributes: tr
 Object.assign(window, {
   hexnca: {
     get model() { return m; },
-    get oracle() { return oracle; },
+    get targets() { return oracles; },
     /** Client coordinates of the cell at axial (q, r). */
     point(q: number, r: number): [number, number] {
       const rect = canvas.getBoundingClientRect();
