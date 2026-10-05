@@ -244,3 +244,36 @@ legacy rule's local chords equal the table's.
 **Throughput** (`rules --bench`, one Pi core, idle machine): a fresh training sample (rule + rendering + tap +
 walk) 1,471 / s at level 2, 842 / s at level 3, 1,041 / s on level-4 crops (mean strand 10 / 39 / 33 chords).
 A training iteration needs about batch / 8 + damage ~ 12 of them: ~10 ms.
+
+**Trainer** (`nca/strand/train2.py`; its docstring has every detail): the v1 trainer's pool, ages, damage, light
+cones, truncated backprop, schedule, collapse guard, resume and log, with the v2 inputs; `--channels 96 --hidden
+128` by default, `--depth` hidden layers in the per-cell update (`nets.StrandNCA`; 1 = HexNCA), and `--inputs e`
+on `nets.FrameNCA`. Damage "edit" re-types 1-3 cells with chords (never the tapped one); "move" moves the tap.
+**M1b** keeps the tap and adds six planes, "the chord through edge d is on a circuit", for the tapped strand:
+a circuit's edge must say 1 once drawn; a tail's edge must say 0 once the open news could have got there (the
+front reaches an end at its distance from the tap, the news comes back a chord a step: chord i of n with the
+tap at p by min(p + i, 2(n-1) - p - i)), don't-care before; after an edit the new strand's closed planes are
+don't-care until its settle time. **Quick check**: the legacy set (train.py's very taps on the 20 v1 held-out
+rules, inputs built from those boards' types and rotations) and the wide set (v2 held-out rules, up to 40 a
+subset, every subset; 120 taps a level stratified by length, round-robin over the subsets), `bySet`,
+`bySubset` (7), the score = length-balanced exact averaged over (set, level); and the **code-fidelity probe**
+`q.code`: a ridge probe from drawn strand cells' hidden channels to the 53 code bits, fitted on the training
+pools, scored on the quick check's held-out read-outs, overall and by distance from the tap.
+
+**Departures from `spectacle-nca-options.md`** (what the build chose where the doc was open or the owner changed it):
+
+1. The split is rank-based per subset (exactly round(0.2 n) held out in each), not `hash < 0.2`, which could
+   hold out none of `15`'s four rules. Training also excludes the 20 legacy held-out rules. In `15` this leaves
+   2 train rules, both with Pi's digit 1, so the one v2 held-out rule (`15·000000010`) and the legacy one
+   (`15·000000000`) need a (type, digit) never trained in that subset: an extrapolation, not a composition. No
+   other subset has one. Holding out only the legacy rules in `15`, `128`, `258` would avoid it (owner's call).
+2. No owner slot (the owner's decision for launch 6): the tap is 59 planes, not 63.
+3. The rule table is `data/strand-v2/rules-hex.json`, with the boards' geometry and the parity sample beside
+   it, not `data/strand/rules-hex.json`; the legacy data stays `data/strand` (launch 5's `strand.tgz`).
+4. The wide set holds every held-out rule of a small subset (1 / 6 / 13 / 2 / 3), not "all 4 of `15`".
+5. M1b's light cone with a tap, and its eval (exact = the edge planes and the closed planes both right;
+   `q.parts` gives each), are this build's definitions.
+6. Added at the owner's request: options D and D-cs (and D-fourier in the probe), `--depth`, option E in the
+   trainer with an equivariance test. The perception is the 7 taps only (no `taps+pool`).
+7. `--ckpt-pool half` (float16 pool states in ckpt.pt; plan 6 uses it) and pool.npz's state limited to 32
+   channels, for the bucket and the dashboard.
