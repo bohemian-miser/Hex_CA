@@ -45,7 +45,7 @@ read-only by path, so `npm run typecheck` and CI do not need it).
 round(0.2·n) rules with the smallest fmix32(FNV-1a(`strand-split-v1|` + ruleKey)) are HELD-OUT: 1 + 6 + 13
 = 20. (Bare FNV-1a put rules that differ only in the Gamma digit next to each other, so held-out came in
 pairs; the finaliser fixes that.) HELD-OUT ids: 0 `15·000000000`; 4 `128·000000000`, 9, 19, 21, 22,
-**24 `128·010100000` (the FASS rule)**; 44, 46, 50, 60, 62, 67, 71, 73, 77, 80, 81, 88, 98 (258).
+**24 (the infinite-line rule; its matching is deliberately not written here)**; 44, 46, 50, 60, 62, 67, 71, 73, 77, 80, 81, 88, 98 (258).
 `meta.json` lists every rule with its key, combo string, split and per-type local chords.
 
 **Boards**: levels 2 and 3 are the nine root-type patches (all of them; 55-63 and 433-496 tiles).
