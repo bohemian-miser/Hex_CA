@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { HexNCA, NEIGHBOURS, boardMask, buildConst, cellCoords, cellIndex, hexDist, loadWeights, randomBridge, side, targets } from '../src/nca.js';
+import { HexNCA, NEIGHBOURS, boardMask, buildConst, cellCoords, cellIndex, fieldMask, hexDist, loadWeights, randomBridge, side, targets } from '../src/nca.js';
 import { rng } from '../src/lines.js';
 
 const readJson = (path: string): unknown => JSON.parse(readFileSync(new URL(path, import.meta.url), 'utf8'));
@@ -619,6 +619,148 @@ describe('randomBridge', () => {
         for (const i of bridge!) walls[i] = 1;
         expect(onCells(R, targets(walls, R)[0]).length).toBeGreaterThan(0);
       }
+    }
+  });
+});
+
+// ── Ragged boards (web/nca.ts's map selector: Spectacle's own hex fields, not just the
+// hexagon). HexNCA and targets() both take an optional custom mask in place of the default
+// boardMask(R); see fieldMask, which builds one from a list of axial cells. ──
+
+describe('fieldMask (a ragged board from a list of axial cells)', () => {
+  it('sets R to one past the farthest cell’s hex distance, and places every listed cell and no other', () => {
+    const qr: Array<[number, number]> = [[0, 0], [1, 0], [0, 1], [-1, 1], [2, -1]];
+    const { R, mask } = fieldMask(qr);
+    const maxD = Math.max(...qr.map(([q, r]) => hexDist(q, r)));
+    expect(R).toBe(maxD + 1);
+    expect(mask.length).toBe(side(R) ** 2);
+    for (const [q, r] of qr) expect(mask[cellIndex(R, q, r)]).toBe(1);
+    expect(Array.from(mask).reduce((n, v) => n + v, 0)).toBe(qr.length);
+  });
+
+  it('gives R = 1 for a single cell at the origin (never R = 0: every cell needs room for an off-board neighbour)', () => {
+    const { R, mask } = fieldMask([[0, 0]]);
+    expect(R).toBe(1);
+    expect(mask[cellIndex(R, 0, 0)]).toBe(1);
+    expect(Array.from(mask).reduce((n, v) => n + v, 0)).toBe(1);
+  });
+
+  it('places Spectacle’s own level-2 field (nca/fields/hex-l2.json) with no overlaps and the documented count', () => {
+    const json = readJson('../nca/fields/hex-l2.json') as { count: number; qr: Array<[number, number]> };
+    const { R, mask } = fieldMask(json.qr);
+    expect(Array.from(mask).reduce((n, v) => n + v, 0)).toBe(json.count);
+    for (const [q, r] of json.qr) expect(mask[cellIndex(R, q, r)]).toBe(1);
+  });
+});
+
+describe('HexNCA on a custom (ragged) board mask', () => {
+  it('matches the default full-hexagon run exactly when the custom mask is boardMask(R) itself', () => {
+    const R = 5;
+    const walls = wallsWhere(R, (q, r) => hexDist(q, r) === 2);
+    const a = modelOn(R, walls);
+    const b = new HexNCA(weights, R, boardMask(R));
+    for (let i = 0; i < walls.length; i++) b.setWall(i, walls[i] ? 1 : 0);
+    b.reset();
+    for (let s = 0; s < 15; s++) {
+      a.step();
+      b.step();
+    }
+    expect(Array.from(b.cells)).toEqual(Array.from(a.cells));
+    expect(Array.from(b.state)).toEqual(Array.from(a.state));
+  });
+
+  it('restricts cells to the custom shape and keeps every off-mask slot exactly 0, every step', () => {
+    const R = 4;
+    const mask = boardMask(R);
+    // An L-shape: drop the quadrant q > 0 and r > 0.
+    for (let r = -R; r <= R; r++) {
+      for (let q = -R; q <= R; q++) if (hexDist(q, r) <= R && q > 0 && r > 0) mask[cellIndex(R, q, r)] = 0;
+    }
+    const onMask = [...mask.keys()].filter((i) => mask[i]);
+    const m = new HexNCA(weights, R, mask);
+    expect(Array.from(m.cells).sort((x, y) => x - y)).toEqual(onMask);
+    m.setWall(cellIndex(R, -1, -1), 1);
+    m.reset();
+    for (let s = 0; s < 20; s++) {
+      m.step();
+      for (let i = 0; i < mask.length; i++) {
+        if (mask[i]) continue;
+        for (let c = 0; c < m.channels; c++) expect(m.state[c * m.N + i]).toBe(0);
+      }
+      for (const v of m.state) expect(Number.isFinite(v)).toBe(true);
+    }
+  });
+
+  it('rejects a mask of the wrong length', () => {
+    expect(() => new HexNCA(weights, 5, new Uint8Array(3))).toThrow(/mask/);
+  });
+
+  it('builds on Spectacle’s own level-2 field end to end: right cell count, finite state, off-field slots stay 0', () => {
+    const json = readJson('../nca/fields/hex-l2.json') as { count: number; qr: Array<[number, number]> };
+    const { R, mask } = fieldMask(json.qr);
+    const m = new HexNCA(weights, R, mask);
+    expect(m.cells.length).toBe(json.count);
+    m.reset();
+    for (let s = 0; s < 10; s++) {
+      m.step();
+      for (let i = 0; i < m.N; i++) {
+        if (mask[i]) continue;
+        for (let c = 0; c < m.channels; c++) expect(m.state[c * m.N + i]).toBe(0);
+      }
+    }
+  });
+});
+
+describe('targets on a custom (ragged) board mask', () => {
+  it('treats the shape’s own outline as part of the rim, with no separate rim input: an opening the field already lacks needs no wall', () => {
+    // R = 3 hexagon with three of (0,0)'s six neighbours missing from the board entirely —
+    // exactly the situation a real Spectacle field was found to have near its own root tile.
+    // Walling the other three neighbours alone encloses (0, 0), matching the live page's
+    // behaviour on hex-l3.json (manually checked against the trained model there).
+    const R = 3;
+    const mask = boardMask(R);
+    for (const [q, r] of [[1, -1], [0, -1], [-1, 0]] as const) mask[cellIndex(R, q, r)] = 0;
+    const walls = new Uint8Array(mask.length);
+    for (const [q, r] of [[1, 0], [-1, 1], [0, 1]] as const) walls[cellIndex(R, q, r)] = 1;
+    const fills = targets(walls, R, mask);
+    expect(fills).toHaveLength(1);
+    expect(Array.from(fills[0]).reduce((n, v) => n + v, 0)).toBe(1);
+    expect(fills[0][cellIndex(R, 0, 0)]).toBe(1);
+  });
+
+  it('leaves the enclosed cell unfilled once one of the drawn walls opens a gap to the shape’s own edge', () => {
+    const R = 3;
+    const mask = boardMask(R);
+    for (const [q, r] of [[1, -1], [0, -1], [-1, 0]] as const) mask[cellIndex(R, q, r)] = 0;
+    const walls = new Uint8Array(mask.length);
+    for (const [q, r] of [[1, 0], [-1, 1]] as const) walls[cellIndex(R, q, r)] = 1; // (0, 1) left open
+    const fills = targets(walls, R, mask);
+    expect(fills).toHaveLength(1);
+    expect(Array.from(fills[0]).reduce((n, v) => n + v, 0)).toBe(0);
+  });
+
+  it('fills a ring drawn entirely inside a ragged shape, same as on the full hexagon', () => {
+    const R = 5;
+    const mask = boardMask(R);
+    // Cut a bay out of one side, well clear of the ring drawn near the centre below.
+    for (let r = -R; r <= R; r++) {
+      for (let q = -R; q <= R; q++) if (hexDist(q, r) <= R && q >= 3) mask[cellIndex(R, q, r)] = 0;
+    }
+    const walls = wallsWhere(R, (q, r) => hexDist(q, r) === 2);
+    for (let i = 0; i < walls.length; i++) if (!mask[i]) walls[i] = 0; // walls only ever sit on the board
+    const fills = targets(walls, R, mask);
+    const inside = onCells(R, wallsWhere(R, (q, r) => hexDist(q, r) < 2 && mask[cellIndex(R, q, r)] === 1 && walls[cellIndex(R, q, r)] === 0));
+    expect(fills).toHaveLength(1);
+    expect(onCells(R, fills[0]).sort()).toEqual(inside.sort());
+  });
+
+  it('never fills an off-mask slot, even one inside the full hexagon of radius R', () => {
+    const R = 4;
+    const mask = boardMask(R);
+    for (const [q, r] of [[1, -1], [0, -1], [-1, 0]] as const) mask[cellIndex(R, q, r)] = 0;
+    const walls = wallsWhere(R, (q, r) => hexDist(q, r) === 3);
+    for (const fill of targets(walls, R, mask)) {
+      for (const [q, r] of [[1, -1], [0, -1], [-1, 0]] as const) expect(fill[cellIndex(R, q, r)]).toBe(0);
     }
   });
 });

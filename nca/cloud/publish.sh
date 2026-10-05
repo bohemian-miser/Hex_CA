@@ -15,9 +15,10 @@
 # it also uploads play.html (dist/nca.html: npm run build) and <run>/weights.json for each run with a
 # checkpoint, which the page's Play link opens. --weights-only uploads just those two kinds of file, for
 # runs whose logs the VM publishes: never runs-*.json or a run's log/pool JSON, and index.html only with
-# --keep-page; a loop sends a file again only once it has changed. --keep-page: a VM still on code from before the Play link uploads
-# its own dash/index.html (no Play link) every minute; this looks at the served page every KEEP_SEC (5) s
-# and, when one without the Play link has replaced it, puts this checkout's page back. THE BUCKET IS
+# --keep-page; a loop sends a file again only once it has changed. --keep-page: a VM on its own code
+# uploads its own dash/index.html every minute, which may differ from this checkout's (an older page, or
+# one missing a later change); this looks at the served page every KEEP_SEC (5) s and, when it isn't
+# byte-identical to this checkout's, puts this checkout's page back. THE BUCKET IS
 # PUBLIC: this uploads only what nca.dashboard --static writes (the page, the play page and the runs'
 # log/pool/weights JSON), nothing else. Uploading needs gcloud credentials that may write the bucket.
 set -uo pipefail
@@ -96,8 +97,11 @@ weights_once() {
   echo "$(date +%T) weights of ${names[*]:-no run} and play.html in $BUCKET/dash/: $n file(s) sent, the rest unchanged"
 }
 
-# --keep-page: when the served index.html is a new upload (its generation) without the Play link, put back
-# the one the last round wrote. Reads the public URL with curl, so no gcloud call unless it uploads.
+# --keep-page: when the served index.html is a new upload (its generation) that isn't byte-identical to
+# this checkout's page, put this checkout's back. Reads the public URL with curl, so no gcloud call unless
+# it uploads. Exact match, not just "has a Play link": a VM on code newer than the Play link but older
+# than a later page change (the board-size control, say) would pass a Play-link-only check and never get
+# replaced, leaving that change missing from the public page indefinitely.
 PAGE_URL=https://storage.googleapis.com/${BUCKET#gs://}/dash/index.html
 seen=
 keep_page() {
@@ -107,9 +111,9 @@ keep_page() {
   [ -n "$g" ] && [ "$g" != "$seen" ] || return 0
   page=$(curl -fs --max-time 20 --compressed "$PAGE_URL") || return 0  # (not piped to grep -q: pipefail)
   seen=$g
-  [[ $page == *'id="playLink"'* ]] && return 0
+  [ "$(printf '%s' "$page" | sha256sum)" = "$(sha256sum <"$out/index.html")" ] && return 0
   put "$out/index.html" index.html "text/html; charset=utf-8" &&
-    echo "$(date +%T) dash/index.html had no Play link (a VM on older code?): put this checkout's back"
+    echo "$(date +%T) dash/index.html wasn't this checkout's page (a VM upload?): put ours back"
 }
 
 while :; do

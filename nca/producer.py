@@ -36,7 +36,9 @@ from .masks import ragged_mask
 
 K_POOL = 4      # targets kept per pool board (K is 1 on ~95% of boards, 2 on ~4.5%)
 MARGIN = 4      # extra steps past the deepest rim-region cell
-DAMAGE_KINDS = WALL_DAMAGE + ("state",)  # --damage kinds a-d (the walls) and e (the state)
+# --damage kinds a-d (the walls, data.WALL_DAMAGE), e (the state) and f (a stamped spiral, data._stamp_spiral):
+# f is appended AFTER e so old pool.npz / log damage codes (0-4) keep their meaning.
+DAMAGE_KINDS = WALL_DAMAGE + ("state", "spiral")
 BAND = {"fill": (0.35, 0.8), "multiRim": (0.15, 1.0), "density": (0.0, 0.45)}  # pool_stats kept in these
 STATS_EVERY = 200  # the pools' statistics (and the steering) every this many iterations
 QUEUE = 4          # items a thread / process producer may run ahead

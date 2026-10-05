@@ -8,11 +8,14 @@ above, default 100) it reads one rollout out at mult*R steps for each mult in --
 the later ones show whether the answer holds or still moves), on these sets of fresh boards (seeds no
 training run uses):
 
-  mix            the training mix
-  bridge         "bridge" boards with 2+ rim regions only
-  page loops     the demo page's Random loop button (data.page_loops), which training never draws from
-  ragged mix     the training mix on ragged masks (nca/masks.py: blobs, crops of Spectacle's hex fields)
-  ragged bridge  bridge boards with 2+ rim regions on ragged masks
+  mix             the training mix
+  bridge          "bridge" boards with 2+ rim regions only
+  page loops      the demo page's Random loop button (data.page_loops), which training never draws from
+  ragged mix      the training mix on ragged masks (nca/masks.py: blobs, crops of Spectacle's hex fields)
+  ragged bridge   bridge boards with 2+ rim regions on ragged masks
+  spiral closed   a spiral sealed shut (data.random_walls kind "spiral-closed"): its corridor fills
+  spiral knockout the same, one wall cell short (kind "spiral-knockout"): nothing stays enclosed
+  spiral open     a bare, unsealed spiral (kind "spiral-open")
 (the ragged sets need a model whose only const input is the mask).
 
 Every row: per-cell accuracy and fill IoU (against the closest acceptable target), the exact-board rate with
@@ -80,8 +83,29 @@ def _ragged_any(rng, R):
     return _ragged_bridge(rng, R) if rng.random() < 0.5 else _ragged_mix(rng, R)
 
 
+def _spiral_closed_board(rng, R):
+    """A closed spiral (data.random_walls kind "spiral-closed"): its wound corridor fills."""
+    return random_walls(rng, R, kind="spiral-closed")
+
+
+def _spiral_knockout_board(rng, R):
+    """The same closed-spiral picture with one wall cell knocked out (kind "spiral-knockout"): nothing
+    stays enclosed -- the near-identical pair _spiral_closed_board makes, one cell apart."""
+    return random_walls(rng, R, kind="spiral-knockout")
+
+
+def _spiral_open_board(rng, R):
+    """A bare, unsealed spiral (kind "spiral-open")."""
+    return random_walls(rng, R, kind="spiral-open")
+
+
+SPIRAL_SEED = 8080  # held-out spirals get a stream of their own
+
+
 SETS = {"mix": (random_walls, EVAL_SEED), "bridge": (_bridge_board, BRIDGE_SEED), "page loops": (page_loops, PAGE_SEED),
-        "ragged mix": (_ragged_mix, RAGGED_SEED), "ragged bridge": (_ragged_bridge, RAGGED_SEED + 1)}
+        "ragged mix": (_ragged_mix, RAGGED_SEED), "ragged bridge": (_ragged_bridge, RAGGED_SEED + 1),
+        "spiral closed": (_spiral_closed_board, SPIRAL_SEED), "spiral knockout": (_spiral_knockout_board, SPIRAL_SEED + 1),
+        "spiral open": (_spiral_open_board, SPIRAL_SEED + 2)}
 RAGGED = ("ragged mix", "ragged bridge")
 
 

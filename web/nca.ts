@@ -5,9 +5,12 @@
 // bundled ones, and can reload them while the run trains, keeping the walls.
 
 import weightsJson from './nca-weights.json';
-import { HexNCA, cellCoords, cellIndex, hexDist, loadWeights, randomBridge, targets, type NCAWeights } from '../src/nca.js';
+import { HexNCA, cellCoords, cellIndex, fieldMask, hexDist, loadWeights, randomBridge, side, targets, type NCAWeights } from '../src/nca.js';
 import { coordsOf, indexOf, makeBoard } from '../src/hex.js';
 import { randomLoop, rng } from '../src/lines.js';
+import hexL2 from '../nca/fields/hex-l2.json';
+import hexL3 from '../nca/fields/hex-l3.json';
+import hexL4 from '../nca/fields/hex-l4.json';
 
 /** The bundled weights until ?weights= brings others (setWeights). */
 let weights = loadWeights(weightsJson);
@@ -30,6 +33,11 @@ const READOUT_MS = 150;
 const MAX_R = 32;
 /** A board this many steps per unit of radius past its last edit has had time to settle. */
 const SETTLE_PER_R = 8;
+/** Past this many ms/step, the status line says why a big field (Spectacle level 4: 3905
+ * cells) runs slower than the speed slider asks for — scalar JS costs ~80-90 µs per
+ * cell-step, and every cell keeps changing every step (measured: no cell ever goes
+ * inactive, even settled, so there is no cheap way to skip work here). */
+const SLOW_STEP_MS = 50;
 
 const clampInt = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, Math.round(v)));
 /** The largest radius the weights were trained at (meta.trainedR is a number or a list), else a fallback. */
@@ -38,6 +46,37 @@ const settings = {
   radius: clampInt(trainedRs.length ? Math.min(10, Math.max(...trainedRs)) : 8, 4, MAX_R), // capped: a big board is slow in the browser
   speed: 60,
 };
+
+// ── Maps: the hexagon (radius slider) or one of Spectacle's own hex fields ─────────────────
+
+/** A board to run the automaton on: the hexagon (R from the slider, no mask) or a fixed,
+ * ragged field (R and mask fixed, from `fieldMask`). */
+interface MapSpec {
+  id: string;
+  label: string;
+  /** Cell count, for the info line; 0 for the hexagon (it varies with the radius). */
+  count: number;
+  /** Fixed R and mask, or undefined for the hexagon (uses settings.radius, the default full board). */
+  fixed?: { R: number; mask: Uint8Array };
+}
+
+interface FieldJson { count: number; qr: [number, number][] }
+const asField = (json: unknown) => json as FieldJson;
+
+const fieldMap = (id: string, label: string, json: unknown): MapSpec => {
+  const { count, qr } = asField(json);
+  return { id, label, count, fixed: fieldMask(qr) };
+};
+
+const MAPS: MapSpec[] = [
+  { id: 'hex', label: 'Hexagon', count: 0 },
+  fieldMap('l2', 'Spectacle hex, level 2', hexL2),
+  fieldMap('l3', 'Spectacle hex, level 3', hexL3),
+  fieldMap('l4', 'Spectacle hex, level 4', hexL4),
+];
+const mapById = new Map(MAPS.map((map) => [map.id, map]));
+let currentMap: MapSpec = MAPS[0];
+$<HTMLSelectElement>('map').append(...MAPS.map((map) => new Option(map.label, map.id)));
 
 let m: HexNCA;
 /** targets() of the current walls (the primary first), and how many cells each fills. */
@@ -58,15 +97,18 @@ let readoutDirty = true;
 
 // ── The automaton ───────────────────────────────────────────────────────────
 
-/** A model of radius R, keeping the walls that still fit, from the fresh state. */
-function newModel(R: number): void {
+/** A model of the current map, keeping the walls that still fit, from the fresh state. */
+function newModel(): void {
   const old = m as HexNCA | undefined;
-  m = new HexNCA(weights, R);
+  const R = currentMap.fixed ? currentMap.fixed.R : settings.radius;
+  m = new HexNCA(weights, R, currentMap.fixed?.mask);
   if (old) {
     for (const i of old.cells) {
       if (!old.walls[i]) continue;
       const [q, r] = cellCoords(old.R, i);
-      if (hexDist(q, r) <= R) m.setWall(cellIndex(R, q, r), 1);
+      if (hexDist(q, r) > R) continue;
+      const j = cellIndex(R, q, r);
+      if (m.mask[j]) m.setWall(j, 1);
     }
   }
   m.reset();
@@ -75,7 +117,7 @@ function newModel(R: number): void {
 }
 
 function wallsChanged(): void {
-  oracles = targets(m.walls, m.R);
+  oracles = targets(m.walls, m.R, currentMap.fixed?.mask);
   oracleCounts = oracles.map((t) => m.cells.reduce((n, i) => n + t[i], 0));
   editedAt = m.steps;
   notice = '';
@@ -101,12 +143,32 @@ const SQ3 = Math.sqrt(3);
 interface Geom { size: number; ox: number; oy: number }
 let geom: Geom = { size: 10, ox: 0, oy: 0 };
 
-/** The largest radius-R hexagon of pointy-top cells that fits a w×h box with `pad` to spare, centred. */
-const fitGeom = (R: number, w: number, h: number, pad: number): Geom =>
-  ({ size: Math.max(0.5, Math.min((w - pad) / (SQ3 * (2 * R + 1)), (h - pad) / (3 * R + 2))), ox: w / 2, oy: h / 2 });
-
 const centreOf = (g: Geom, q: number, r: number): [number, number] =>
   [g.ox + g.size * SQ3 * (q + r / 2), g.oy + g.size * 1.5 * r];
+
+/**
+ * The largest hexagonal-cell grid that fits a w×h box with `pad` to spare, centred on the
+ * board's own cells rather than on the full R hexagon — tight around a ragged field (a
+ * ratio of its own cells to the bounding hexagon's, e.g. Spectacle's level 4 is under a
+ * fifth), and equivalent to the old fixed formula for the hexagon itself.
+ */
+function fitGeom(R: number, mask: Uint8Array, w: number, h: number, pad: number): Geom {
+  const S = side(R);
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let row = 0; row < S; row++) {
+    for (let col = 0; col < S; col++) {
+      if (!mask[row * S + col]) continue;
+      const x = SQ3 * (col - R + (row - R) / 2);
+      const y = 1.5 * (row - R);
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  const size = Math.max(0.5, Math.min((w - pad) / (maxX - minX + SQ3), (h - pad) / (maxY - minY + 4)));
+  return { size, ox: w / 2 - (size * (minX + maxX)) / 2, oy: h / 2 - (size * (minY + maxY)) / 2 };
+}
 
 function cubeRound(fq: number, fr: number): [number, number] {
   const fs = -fq - fr;
@@ -121,12 +183,14 @@ function cubeRound(fq: number, fr: number): [number, number] {
   return [q, r];
 }
 
-/** The cell index whose hexagon holds (x, y) under `g`, or −1 off the board. */
-function cellAtPoint(g: Geom, R: number, x: number, y: number): number {
+/** The cell index whose hexagon holds (x, y) under `g`, or −1 off the board (off `mask`, not just off the full hexagon of radius R). */
+function cellAtPoint(g: Geom, R: number, mask: Uint8Array, x: number, y: number): number {
   const fx = (x - g.ox) / g.size;
   const fy = (y - g.oy) / g.size;
   const [q, r] = cubeRound((SQ3 / 3) * fx - fy / 3, (2 / 3) * fy);
-  return hexDist(q, r) <= R ? cellIndex(R, q, r) : -1;
+  if (hexDist(q, r) > R) return -1;
+  const i = cellIndex(R, q, r);
+  return mask[i] ? i : -1;
 }
 
 /** Cells on the straight hex line from a to b, both ends included. */
@@ -147,7 +211,7 @@ let lastCell = -1;
 
 function cellAt(ev: PointerEvent): number {
   const rect = canvas.getBoundingClientRect();
-  return cellAtPoint(geom, m.R, ev.clientX - rect.left, ev.clientY - rect.top);
+  return cellAtPoint(geom, m.R, m.mask, ev.clientX - rect.left, ev.clientY - rect.top);
 }
 
 function strokeTo(cell: number): void {
@@ -237,7 +301,7 @@ function layout(): void {
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  geom = fitGeom(m.R, rect.width, rect.height, 16);
+  geom = fitGeom(m.R, m.mask, rect.width, rect.height, 16);
   cx = new Float64Array(m.N);
   cy = new Float64Array(m.N);
   for (const i of m.cells) {
@@ -344,7 +408,7 @@ let NAMES = Array.from({ length: C }, (_, c) => (c === 0 ? 'wall' : c === 1 ? 'f
 interface Tile { kind: 'state' | 'const'; index: number; el: HTMLButtonElement; cv: HTMLCanvasElement; ctx: CanvasRenderingContext2D; range: HTMLElement; text: string }
 const tiles: Tile[] = [];
 /** Device pixel → cell index (−1 for none), shared by every tile. */
-let mini: { map: Int32Array; img: ImageData; px: Uint32Array; R: number; w: number; h: number } | null = null;
+let mini: { map: Int32Array; img: ImageData; px: Uint32Array; mask: Uint8Array; w: number; h: number } | null = null;
 let lastGrid = 0;
 
 function buildTiles(): void {
@@ -387,18 +451,18 @@ function miniLayout(): NonNullable<typeof mini> | null {
   const dpr = window.devicePixelRatio || 1;
   const w = Math.round(rect.width * dpr);
   const h = Math.round(rect.height * dpr);
-  if (mini && mini.R === m.R && mini.w === w && mini.h === h) return mini;
-  const g = fitGeom(m.R, rect.width, rect.height, 4);
+  if (mini && mini.mask === m.mask && mini.w === w && mini.h === h) return mini;
+  const g = fitGeom(m.R, m.mask, rect.width, rect.height, 4);
   const map = new Int32Array(w * h);
   for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) map[y * w + x] = cellAtPoint(g, m.R, (x + 0.5) / dpr, (y + 0.5) / dpr);
+    for (let x = 0; x < w; x++) map[y * w + x] = cellAtPoint(g, m.R, m.mask, (x + 0.5) / dpr, (y + 0.5) / dpr);
   }
   for (const t of tiles) {
     t.cv.width = w;
     t.cv.height = h;
   }
   const img = new ImageData(w, h);
-  return (mini = { map, img, px: new Uint32Array(img.data.buffer), R: m.R, w, h });
+  return (mini = { map, img, px: new Uint32Array(img.data.buffer), mask: m.mask, w, h });
 }
 
 function drawGrid(): void {
@@ -468,9 +532,12 @@ function readout(): void {
   if (oracles.length > 1) rows.splice(3, 0, ['Oracle', oracles.length === 2 ? 'either side' : `any of ${oracles.length}`]);
   $('readout').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   if (badge !== shownBadge) $('verdict').innerHTML = shownBadge = badge;
-  $('status').innerHTML = notice || (resetOnEdit
+  const slow = currentMap.fixed && msPerStep > SLOW_STEP_MS
+    ? ` This board is large (${m.cells.length} cells): it settles at about ${stepsPerSec} steps/s, slower than the slider asks for — nothing is wrong, it is just a lot of cells for scalar JS.`
+    : '';
+  $('status').innerHTML = (notice || (resetOnEdit
     ? 'Drag to paint walls. Each edit restarts the network from the fresh state.'
-    : 'Drag to paint walls. Edits go in live: the network carries on from where it was.');
+    : 'Drag to paint walls. Edits go in live: the network carries on from where it was.')) + slow;
 }
 
 function metaLine(): string {
@@ -560,6 +627,7 @@ function bindSlider(id: 'radius' | 'speed', onChange?: () => void): void {
 }
 
 function addLoop(): void {
+  if (currentMap.fixed) return; // hexagon only: a ragged field has no borderRing to walk
   const board = makeBoard(m.R);
   const blocked = new Set<number>();
   for (const i of m.cells) {
@@ -576,6 +644,7 @@ function addLoop(): void {
 }
 
 function addBridge(): void {
+  if (currentMap.fixed) return; // hexagon only: same reason as addLoop
   const bridge = randomBridge(m.walls, m.R, rng((Math.random() * 2 ** 32) >>> 0));
   if (!bridge) return noRoom('a bridge');
   edit(bridge, 1);
@@ -586,8 +655,21 @@ function noRoom(what: string): void {
   readoutDirty = true;
 }
 
-bindSlider('radius', () => newModel(settings.radius));
+/** Switch to a map by id (MAPS): rebuilds the model on it, keeping the walls that still fit. */
+function setMap(id: string): void {
+  currentMap = mapById.get(id) ?? MAPS[0];
+  const isHex = !currentMap.fixed;
+  $<HTMLSelectElement>('map').value = currentMap.id;
+  $('radiusRow').hidden = !isHex;
+  $<HTMLButtonElement>('loop').disabled = !isHex;
+  $<HTMLButtonElement>('bridge').disabled = !isHex;
+  $('mapInfo').textContent = isHex ? '' : `${currentMap.count} cells, fixed size (R = ${currentMap.fixed!.R}) — random loop/bridge are hexagon-only.`;
+  newModel();
+}
+
+bindSlider('radius', () => newModel());
 bindSlider('speed');
+$<HTMLSelectElement>('map').addEventListener('change', (ev) => setMap((ev.target as HTMLSelectElement).value));
 $('play').addEventListener('click', () => setPlaying(!playing));
 $('step').addEventListener('click', () => {
   setPlaying(false);
@@ -726,7 +808,7 @@ async function reloadWeights(auto: boolean): Promise<void> {
       $('tiles').replaceChildren();
       buildTiles();
       $('meta').textContent = metaLine();
-      newModel(m.R);
+      newModel();
       show(shown !== null && shown < C ? shown : null);
       source = { label: weightsName || weightsUrl, loaded: new Date() };
     }
@@ -763,10 +845,13 @@ Object.assign(window, {
   },
 });
 
+/** ?map=<id>: which board to open on (MAPS' ids; falls back to the hexagon). */
+const initialMap = params.get('map');
+
 void initialWeights().then(() => {
   $('meta').textContent = metaLine();
   buildTiles();
-  newModel(settings.radius);
+  setMap(initialMap && mapById.has(initialMap) ? initialMap : 'hex');
   addLoop();
   show(null);
   setPlaying(true);

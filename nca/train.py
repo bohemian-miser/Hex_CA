@@ -19,6 +19,7 @@ radius R from --R and a batch of --batch boards from that pool, each with the st
       stamp   a fresh closed loop or a rim-to-rim bridge ORed onto the board
       state   distill's damage: every channel but the walls zeroed inside a random disc of radius
               1..R/2 (walls and targets unchanged)
+      spiral  a fresh spiral ORed on: open, closed, or closed's knocked-out near-twin (data._stamp_spiral)
     after a wall damage the board's targets are recomputed. Damage piles up on the pool board: nothing
     toggles back to an original.
 All the board work (new boards, damage, targets, T) is made by a PRODUCER (nca/producer.py) from its own copy
@@ -47,7 +48,8 @@ The quick held-out check (every --eval-every iterations, and at iteration 0 of a
 boards per trained radius, means over the radii): exact (= equals any acceptable target) from the fresh
 state at mult*R steps for each --eval-mults, on the training mix ("mix"), on bridge boards with 2+ rim regions
 ("bridge", also per radius, with "none" / "both": the share where two or more sides stayed empty / every
-side filled, and "gap") and on the demo page's random loops ("page", never trained on); and the EDIT
+side filled, and "gap"), on the demo page's random loops ("page", never trained on), and on three spiral
+sets (closed/knocked-out/open: "spiralClosed"/"spiralKnockout"/"spiralOpen", heldout()); and the EDIT
 SEQUENCE ("edit": what the page does): a board of the mix settled from the fresh state for eval_mults[0]*R
 steps, then 3 successive wall damages (kinds edit, burst, erase, stamp), each followed by 6R steps WITHOUT a
 reset, exact against the edited board's targets after each ([e1, e2, e3]; editHold at the start: the share
@@ -128,7 +130,8 @@ import torch
 
 from .data import (EPS, N_AUX, WALL_DAMAGE, aux_flood, aux_targets, damage_walls, disc, pad_targets, page_loops,
                    random_walls, targets)
-from .evaluate import _bridge_board, _ragged_any, boards, score, summarise
+from .evaluate import (_bridge_board, _ragged_any, _spiral_closed_board, _spiral_knockout_board,
+                       _spiral_open_board, boards, score, summarise)
 from .hexgrid import CONST_NAMES, mask as hex_mask, rim
 from .model import PERCEPTIONS, HexNCA, const_stack, fresh_state, load_expanded
 from .producer import (BAND, DAMAGE_KINDS, K_POOL, MARGIN, STATS_EVERY, Producer, Source, answers, data_rng,
@@ -252,15 +255,21 @@ def arc_rule(state, walls, mk):
 
 def heldout(radii, consts, n=EVAL_N, device=None, ragged=None):
     """{set: {R: (walls, fills, sides, consts)}}: fixed boards for the quick check, n per set per radius, mix,
-    bridge and page (the demo page's random loops, data.page_loops: never trained on), and (ragged, default:
-    when the consts are the mask alone) "ragged": boards on ragged masks (nca/masks.py), half bridge boards
-    with 2+ rim regions, half the training mix (evaluate._ragged_any). consts = {R: const stack [1,n,S,S]}
-    (mask first); the ragged set's consts are its masks, [n,1,S,S]. Their aux floods are recomputed per check
-    (aux_flood). A larger n keeps the first EVAL_N boards of each set (the draws come in order) and adds more."""
+    bridge and page (the demo page's random loops, data.page_loops: never trained on), the three spiral sets
+    (spiralClosed/spiralKnockout/spiralOpen: closed, its knocked-out near-twin, and open -- evaluate.py's
+    "spiral closed"/"spiral knockout"/"spiral open"), and (ragged, default: when the consts are the mask
+    alone) "ragged": boards on ragged masks (nca/masks.py), half bridge boards with 2+ rim regions, half the
+    training mix (evaluate._ragged_any). consts = {R: const stack [1,n,S,S]} (mask first); the ragged set's
+    consts are its masks, [n,1,S,S]. Their aux floods are recomputed per check (aux_flood). A larger n keeps
+    the first EVAL_N boards of each set (the draws come in order) and adds more."""
     if ragged is None:
         ragged = all(c.shape[1] == 1 for c in consts.values())
     sets = [("mix", random_walls, EVAL_SEED), ("bridge", _bridge_board, EVAL_SEED + 50),
-            ("page", page_loops, EVAL_SEED + 100)] + ([("ragged", _ragged_any, EVAL_SEED + 200)] if ragged else [])
+            ("page", page_loops, EVAL_SEED + 100),
+            ("spiralClosed", _spiral_closed_board, EVAL_SEED + 300),
+            ("spiralKnockout", _spiral_knockout_board, EVAL_SEED + 301),
+            ("spiralOpen", _spiral_open_board, EVAL_SEED + 302)] + \
+        ([("ragged", _ragged_any, EVAL_SEED + 200)] if ragged else [])
     out = {name: {} for name, _, _ in sets}
     for R in radii:
         for name, gen, seed in sets:
@@ -338,8 +347,8 @@ def trivial_aux(held, mults):
 
 @torch.no_grad()
 def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
-    """{mult: {mix, bridge, page, none, both, gap, bridgeByR, ...}} -- means over the radii, read out at mult*R
-    steps; mix / bridge / page = exact on each held-out set.
+    """{mult: {mix, bridge, page, spiralClosed, spiralKnockout, spiralOpen, none, both, gap, bridgeByR, ...}}
+    -- means over the radii, read out at mult*R steps; exact on each held-out set (held's own keys).
 
     gap (bridge boards): mean ch1 on the rim regions the primary target fills minus mean ch1 on the one it
     leaves empty -- a soft trend that moves long before exact does. With aux: auxDense = channels 2..6 against
@@ -506,7 +515,7 @@ def write_snapshot(path, it, pools, last_R, last_idx):
     tie), ntargets_R uint8 [n] (distinct acceptable targets), loss_R float32 [n] (NaN if never in a batch yet),
     mask_R uint8 [n,S,S] (each board's shape: the hexagon or a ragged mask; pools from before masks: none),
     age_R int32 [n] (iterations since its last fresh start), edits_R int32 [n] (damages since then), damage_R
-    int8 [n] (the last one's kind: -1 none, then DAMAGE_KINDS' order: edit, burst, erase, stamp, state), and
+    int8 [n] (the last one's kind: -1 none, then DAMAGE_KINDS' order: edit, burst, erase, stamp, state, spiral), and
     state_R float16 [m,C,S,S], the full state of the first m = min(n, SNAP_M)."""
     out = {"iteration": np.int64(it), "radii": np.array(sorted(pools), dtype=np.int64),
            "last_R": np.int64(last_R), "last_idx": np.asarray(last_idx, dtype=np.int64)}
