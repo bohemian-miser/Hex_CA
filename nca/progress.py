@@ -18,8 +18,14 @@ binomial one of a single check, sqrt(2 p (1 - p) / n), n = evalN boards per set 
 the score, the mean of four such shares, the four errors combined), or the check-to-check scatter within the
 windows if that is larger (training noise).
 
+The trainer's collapse guard (nca.train) rolls a run back to best.pt: the block counts the rollbacks and the
+current lr scale ("rollbacks 2, lr scale 0.25"), and the lines between the restored best.pt's iteration and
+the rollback (a discarded stretch) are left out of the windows below, so a run that rolled back and
+recovered is judged on what it does since, as PROGRESS / PLATEAU / ... like any other.
+
 Then one line, VERDICT: <word> - reason, the first rule that matches:
-  DIVERGED  the trainer's "non-finite steps in a row" stop, a non-finite (or all-skipped) loss in the recent
+  COLLAPSED the trainer's {"stopped": "collapsed"}: its collapse guard ran out of rollbacks (--max-rollbacks)
+  DIVERGED  a collapse the trainer did not catch: its "non-finite steps in a row" stop, a non-finite (or all-skipped) loss in the recent
             window, the skipped-step guard firing in the recent window, or the loss more than 2x the window
             before
   FINISHED  a clean end: the trainer's last line {"stopped": "done"} (--iters reached) or {"stopped": "time"}
@@ -28,7 +34,8 @@ Then one line, VERDICT: <word> - reason, the first rule that matches:
   WARMUP    fewer than 2K quick checks so far
   PLATEAU   no metric improved beyond noise over the last 2K checks, and the loss fell less than 3%
   PROGRESS  anything else
-Exit code: 0 PROGRESS / WARMUP / FINISHED, 3 PLATEAU, 4 STALLED, 5 DIVERGED, 1 no log.jsonl to read.
+Exit code: 0 PROGRESS / WARMUP / FINISHED, 3 PLATEAU, 4 STALLED, 5 DIVERGED / COLLAPSED, 1 no log.jsonl
+to read.
 
 Stdlib only (no torch, no numpy): quick to start, and safe to run next to a training run.
 """
@@ -42,7 +49,7 @@ import sys
 import tempfile
 import time
 
-EXIT = {"PROGRESS": 0, "WARMUP": 0, "FINISHED": 0, "PLATEAU": 3, "STALLED": 4, "DIVERGED": 5}
+EXIT = {"PROGRESS": 0, "WARMUP": 0, "FINISHED": 0, "PLATEAU": 3, "STALLED": 4, "DIVERGED": 5, "COLLAPSED": 5}
 EVAL_N = 32            # nca.train.EVAL_N: boards per set per radius when a log doesn't say
 STALL_MIN_SEC = 600    # STALLED: no line for longer than this, or STALL_GAPS x the usual gap if longer
 STALL_GAPS = 5
@@ -118,16 +125,24 @@ def analyse(run_dir, window=3, now=None):
     K = max(1, window)
 
     # Records in order, a resume dropping what came after its checkpoint (those iterations ran again).
-    records, last_start, last_line = [], None, None
+    # A rollback (the trainer's collapse guard) drops the lines after the restored best.pt's iteration up to
+    # it: that stretch's model was thrown away.
+    records, last_start, last_line, rollbacks = [], None, None, []
     for si, s in enumerate(sessions):
         if s["start"] is not None:
             last_start = s["start"]
             s0 = s["start"].get("startIteration", 0) or 0
             records = [r for r in records if s0 and r["iteration"] <= s0]
+            rollbacks = [r for r in rollbacks if s0 and r["iteration"] <= s0]
             last_line = s["start"]
         for line in s["lines"]:
             last_line = line
-            if "stopped" not in line and "snapshotError" not in line:
+            if "rollback" in line:
+                rollbacks.append(line)
+                lo = line.get("restored")
+                lo = lo if isinstance(lo, int) else line["iteration"]
+                records = [r for r in records if not lo < r["iteration"] <= line["iteration"]]
+            elif "stopped" not in line and "snapshotError" not in line:
                 records.append(dict(line, _session=si))
     stop = last_line if last_line is not None and "stopped" in last_line else None
     cfg = (last_start or {}).get("config") or last_start or {}  # nested (the trainer) or flat (older, the demo)
@@ -256,7 +271,11 @@ def analyse(run_dir, window=3, now=None):
             "sessions": len(sessions), "checks": len(checks), "window": K, "evalN": eval_n, "boards": boards,
             "radii": cfg.get("R"), "recentChecks": [c[0] for c in recent], "beforeChecks": [c[0] for c in before],
             "metrics": table, "loss": loss, "nonFiniteLoss": bad_loss, "skippedRecent": fired,
-            "stopped": stop.get("stopped") if stop else None}
+            "stopped": stop.get("stopped") if stop else None, "stopReason": stop.get("reason") if stop else None,
+            "rollbacks": max(len(rollbacks), (stop or {}).get("rollbacks") or 0, (last_start or {}).get("rollbacks") or 0),
+            "lrScale": ((stop or {}).get("lrScale") or (rollbacks[-1].get("lrScale") if rollbacks else None)
+                        or (last_start or {}).get("lrScale") or 1.0),
+            "lastRollback": {k: rollbacks[-1].get(k) for k in ("iteration", "restored", "reason")} if rollbacks else None}
     info["verdict"], info["reason"] = verdict(info, K)
     info["exitCode"] = EXIT[info["verdict"]]
     return info
@@ -267,6 +286,10 @@ def verdict(info, K):
     it, target, loss, table = info["iteration"], info["target"], info["loss"], info["metrics"]
     of = f"{it}/{target}" if target else f"{it} (target unknown)"
     stopped = info["stopped"] or ""
+    if stopped == "collapsed":
+        return "COLLAPSED", (f"the trainer's collapse guard gave up at iteration {it} after {info['rollbacks']} "
+                             f"rollback(s) (lr scale {info['lrScale']:g}): {info['stopReason'] or '?'}; best.pt "
+                             "holds the best model")
     if stopped and stopped not in ("time", "done"):
         return "DIVERGED", f"the trainer stopped: {stopped} at iteration {it}"
     if info["nonFiniteLoss"]:
@@ -317,6 +340,11 @@ def render(info):
            f"iteration  {info['iteration']} / {info['target'] or '?'}{pct}   {rate}   ETA {fmt_dur(info['etaSec'])}",
            f"last line  {fmt_dur(info['ageSec'])} ago ({info['ageBasis']}; usual gap {fmt_dur(info['usualGapSec'])}, "
            f"stalled after {fmt_dur(info['stallAfterSec'])})"]
+    if info["rollbacks"]:
+        lb = info["lastRollback"] or {}
+        out.append(f"rollbacks {info['rollbacks']}, lr scale {info['lrScale']:g}"
+                   + (f"   last at it {lb['iteration']} (to best.pt of it {lb['restored']}): {lb['reason']}"
+                      if lb else ""))
     L = info["loss"]
     if L["recent"] is not None:
         line = f"loss       {L['recent']:.4g} (last {L['window']} lines, it {L['recentIters'][0]}-{L['recentIters'][1]})"
@@ -344,8 +372,9 @@ def render(info):
 # --------------------------------------------------------------------------
 
 def _synth(path, n_checks, every=200, t0=1.0e9, gap=60.0, score=lambda k: 0.5, loss=lambda i: 0.05,
-           iters=20000, timed=True, extra=None, stop=None, start_extra=None):
-    """Write a trainer-shaped log: a config line, a line per 50 iterations, a quick check every `every`."""
+           iters=20000, timed=True, extra=None, stop=None, start_extra=None, stop_extra=None):
+    """Write a trainer-shaped log: a config line, a line per 50 iterations, a quick check every `every`. extra =
+    {iteration: fields}: added to that line; its "_after" (a dict) is written as a line of its own after it."""
     lines = [{"config": {"R": [4, 5, 6], "iters": iters}, "startIteration": 0, "evalN": 32, **(start_extra or {})}]
     t = t0
     if timed:
@@ -360,14 +389,19 @@ def _synth(path, n_checks, every=200, t0=1.0e9, gap=60.0, score=lambda k: 0.5, l
             rec.update(q8={"mix": s, "bridge": s, "page": s, "none": 1 - s, "both": s, "bridgeByR": {}},
                        edit=[s, s, s], score=s, evalN=32)
             k += 1
-        rec.update((extra or {}).get(it, {}))
+        more = dict((extra or {}).get(it, {}))
+        after = more.pop("_after", None)
+        rec.update(more)
         if timed:
             t += gap
             rec["time"] = t
         lines.append(rec)
+        if after:
+            lines.append(dict(after, **({"time": t} if timed else {})))
         it += 50
     if stop:
-        lines.append({"iteration": lines[-1]["iteration"], "stopped": stop, **({"time": t + 1} if timed else {})})
+        lines.append({"iteration": lines[-1]["iteration"], "stopped": stop, **(stop_extra or {}),
+                      **({"time": t + 1} if timed else {})})
     with open(path, "w") as f:
         f.write("\n".join(json.dumps(x) for x in lines) + "\n")
     return t
@@ -419,6 +453,27 @@ def selftest():
         check(a["verdict"] == "FINISHED" and a["exitCode"] == 0, f"a --minutes stop line -> FINISHED ({a['reason']})")
         a = run("finished-iters", n_checks=10, score=rise, iters=1800, now_after=86400)
         check(a["verdict"] == "FINISHED", f"last iteration = target -> FINISHED, however old ({a['reason']})")
+
+        # The collapse guard: a run that collapsed at 1200-1400 (score 0.1, loss 4x) and was rolled back at 1400
+        # to its best.pt of 1000, then carried on improving.
+        crash = lambda k: 0.1 if k in (6, 7) else 0.2 + 0.08 * min(k, 5) + (0.03 * (k - 7) if k > 7 else 0)
+        rb = {1400: {"_after": {"iteration": 1400, "rollback": 1400, "lrScale": 0.5, "rollbacks": 1,
+                                "reason": "score 0.1000 < 0.6 x best 0.6000", "restored": 1000, "best": 0.6}}}
+        a = run("rolled-back", n_checks=14, score=crash, loss=lambda i: 0.2 if 1150 <= i <= 1400 else 0.05,
+                extra=rb)
+        check(a["verdict"] == "PROGRESS" and a["rollbacks"] == 1 and a["lrScale"] == 0.5
+              and 1200 not in a["recentChecks"] + a["beforeChecks"],
+              f"rolled back at 1400 to best.pt of 1000 and improving since -> PROGRESS, not DIVERGED; the 1050-1400 "
+              f"stretch left out ({a['reason']})")
+        check("rollbacks 1, lr scale 0.5" in render(a), "...and the block says 'rollbacks 1, lr scale 0.5'")
+        a = run("rolled-back-flat", n_checks=16, score=lambda k: 0.1 if k in (6, 7) else 0.6,
+                loss=lambda i: 0.3 if 1150 <= i <= 1400 else 0.05, extra=rb)
+        check(a["verdict"] == "PLATEAU" and a["exitCode"] == 3,
+              f"...and one flat since the rollback -> PLATEAU ({a['reason']})")
+        a = run("collapsed", n_checks=10, score=rise, stop="collapsed", now_after=7200,
+                stop_extra={"reason": "score 0.1 < 0.6 x best 0.8", "rollbacks": 6, "lrScale": 0.015625})
+        check(a["verdict"] == "COLLAPSED" and a["exitCode"] == 5,
+              f"the trainer's {{stopped: collapsed}} -> COLLAPSED, exit 5 ({a['reason']})")
 
         # An old log (no "time"): the age comes from the file's mtime, the rate from secPerIter + evalSec.
         d = os.path.join(tmp, "untimed")

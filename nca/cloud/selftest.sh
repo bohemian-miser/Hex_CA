@@ -52,7 +52,7 @@ vm vm1 "$WORK/plan1.txt"
 check "vm1 exits 0" test $? -eq 0
 check "DONE: ok, launch vm1, runs a and b done" test "$(j "$B/DONE" '(d["ok"], d["launch"], d["runs"]["a"]["state"], d["runs"]["b"]["state"])')" = "(True, 'vm1', 'done', 'done')"
 check "a-s1 ends {stopped: done} at its --iters 3" test "$(lastline "$B/runs/a-s1/log.jsonl" '(d["stopped"], d["iteration"])')" = "('done', 3)"
-check "a-s2 started --init from a-s1's ckpt.pt" test "$(head -n 1 "$B/runs/a-s2/log.jsonl" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["config"]["init"])')" = "runs/a-s1/ckpt.pt"
+check "a-s2 started --init from a-s1's best.pt (not its ckpt.pt)" test "$(head -n 1 "$B/runs/a-s2/log.jsonl" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["config"]["init"])')" = "runs/a-s1/best.pt"
 check "b-s1 started --init from the bucket's init/tiny.pt and ended by its time box" \
   test "$(head -n 1 "$B/runs/b-s1/log.jsonl" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["config"]["init"])')|$(lastline "$B/runs/b-s1/log.jsonl" 'd["stopped"]')" = "$WORK/vm1/bucket/init/tiny.pt|time"
 bad=$(find "$B/runs" -type f | grep -vE '/(log\.jsonl|pool\.npz|ckpt\.pt|best\.pt|stdout\.log)$')
@@ -158,8 +158,8 @@ out=$(bash "$HERE/launch.sh" --dry-run "$HERE/plan.example.txt" 2>&1); rc=$?
 check "launch.sh refuses: 1.5 h used + MAX_HOURS 6 > BUDGET_HOURS 6.5" test "$rc|$(echo "$out" | grep -c 'REFUSED: the ledger has 1.50')" = "1|1"
 rm -f "$LEDGER"
 out=$(bash "$HERE/launch.sh" --dry-run "$HERE/plan.example.txt" 2>&1); rc=$?
-check "launch.sh --dry-run with an empty ledger prints the create command (SPOT, DELETE, 21600s, storage-read-write, label)" \
-  test "$rc|$(echo "$out" | grep -c 'gcloud compute instances create hexca-train --project=recipe-lanes-staging .*--provisioning-model=SPOT --instance-termination-action=DELETE --max-run-duration=21600s .*--scopes=storage-read-write --labels=purpose=hexca')" = "0|1"
+check "launch.sh --dry-run with an empty ledger prints the create command (SPOT, DELETE, 21600s, storage-rw, label)" \
+  test "$rc|$(echo "$out" | grep -c 'gcloud compute instances create hexca-train --project=recipe-lanes-staging .*--provisioning-model=SPOT --instance-termination-action=DELETE --max-run-duration=21600s .*--scopes=storage-rw --labels=purpose=hexca')" = "0|1"
 printf 'x | s1 | 400 | --R 4\nY | s1 | 5 | --R 4\nz | s1 | 5 | --R 4 --resume\n' >"$WORK/badplan.txt"
 out=$(bash "$HERE/launch.sh" --dry-run "$WORK/badplan.txt" 2>&1); rc=$?
 check "launch.sh refuses a bad plan (400 min > 335, upper-case name, --resume)" \

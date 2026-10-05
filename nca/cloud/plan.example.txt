@@ -1,6 +1,7 @@
 # A plan: one training stage per line,   run-name | stage-name | minutes | nca.train args
 #   - lines with the same run-name are one run's stages, in order: a later stage starts with --init from the
-#     previous stage's ckpt.pt (unless its own args name an --init), or --resume once it has a ckpt.pt of its own
+#     previous stage's best.pt (ckpt.pt if it has none; unless its own args name an --init), or --resume once
+#     it has a ckpt.pt of its own
 #   - different run-names run at the same time, a process each, sharing the one GPU (and the 4 vCPUs:
 #     --threads defaults to 4 / number of runs)
 #   - a stage lives in runs/<run>-<stage>; names are lowercase letters, digits and '-'

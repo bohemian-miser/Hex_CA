@@ -32,7 +32,7 @@ left='' unchecked=''
 for kind in instances disks snapshots addresses images; do
   extra=()
   [ "$kind" = images ] && extra=(--no-standard-images)
-  if out=$(gc compute "$kind" list "${extra[@]}" --filter="$filter" --format='value(name)' 2>&1); then
+  if out=$(gc compute "$kind" list "${extra[@]}" --filter="$filter" --format='value(name)' 2>/dev/null); then
     [ -z "$out" ] || left="$left $kind: $(echo "$out" | tr '\n' ' ')"
   else
     unchecked="$unchecked $kind"

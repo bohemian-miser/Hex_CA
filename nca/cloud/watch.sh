@@ -9,10 +9,11 @@
 #   8  the VM is gone without DONE: deleted (Spot preemption, --max-run-duration, or down.sh)
 #   9  the VM is stopped, not deleted (it still costs its disk) -> run down.sh
 #   7  the heartbeat (status.json) is older than 10 min, or there is none 15 min after the launch
-#   5  a run is DIVERGED      4  a run is STALLED      3  a run is PLATEAU
+#   5  a run is DIVERGED or COLLAPSED (its collapse guard ran out of rollbacks)
+#   4  a run is STALLED       3  a run is PLATEAU
 #   6  a run ENDED (all its stages done, or failed) while others go on
 #   1  usage or settings error
-# WATCH_IGNORE=PLATEAU,ENDED (any of PLATEAU STALLED DIVERGED ENDED) stops those from waking you again once
+# WATCH_IGNORE=PLATEAU,ENDED (any of PLATEAU STALLED DIVERGED COLLAPSED ENDED) stops those from waking you again once
 # you have seen them. For tests: a local BUCKET skips the VM check (FAKE_VM_STATUS=RUNNING|TERMINATED|GONE).
 set -uo pipefail
 # shellcheck source-path=SCRIPTDIR source=common.sh
@@ -76,6 +77,7 @@ while :; do
       */PLATEAU) word=PLATEAU code=3 ;;
       */STALLED) word=STALLED code=4 ;;
       */DIVERGED) word=DIVERGED code=5 ;;
+      */COLLAPSED) word=COLLAPSED code=5 ;;
       *) word=$verdict code=0 ;;
     esac
     printf '  %-14s %-12s %-28s %-9s %s\n' "$run" "$r_stage" "$it" "$word" "$reason"

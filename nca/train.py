@@ -50,6 +50,25 @@ mean(edit)) at eval_mults[0]*R. --eval-n boards per set per radius (default 32, 
 RSS and the damage counts; every line has "time" (unix seconds) and "device"; a clean end adds a line
 {"stopped": "time"} (the --minutes limit) or {"stopped": "done"} (--iters reached). nca.progress reads it.
 
+COLLAPSE GUARD. Two GPU runs at a constant lr 2e-3 (runs/ga-r456, runs/gb-r456) peaked by iteration 2000-4000
+and then collapsed (score 0.86 -> 0.24, later loss 2.2): the weights grew (w1 norm 17 -> 25..33) until 75-85% of
+the hidden-channel cells sat at the clamp, where the gradient is zero. So at every log line (each 50 iterations)
+the trainer checks: the window's loss non-finite (no finite step, or over 10% of its steps skipped) or above
+--collapse-loss-x (4) times the median of the previous 10 windows since the last fresh optimiser; and at a quick
+check, the best score so far >= 0.4 and the new score below --collapse-frac (0.6) of it. Either one is a
+ROLLBACK: the weights reload from best.pt, a fresh optimiser (with its warm-up), the lr scale halves (it
+multiplies the schedule; never below --lr-floor), every pool sample restarts from the fresh state on its current
+board, a checkpoint is written, and the log gets {"iteration", "rollback": iteration, "lrScale", "rollbacks",
+"reason", "restored": best.pt's iteration, "best"}. A collapse with --max-rollbacks (6) already made ends the
+run cleanly: {"stopped": "collapsed"} (exit 0; nca.progress: COLLAPSED). best.pt only ever gets a model with a
+higher score than every earlier one of the run (its score is kept in it, and a --resume takes the higher of
+the checkpoint's and best.pt's), never one from a window whose loss tripped the guard. The lr scale, the
+rollback count and the warm-up's start are kept in ckpt.pt (--resume restores them).
+
+LR: --lr (default 5e-4: 2e-3 collapsed, see above) x 1 to 60% of --iters, x0.3 to 85%, x0.1 after, x the
+rollback scale, never below --lr-floor (1e-5); and after every fresh optimiser (iteration 0 of a fresh or --init
+run, a rollback) a linear warm-up over --warmup (100) iterations. The log's "lr" is the one the window used last.
+
 --minutes stops before an iteration that would end past the limit, counting the slowest iteration so far
 and, if one is due, the last quick check's time (kept in the checkpoint), so a chunk keeps to the limit with
 its checks. Checkpoints (atomic) to runs/<name>/ckpt.pt every 200 iterations and at a stop.
@@ -83,6 +102,7 @@ channels 2..6 replaced by F_t with probability p after each step, p linear from 
 
 import argparse
 import json
+import math
 import os
 import resource
 import time
@@ -105,6 +125,9 @@ BAND = {"fill": (0.35, 0.8), "multiRim": (0.15, 1.0), "density": (0.0, 0.45)}  #
 N_EDITS = 3     # the quick check's edit sequence: edits per board,
 EDIT_MULT = 6   # and EDIT_MULT*R steps after each
 STOP_SKIPS = 20 # non-finite steps in a row that stop the run
+LR = 5e-4      # --lr default: 2e-3 collapsed on the GPU (module docstring)
+COLLAPSE_MIN_BEST = 0.4  # the score rule of the collapse guard needs a best this good
+COLLAPSE_HISTORY = 10    # the loss rule compares with the median of this many earlier windows
 SNAP_N, SNAP_M = 48, 6  # pool.npz shows the first SNAP_N slots of each pool, the full state of the first SNAP_M
 
 
@@ -399,20 +422,69 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
     return out
 
 
-def lr_at(it: int, iters: int, lr: float) -> float:
-    """Step decay: full lr to 60%, x0.3 to 85%, x0.1 after."""
+def lr_at(it: int, iters: int, lr: float, scale: float = 1.0, floor: float = 0.0, warm_from=None,
+          warmup: int = 0) -> float:
+    """Step decay: full lr to 60%, x0.3 to 85%, x0.1 after; times `scale` (the collapse guard halves it at each
+    rollback), never below `floor`; then, `warmup` iterations from `warm_from` (a fresh optimiser; None = none),
+    a linear warm-up: x (it - warm_from + 1) / warmup."""
     f = it / max(1, iters)
-    return lr * (1.0 if f < 0.6 else 0.3 if f < 0.85 else 0.1)
+    x = max(floor, lr * scale * (1.0 if f < 0.6 else 0.3 if f < 0.85 else 0.1))
+    if warm_from is not None and warmup > 0 and 0 <= it - warm_from < warmup:
+        x *= (it - warm_from + 1) / warmup
+    return x
 
 
-def save_ckpt(path, model, opt, it, cfg, rng, pools=None, best=-1.0, eval_sec=0.0, steering=None):
-    """Atomically (a temp file, then a rename): weights, optimiser, iteration, config, rng, pools, best score,
-    the last quick check's seconds and the pools' steering. Every tensor goes in on the CPU (to_cpu), so the
-    file loads on any device."""
+def collapse_reason(score, best, frac, loss, history, skipped=0, steps=1, loss_x=4.0):
+    """Why the run counts as collapsed (a short string), or None. score: this log line's quick-check score
+    (None if there was none); best: the best score so far; loss: the window's mean loss over its finite steps
+    (None if it had none); history: the earlier windows' losses since the last fresh optimiser; skipped / steps:
+    the window's skipped (non-finite) and total steps."""
+    if loss is None or not math.isfinite(loss) or skipped > 0.1 * steps:
+        return f"loss not finite ({skipped} of {steps} steps skipped)"
+    if len(history) >= COLLAPSE_HISTORY:
+        med = float(np.median(history[-COLLAPSE_HISTORY:]))
+        if loss > loss_x * med:
+            return f"loss {loss:.4g} > {loss_x:g}x the median {med:.4g} of the previous {COLLAPSE_HISTORY} windows"
+    if score is not None and best >= COLLAPSE_MIN_BEST and score < frac * best:
+        return f"score {score:.4f} < {frac:g} x best {best:.4f}"
+    return None
+
+
+def best_score(run_dir):
+    """(score, iteration) of the model in runs/<name>/best.pt, or None without a readable one. The score is the
+    file's "best"; files from before the collapse guard have -1 there: then the log's last "best" at that
+    iteration (None if the log has none)."""
+    path = os.path.join(run_dir, "best.pt")
+    try:
+        b = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:  # noqa: BLE001 -- missing or unreadable: no best to keep
+        return None
+    score, it = b.get("best", -1.0), b.get("iteration", 0)
+    if score is None or score < 0:
+        score = None
+        try:
+            with open(os.path.join(run_dir, "log.jsonl")) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("iteration") == it and isinstance(rec.get("best"), (int, float)):
+                        score = float(rec["best"])
+        except OSError:
+            pass
+    return None if score is None else (float(score), it)
+
+
+def save_ckpt(path, model, opt, it, cfg, rng, pools=None, best=-1.0, eval_sec=0.0, steering=None, guard=None):
+    """Atomically (a temp file, then a rename): weights, optimiser, iteration, config, rng, pools, best score
+    (for best.pt: its own score), the last quick check's seconds, the pools' steering and the collapse guard's
+    state (guard = {lrScale, rollbacks, warmFrom}). Every tensor goes in on the CPU (to_cpu), so the file loads
+    on any device."""
     tmp = path + ".tmp"
     torch.save({"model": to_cpu(model.state_dict()), "opt": to_cpu(opt.state_dict()), "iteration": it,
                 "config": cfg, "rng": rng.bit_generator.state, "pool": to_cpu(pools), "best": best,
-                "evalSec": eval_sec, "steer": steering}, tmp)
+                "evalSec": eval_sec, "steer": steering, **(guard or {})}, tmp)
     os.replace(tmp, path)
 
 
@@ -503,7 +575,20 @@ def main():
     p.add_argument("--last-k", type=int, default=8, help="fill loss = mean over the last K steps")
     p.add_argument("--iters", type=int, default=None, help="total iterations, default 4000 (lr decay is relative to this)")
     p.add_argument("--batch", type=int, default=16)
-    p.add_argument("--lr", type=float, default=2e-3)
+    p.add_argument("--lr", type=float, default=None,
+                   help=f"peak learning rate (default {LR}; 2e-3 collapsed); with --resume it replaces the run's")
+    p.add_argument("--lr-floor", type=float, default=1e-5, help="the lr never goes below this (after decay and "
+                   "rollbacks; the warm-up still starts below it)")
+    p.add_argument("--warmup", type=int, default=100,
+                   help="linear lr warm-up over this many iterations after every fresh optimiser (0 = none)")
+    p.add_argument("--collapse-frac", type=float, default=0.6,
+                   help="collapse guard: roll back when a quick check scores below this share of the best so "
+                        f"far (once the best is >= {COLLAPSE_MIN_BEST})")
+    p.add_argument("--collapse-loss-x", type=float, default=4.0,
+                   help="collapse guard: roll back when a log window's loss is above this many times the median "
+                        f"of the {COLLAPSE_HISTORY} windows before it")
+    p.add_argument("--max-rollbacks", type=int, default=6,
+                   help="a collapse after this many rollbacks ends the run: {\"stopped\": \"collapsed\"}")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--hidden", type=int, default=96)
     p.add_argument("--channels", type=int, default=16)
@@ -595,6 +680,11 @@ def main():
             cfg["teach"] = [cfg["teach"][0], args.teach[1]]
         if cfg.get("teach") and abs(teach_p(start_it, cfg) - p_now) > 1e-12:  # new --iters / P1: go on from here
             cfg["teachFrom"] = [start_it, p_now]
+        if args.lr:  # a new peak lr for the rest of the run (the schedule and the rollback scale still apply)
+            cfg["lr"] = args.lr
+        for k, v in (("lrFloor", 0.0), ("warmup", 0), ("collapseFrac", args.collapse_frac),
+                     ("collapseLossX", args.collapse_loss_x), ("maxRollbacks", args.max_rollbacks)):
+            cfg.setdefault(k, v)  # older checkpoints: no floor, no warm-up (the optimiser carries on), the guard on
         if cfg.get("pool") and "damage" not in cfg:
             p.error(f"{ckpt_path} is from the old pool (edits toggled back to the board as first drawn); "
                     "start a new run, or --init from it")
@@ -619,7 +709,8 @@ def main():
             "fireRate": 1.0, "stepsMult": [a, b],
             "steps": {R: [int(round(a * R)), int(round(b * R))] for R in sorted(args.R)},
             "margin": MARGIN, "lastK": args.last_k,
-            "lr": args.lr, "batch": args.batch, "iters": args.iters or 4000, "seed": args.seed,
+            "lr": args.lr or LR, "lrFloor": args.lr_floor, "warmup": args.warmup, "collapseFrac": args.collapse_frac,
+            "collapseLossX": args.collapse_loss_x, "maxRollbacks": args.max_rollbacks, "batch": args.batch, "iters": args.iters or 4000, "seed": args.seed,
             "bridgeFrac": args.bridge_frac, "pool": args.pool, "poolSize": args.pool_size,
             "damage": args.damage if args.pool else None, "damageKinds": list(DAMAGE_KINDS) if args.pool else None,
             "init": args.init,
@@ -663,6 +754,13 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
     if ckpt:
         opt.load_state_dict(ckpt["opt"])
+    # The collapse guard's state (module docstring): kept in ckpt.pt; a fresh or --init run warms up from 0.
+    lr_scale = ckpt.get("lrScale", 1.0) if ckpt else 1.0
+    rollbacks = ckpt.get("rollbacks", 0) if ckpt else 0
+    warm_from = ckpt.get("warmFrom") if ckpt else 0
+    guard = lambda: {"lrScale": lr_scale, "rollbacks": rollbacks, "warmFrom": warm_from}
+    lr_of = lambda i: lr_at(i, cfg["iters"], cfg["lr"], lr_scale, cfg.get("lrFloor", 0.0), warm_from,
+                            cfg.get("warmup", 0))
 
     held = heldout(radii, consts, eval_n, device)
     eseq = {R: edit_sequence(R, consts[R], eval_n, device=device) for R in radii}
@@ -682,7 +780,8 @@ def main():
     start = {"config": cfg, "startIteration": start_it,
              "editChanged": [round(float(np.mean([e[3][k] for e in eseq.values()])), 3) for k in range(N_EDITS)],
              "editHold": [round(float(np.mean([e[4][k] for e in eseq.values()])), 3) for k in range(N_EDITS)],
-             "evalN": eval_n, "threads": torch.get_num_threads(), "torch": torch.__version__}
+             "evalN": eval_n, "threads": torch.get_num_threads(), "torch": torch.__version__,
+             "lrScale": lr_scale, "rollbacks": rollbacks}
     if device.type == "cuda":
         start["gpu"] = torch.cuda.get_device_name(device)
     if use_aux:
@@ -732,6 +831,10 @@ def main():
                 emit({"iteration": it, "snapshotError": repr(e)})
 
     best = ckpt.get("best", -1.0) if ckpt else -1.0
+    best_path = os.path.join(run_dir, "best.pt")
+    on_disk = best_score(run_dir) if ckpt else None
+    if on_disk and on_disk[0] > best:  # best.pt can be newer than ckpt.pt: never overwrite it with a worse model
+        best = on_disk[0]
     # --minutes: stop BEFORE an iteration that (with the slowest iteration seen so far, plus the last quick
     # check's time if one is due after it) would end past the limit -- so the quick check keeps to it too.
     eval_sec = ckpt.get("evalSec", 0.0) if ckpt else 0.0
@@ -742,19 +845,21 @@ def main():
         if pools:
             rec["pool"] = {R: pool_stats(P["walls"], P["fill"], R) for R, P in pools.items()}
         best = rec["best"] = rec["score"]
-        save_ckpt(os.path.join(run_dir, "best.pt"), model, opt, 0, cfg, rng, eval_sec=eval_sec)
+        save_ckpt(best_path, model, opt, 0, cfg, rng, best=best, eval_sec=eval_sec)
         emit(rec)
 
     t_win, losses, parts, taught = time.time(), [], [], []
     kinds = dict.fromkeys(DAMAGE_KINDS, 0)
     skipped = skip_run = 0
+    win_skipped, win_steps, history = 0, 0, []  # the collapse guard's loss windows (since the last fresh optimiser)
+    collapsed = False
     slowest = 0.0
     it = start_it
     while it < cfg["iters"]:
         due = (it + 1) % args.eval_every == 0 or it + 1 == cfg["iters"]
         if args.minutes and time.time() - t_start + slowest + (eval_sec if due else 0) > 60 * args.minutes:
             if it > start_it:
-                save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering)
+                save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering, guard())
                 snapshot(it)
             # a clean end of this chunk (or time-boxed stage), in the log too: nca.progress reads it as FINISHED
             emit({"stopped": "time", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2),
@@ -847,18 +952,19 @@ def main():
                 if prm.grad is not None:
                     prm.grad /= prm.grad.norm() + 1e-8
             for g in opt.param_groups:
-                g["lr"] = lr_at(it, cfg["iters"], cfg["lr"])
+                g["lr"] = lr_of(it)
             opt.step()
             model.restore_floods()  # spec v6: a no-op unless something besides the (masked) gradient moved them
             losses.append(loss.item())
             if use_aux:
                 parts.append((loss_fill.item(), acc_aux.mean().item()))
         else:  # no step; the batch's boards start over from the fresh state
-            skipped, skip_run = skipped + 1, skip_run + 1
+            skipped, skip_run, win_skipped = skipped + 1, skip_run + 1, win_skipped + 1
             state = fresh_state(walls, cfg["channels"])
             if cfg["pool"]:
                 P["born"][idx], P["edits"][idx], P["last"][idx] = it, 0, -1
         it += 1
+        win_steps += 1
         taught.append(n_taught / (B * max(1, T - 1)))
         slowest = max(slowest, time.time() - t_it)  # the iteration alone (no quick check, no checkpoint)
 
@@ -876,7 +982,7 @@ def main():
         if it % 50 == 0 or it == cfg["iters"]:
             rec = {"iteration": it, "loss": float(np.mean(losses)) if losses else None,
                    "secPerIter": (time.time() - t_win) / max(1, len(taught)),
-                   "lr": lr_at(it - 1, cfg["iters"], cfg["lr"]),
+                   "lr": lr_of(it - 1),
                    "maxRssMB": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024}
             if parts:
                 rec["lossFill"], rec["lossAux"] = (float(x) for x in np.mean(parts, 0))
@@ -891,22 +997,54 @@ def main():
                 steering = {R: steer(s) for R, s in rec["pool"].items()}
                 if any(s["why"] for s in steering.values()):
                     rec["steer"] = {R: s for R, s in steering.items() if s["why"]}
+            # The collapse guard (module docstring): the loss rule first, so a window that trips it never
+            # makes a best.pt; then the score rule at a quick check.
+            why = collapse_reason(None, best, cfg["collapseFrac"], rec["loss"], history, win_skipped, win_steps,
+                                  cfg["collapseLossX"])
             if it % args.eval_every == 0 or it == cfg["iters"]:
                 t_eval = time.time()
                 rec.update(check())
                 eval_sec = rec["evalSec"] = round(time.time() - t_eval, 1)
-                if rec["score"] > best:  # training swings: keep the best quick check too
+                if rec["score"] > best and not why:  # training swings: keep the best quick check too
                     best = rec["best"] = rec["score"]
-                    save_ckpt(os.path.join(run_dir, "best.pt"), model, opt, it, cfg, rng, eval_sec=eval_sec)
+                    save_ckpt(best_path, model, opt, it, cfg, rng, best=best, eval_sec=eval_sec)
+                why = why or collapse_reason(rec["score"], best, cfg["collapseFrac"], 0.0, [], 0, 1)
             emit(rec)
+            if rec["loss"] is not None and math.isfinite(rec["loss"]):
+                history.append(rec["loss"])
             t_win, losses, parts, taught = time.time(), [], [], []
             kinds = dict.fromkeys(DAMAGE_KINDS, 0)
+            win_skipped = win_steps = 0
+            if why:
+                back = best_score(run_dir)
+                if rollbacks >= cfg["maxRollbacks"] or back is None:
+                    save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering, guard())
+                    emit({"iteration": it, "stopped": "collapsed", "reason": why, "rollbacks": rollbacks,
+                          "lrScale": lr_scale, "best": best,
+                          **({} if back else {"note": "no readable best.pt to roll back to"})})
+                    collapsed = True
+                    break
+                # Roll back: best.pt's weights, a fresh optimiser (warming up), half the lr, fresh pool states.
+                b = torch.load(best_path, map_location="cpu", weights_only=False)
+                model.load_state_dict(b["model"])
+                model.restore_floods()
+                opt = torch.optim.Adam(model.parameters(), lr=cfg["lr"])
+                lr_scale, rollbacks, warm_from, history = lr_scale / 2, rollbacks + 1, it, []
+                if pools:
+                    for P in pools.values():
+                        P["state"] = fresh_state(to_t(P["walls"], device), cfg["channels"])
+                        P["born"][:], P["edits"][:], P["last"][:], P["loss"][:] = it, 0, -1, np.nan
+                emit({"iteration": it, "rollback": it, "lrScale": lr_scale, "rollbacks": rollbacks, "reason": why,
+                      "restored": back[1], "best": best})
+                save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering, guard())
+                snapshot(it)
+                continue
         if it % max(1, args.ckpt_every) == 0 or it == cfg["iters"]:
-            save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering)
+            save_ckpt(ckpt_path, model, opt, it, cfg, rng, pools, best, eval_sec, steering, guard())
             snapshot(it)
         elif args.snap_every and it % args.snap_every == 0:
             snapshot(it)
-    if it >= cfg["iters"]:  # the run reached its target: a clean end, in the log (nca.progress: FINISHED)
+    if it >= cfg["iters"] and not collapsed:  # the run reached its target: a clean end, in the log (nca.progress: FINISHED)
         emit({"stopped": "done", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2)})
     log.close()
 

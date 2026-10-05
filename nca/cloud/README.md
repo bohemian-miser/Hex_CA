@@ -79,13 +79,15 @@ Prices for us-central1, checked 2026-10-05 (Spot prices move daily):
 One stage per line, `run-name | stage-name | minutes | nca.train args` (see `plan.example.txt`):
 
 - the same run-name: stages one after another, in `runs/<run>-<stage>`; a later stage starts with `--init`
-  from the previous stage's `ckpt.pt` unless it names its own `--init`; `bucket:PATH` is fetched first;
+  from the previous stage's `best.pt` (its best quick check; `ckpt.pt` only if there is none) unless it
+  names its own `--init`; `bucket:PATH` is fetched first;
 - different run-names: in parallel, a process each on the one GPU (`--threads` = 4 / runs unless given);
 - minutes: the stage's time box (`--minutes`). Each run's total + `SETUP_MIN` (25) must fit in `MAX_HOURS`.
   The lr decays at 60% and 85% of `--iters`, so choose `--iters` that the minutes reach;
 - don't pass `--name`, `--resume`, `--minutes` or `--device`;
 - on a relaunch (after a preemption) the VM pulls `runs/` from the bucket: a stage that ended
-  (`{"stopped": "done"}`, or its time box used) is skipped, one that was cut off resumes from its
+  (`{"stopped": "done"}`, `{"stopped": "collapsed"}` = the trainer's collapse guard ran out of rollbacks,
+  or its time box used) is skipped, one that was cut off resumes from its
   `ckpt.pt` with the minutes it has left. So stage names already in the bucket count as done: use new names
   for new work.
 

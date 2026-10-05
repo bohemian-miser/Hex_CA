@@ -11,10 +11,12 @@
 #   4. the PLAN (metadata "plan"), one stage per line:   run-name | stage-name | minutes | train args
 #      Different run-names run IN PARALLEL (a process each, sharing the GPU); a run's stages one after
 #      another, each in runs/<run>-<stage> with --minutes = what is left of its minutes: --resume if its
-#      ckpt.pt exists, else --init from the previous stage's ckpt.pt (unless its args name an --init; an
-#      arg bucket:PATH is fetched from the bucket first, e.g. --init bucket:init/pure-a.pt). A stage whose
-#      log ended {"stopped": "done"}, or {"stopped": "time"} with under 2 of its minutes left, is skipped (so
-#      a finished stage dir of the same name already in the bucket counts as done; a preempted one resumes).
+#      ckpt.pt exists, else --init from the previous stage's best.pt (its best quick check; ckpt.pt only if
+#      it has no best.pt), unless its args name an --init (an arg bucket:PATH is fetched from the bucket
+#      first, e.g. --init bucket:init/pure-a.pt). A stage whose log ended {"stopped": "done"} or
+#      {"stopped": "collapsed"} (the trainer's collapse guard ran out of rollbacks: the next stage starts
+#      from its best.pt), or {"stopped": "time"} with under 2 of its minutes left, is skipped (so a finished
+#      stage dir of the same name already in the bucket counts as done; a preempted one resumes).
 #      A stage that fails ends its run.
 #   5. a sidecar, every 60 s: the whitelisted run files (log.jsonl pool.npz ckpt.pt best.pt stdout.log)
 #      to $BUCKET/runs/, status.json (the heartbeat), the tail of this log, and the static dashboard to
@@ -117,16 +119,19 @@ run_stages() {  # run_stages RUN THREADS: the run's stages, in order
     done
     read -r stopped used verdict < <(progress "$dir")
     left=$(awk -v m="$minutes" -v u="$used" 'BEGIN { l = m - u; printf "%.2f", (l > 0 ? l : 0) }')
-    # done: its --iters reached; time: its time box ran out (a remainder under 2 min isn't worth a restart);
-    # no stop line (preempted mid-stage): resume with whatever is left
-    if [ "$stopped" = "done" ] || awk -v s="$stopped" -v l="$left" 'BEGIN { exit !(l < 0.2 || (s == "time" && l < 2)) }'; then
+    # done: its --iters reached; collapsed: out of rollbacks (best.pt carries on); time: its time box ran out
+    # (a remainder under 2 min isn't worth a restart); no stop line (preempted mid-stage): resume with what is left
+    if [ "$stopped" = "done" ] || [ "$stopped" = "collapsed" ] || awk -v s="$stopped" -v l="$left" 'BEGIN { exit !(l < 0.2 || (s == "time" && l < 2)) }'; then
       log "$dir: already ended ($stopped, $used of $minutes min used, $verdict): next stage"
       prev=$dir
       continue
     fi
     mode=()
     if [ -f "$CODE/runs/$dir/ckpt.pt" ]; then mode=(--resume)
-    elif [[ " ${argv[*]} " != *" --init "* ]] && [ -n "$prev" ]; then mode=(--init "runs/$prev/ckpt.pt"); fi
+    elif [[ " ${argv[*]} " != *" --init "* ]] && [ -n "$prev" ]; then
+      # the previous stage's best model, not its last one (a stage can end past its best, or collapsed)
+      if [ -f "$CODE/runs/$prev/best.pt" ]; then mode=(--init "runs/$prev/best.pt"); else mode=(--init "runs/$prev/ckpt.pt"); fi
+    fi
     [[ " ${argv[*]} " == *" --threads "* ]] || argv+=(--threads "$threads")
     set_state "$run" "$stage" "$i" "$n" running
     mkdir -p "$CODE/runs/$dir"

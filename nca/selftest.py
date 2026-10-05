@@ -329,6 +329,7 @@ def main() -> None:
     pool_stat_checks()
     device_checks()
     snapshot_checks()
+    collapse_checks()
     progress_checks()
     print("\nALL OK")
 
@@ -616,6 +617,116 @@ def device_checks() -> None:
                                           for v in s.values())
     check(len(seen) == n and type(sd["model"]) is type(model.state_dict()) and hasattr(sd["model"], "_metadata"),
           f"to_cpu (what save_ckpt writes) moves every tensor of the weights, optimiser and pools ({n})")
+
+
+def collapse_checks() -> None:
+    """The collapse guard and the lr schedule (nca.train). collapse_reason and lr_at on their own, then a forced
+    collapse: a tiny pool run in-process with the quick check's scores scripted (quick_eval / edit_eval patched)
+    0.7, 0.8, 0.3 at iterations 0, 50, 100 (--iters 100): a rollback to best.pt of 50, lr scale 0.5, ckpt.pt =
+    best.pt's weights; then --resume to 300 with 0.75, 0.2, 0.1: the scale comes back, a second rollback, then
+    {stopped: collapsed} (--max-rollbacks 2). best.pt stays the one of iteration 50 throughout."""
+    import contextlib
+    import hashlib
+    import io
+    import json
+    import os
+    import sys
+    import tempfile
+
+    import torch
+
+    from . import train
+    from .progress import analyse
+    from .train import collapse_reason, lr_at
+
+    print("\n-- the collapse guard --")
+    hist = [0.03] * 10
+    check(collapse_reason(None, 0.8, 0.6, 0.05, hist) is None and collapse_reason(0.5, 0.8, 0.6, 0.03, hist) is None,
+          "collapse_reason: loss 1.7x the median, or a score 0.62 of the best -> no collapse")
+    check("4x the median" in (collapse_reason(None, 0.8, 0.6, 0.13, hist) or "")
+          and collapse_reason(None, 0.8, 0.6, 0.13, hist[:9]) is None,
+          "...a loss 4.3x the median of the 10 windows before -> collapse (with 9 windows: not yet)")
+    check("not finite" in (collapse_reason(None, 0.8, 0.6, float("nan"), []) or "")
+          and "not finite" in (collapse_reason(None, 0.8, 0.6, None, []) or "")
+          and "not finite" in (collapse_reason(None, 0.8, 0.6, 0.03, [], skipped=6, steps=50) or ""),
+          "...a non-finite window loss, none at all, or over 10% of its steps skipped -> collapse")
+    check("score" in (collapse_reason(0.47, 0.8, 0.6, 0.03, hist) or "")
+          and collapse_reason(0.1, 0.39, 0.6, 0.03, hist) is None,
+          "...a score below 0.6 x best -> collapse, but only once the best is >= 0.4")
+    check(lr_at(0, 1000, 1e-3) == 1e-3 and abs(lr_at(700, 1000, 1e-3) - 3e-4) < 1e-12
+          and abs(lr_at(900, 1000, 1e-3) - 1e-4) < 1e-12,
+          "lr_at: the step decay as before (x1, x0.3 from 60%, x0.1 from 85%)")
+    check(abs(lr_at(0, 1000, 1e-3, warm_from=0, warmup=100) - 1e-5) < 1e-15
+          and abs(lr_at(149, 1000, 1e-3, 0.5, warm_from=100, warmup=100) - 2.5e-4) < 1e-12
+          and lr_at(200, 1000, 1e-3, 0.5, warm_from=100, warmup=100) == 5e-4
+          and lr_at(900, 1000, 1e-3, 1 / 64, floor=1e-5) == 1e-5,
+          "...x the rollback scale, a linear warm-up from a fresh optimiser, never below the floor")
+
+    scores = iter([0.7, 0.8, 0.3, 0.75, 0.2, 0.1])
+    seen = {}
+
+    def fake_quick(model, held, mults, **kw):
+        s = next(scores)
+        seen.setdefault("calls", []).append(s)
+        if s == 0.3:  # the check that collapses: best.pt as it is now
+            with open("runs/col/best.pt", "rb") as f:
+                seen["bestHash"] = hashlib.sha256(f.read()).hexdigest()
+        return {m: {"mix": s, "bridge": s, "page": s, "none": 0.0, "both": 0.0, "gap": 0.0, "bridgeByR": {}}
+                for m in mults}
+
+    def fake_edit(model, eseq, settle_mult):
+        s = seen["calls"][-1]
+        return {"edit": [s, s, s], "editByR": {}}
+
+    base = ["nca.train", "--name", "col", "--R", "3", "--batch", "4", "--pool-size", "16", "--hidden", "16",
+            "--eval-mults", "1", "--eval-every", "50", "--snap-every", "0", "--threads", "1", "--device", "cpu",
+            "--max-rollbacks", "2"]
+    real = train.quick_eval, train.edit_eval, os.getcwd(), sys.argv, torch.get_num_threads()
+    load = lambda p: torch.load(p, map_location="cpu", weights_only=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            train.quick_eval, train.edit_eval = fake_quick, fake_edit
+            os.chdir(tmp)
+            with contextlib.redirect_stdout(io.StringIO()):
+                sys.argv = base + ["--iters", "100"]
+                train.main()
+                a_ckpt, a_best = load("runs/col/ckpt.pt"), load("runs/col/best.pt")
+                sys.argv = base + ["--iters", "300", "--resume"]
+                train.main()
+            with open("runs/col/log.jsonl") as f:
+                lines = [json.loads(x) for x in f]
+            with open("runs/col/best.pt", "rb") as f:
+                end_hash = hashlib.sha256(f.read()).hexdigest()
+            end_best = load("runs/col/best.pt")
+            info = analyse("runs/col")
+        finally:
+            train.quick_eval, train.edit_eval = real[0], real[1]
+            os.chdir(real[2])
+            sys.argv = real[3]
+            torch.set_num_threads(real[4])
+    rb = [x for x in lines if "rollback" in x]
+    check(len(rb) == 2 and [x["iteration"] for x in rb] == [100, 200] and [x["lrScale"] for x in rb] == [0.5, 0.25]
+          and all(x["restored"] == 50 and "score" in x["reason"] for x in rb),
+          f"forced collapse: rollbacks at 100 and 200 (score 0.3, 0.2 < 0.6 x best 0.8), each to best.pt of 50, the "
+          f"lr scale 0.5 then 0.25 ({rb[0]['reason'] if rb else 'none'})")
+    check(a_ckpt["lrScale"] == 0.5 and a_ckpt["rollbacks"] == 1 and a_ckpt["warmFrom"] == 100
+          and all(torch.equal(a_ckpt["model"][k], a_best["model"][k]) for k in a_best["model"]),
+          "...the checkpoint written at the rollback has best.pt's weights, lrScale 0.5, rollbacks 1, warmFrom 100")
+    starts = [x for x in lines if "config" in x]
+    w150 = next(x for x in lines if x.get("iteration") == 150 and "loss" in x)
+    check(len(starts) == 2 and starts[1]["lrScale"] == 0.5 and starts[1]["rollbacks"] == 1
+          and abs(w150["lr"] - 5e-4 * 0.5 * 0.5) < 1e-12,
+          "...--resume keeps the scale: its start line says lrScale 0.5, rollbacks 1, and iteration 149 runs at "
+          f"5e-4 x 0.5 x warm-up 0.5 = {w150['lr']:.3g}")
+    check(lines[-1].get("stopped") == "collapsed" and lines[-1]["iteration"] == 250 and lines[-1]["rollbacks"] == 2
+          and not any(x.get("stopped") == "done" and x["iteration"] > 100 for x in lines),
+          "...a third collapse with --max-rollbacks 2 ends the run cleanly: {stopped: collapsed} at 250")
+    check(end_best["iteration"] == 50 and end_best["best"] == 0.8 and end_hash == seen.get("bestHash"),
+          "...best.pt is the one of iteration 50 (score 0.8 kept in it), byte-identical from before the first "
+          "rollback to the end")
+    check(info["verdict"] == "COLLAPSED" and info["exitCode"] == 5 and info["rollbacks"] == 2
+          and info["lrScale"] == 0.25,
+          f"...nca.progress: COLLAPSED (exit 5), rollbacks 2, lr scale 0.25 ({info['reason']})")
 
 
 def progress_checks() -> None:
