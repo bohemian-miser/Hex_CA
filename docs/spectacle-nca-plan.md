@@ -131,7 +131,7 @@ Notes on M1: with the tap held constant the strand is a fixed point (like a seed
 "the whole pattern" (M1b without a tap) is the chord input itself plus the closed flag, which is why
 the closed flag is the content of "recreate the patterns". Counting (measured with Spectacle's
 `validEdgeSubsets` / `nonCrossingForTile`): hex clean rules per subset 15: 4, 128: 32, 258: 64,
-01346: 8, 03456: 16, 023468: 320, 01234568: 1,953,125. The infinite-line rule (its matching deliberately not written here) is one
+01346: 8, 03456: 16, 023468: 320, 01234568: 1,953,125. The infinite-line rule `128·010100000` is one
 of the 100 and is a legitimate training case (the owner's call stands: finding it should pay).
 
 ## 5. Mechanics: local, regional, global
