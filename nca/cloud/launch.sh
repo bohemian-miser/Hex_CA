@@ -84,7 +84,7 @@ cmd_for() {  # cmd_for ZONE: the create command, in the array cmd
   cmd=(gcloud compute instances create "$VM" --project="$PROJECT" --zone="$1" --machine-type="$MACHINE"
     --provisioning-model=SPOT --instance-termination-action=DELETE --max-run-duration="${secs}s"
     --maintenance-policy=TERMINATE
-    --image-family=ubuntu-2404-lts-amd64 --image-project=ubuntu-os-cloud
+    --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT"
     --boot-disk-size=50GB --boot-disk-type=pd-balanced
     --service-account="$SA" --scopes=storage-read-write
     --labels="$LABEL,launch=$launch,commit=${commit:0:12}"

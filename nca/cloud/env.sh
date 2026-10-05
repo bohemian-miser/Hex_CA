@@ -18,3 +18,8 @@ BUDGET_HOURS=${BUDGET_HOURS:-6.5}  # launch.sh refuses if the ledger's VM hours 
 SETUP_MIN=${SETUP_MIN:-25}         # boot + driver install (and its reboot) + venv + clone, before training
 REPO=${REPO:-https://github.com/bohemian-miser/Hex_CA.git}  # the VM clones this, at the launched commit
 TORCH=${TORCH:-torch}  # pip args for the VM's torch, e.g. "torch==2.8.0 --index-url https://download.pytorch.org/whl/cu126" (no commas: it travels in --metadata)
+# Boot image. The Deep Learning VM "common" image has the NVIDIA driver preinstalled, which saves the driver
+# install and its reboot (startup.sh installs the driver only when nvidia-smi is missing). Plain Ubuntu also works:
+#   IMAGE_FAMILY=ubuntu-2404-lts-amd64 IMAGE_PROJECT=ubuntu-os-cloud
+IMAGE_FAMILY=${IMAGE_FAMILY:-common-cu129-ubuntu-2404-nvidia-580}
+IMAGE_PROJECT=${IMAGE_PROJECT:-deeplearning-platform-release}
