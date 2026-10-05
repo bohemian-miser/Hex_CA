@@ -742,6 +742,9 @@ PAGE_HTML = r"""<!doctype html>
   --accent: #0f7a66; --wall: #2c3631; --empty: #e4e9e4; --bad: #c0392b; --good: #1f8a4c;
   --amber: #b8860b; --mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
   --body: -apple-system, system-ui, "Segoe UI", sans-serif;
+  /* board/small-multiple thumbnail size: the "size" control (next to sort) swaps these via JS,
+     default here is "m" so the first paint (before JS runs) already matches it -- no flash. */
+  --board-w: 224px; --board-h: 172px; --detail-min: 192px; --detail-h: 172px;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -799,10 +802,10 @@ details.cfg pre { font: 12px var(--mono); white-space: pre-wrap; word-break: bre
 .controls label { display: flex; align-items: center; gap: 5px; color: var(--muted); }
 .grid { display: flex; flex-wrap: wrap; gap: 6px; }
 .board-wrap { background: var(--panel); border: 1px solid var(--hair); border-radius: 5px; padding: 4px;
-  width: 112px; }
+  width: var(--board-w); max-width: 100%; }
 .board-wrap.highlight { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .board-wrap.clickable canvas { cursor: pointer; }
-.board-wrap canvas { display: block; width: 100%; height: 86px; background: var(--empty); border-radius: 3px; }
+.board-wrap canvas { display: block; width: 100%; height: var(--board-h); background: var(--empty); border-radius: 3px; }
 .cap { font: 10px/1.3 var(--mono); color: var(--muted); margin-top: 3px; display: flex; justify-content: space-between; gap: 4px; }
 .cap .dmg { padding: 0 4px; border-radius: 3px; background: var(--hair); color: var(--fg); }
 .cap .state-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
@@ -815,9 +818,9 @@ details.cfg pre { font: 12px var(--mono); white-space: pre-wrap; word-break: bre
 .detail-panel h3 { margin: 0 0 8px; font-size: 14px; }
 .detail-panel button.close { position: absolute; top: 8px; right: 10px; border: none; background: none;
   font-size: 18px; cursor: pointer; color: var(--muted); }
-.detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 8px; }
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(var(--detail-min), 1fr)); gap: 8px; }
 .detail-cell { text-align: center; }
-.detail-cell canvas { width: 100%; height: 86px; background: var(--empty); border-radius: 3px; }
+.detail-cell canvas { width: 100%; height: var(--detail-h); background: var(--empty); border-radius: 3px; }
 .detail-cell .lbl { font: 10px var(--mono); color: var(--muted); margin-top: 2px; }
 footer { color: var(--muted); font-size: 11px; margin-top: 20px; }
 </style>
@@ -935,11 +938,47 @@ var state = {
   hiddenPoolStats: Object.create(null),
   sortMode: "pool",
   showTarget: false,
+  boardSize: "m",
 };
 
 var boardDom = Object.create(null); // "<R>:<idx>" -> {wrap, canvas}
 var currentGridRun = null;
 var currentGridRadii = null;
+
+// ---- thumbnail size: pool boards and the channel-detail small multiples share one "size"
+//      control (next to sort), remembered in localStorage. Changing it only touches CSS custom
+//      properties (the hex geometry itself is resolution-independent, drawBoard reads the
+//      canvas's own CSS box each time), then asks the pool to redraw at the new box size.
+var BOARD_SIZES = {
+  s: { w: 112, h: 86, detailMin: 96, detailH: 86 },     // the original size
+  m: { w: 224, h: 172, detailMin: 192, detailH: 172 },  // default: ~2x the original
+  l: { w: 320, h: 246, detailMin: 272, detailH: 246 },
+};
+var BOARD_SIZE_KEY = "ncaDash.boardSize";
+function loadBoardSize() {
+  try {
+    var v = localStorage.getItem(BOARD_SIZE_KEY);
+    if (v && BOARD_SIZES[v]) return v;
+  } catch (e) { /* no storage (private mode, etc): fall back to the default */ }
+  return "m";
+}
+function applyBoardSize(size) {
+  var p = BOARD_SIZES[size] || BOARD_SIZES.m;
+  var root = document.documentElement.style;
+  root.setProperty("--board-w", p.w + "px");
+  root.setProperty("--board-h", p.h + "px");
+  root.setProperty("--detail-min", p.detailMin + "px");
+  root.setProperty("--detail-h", p.detailH + "px");
+}
+function setBoardSize(size) {
+  if (!BOARD_SIZES[size]) size = "m";
+  state.boardSize = size;
+  applyBoardSize(size);
+  try { localStorage.setItem(BOARD_SIZE_KEY, size); } catch (e) { /* best-effort */ }
+  if (state.pool) renderPool(state.pool);
+}
+state.boardSize = loadBoardSize();
+applyBoardSize(state.boardSize);
 
 // ---- header -----------------------------------------------------------------------------------
 function fmtDuration(sec) {
@@ -1283,7 +1322,9 @@ function hexLayout(R, boxW, boxH) {
     }
   }
   var pad = 2;
-  var size = Math.min((boxW - 2 * pad) / (maxX - minX), (boxH - 2 * pad) / (maxY - minY));
+  // clamp >= 0: a box read mid-reflow (e.g. a wrap still settling into its new --board-w) can
+  // come in smaller than 2*pad; a negative size would feed ctx.arc() a negative radius and throw.
+  var size = Math.max(0, Math.min((boxW - 2 * pad) / (maxX - minX), (boxH - 2 * pad) / (maxY - minY)));
   var layout = { S: S, size: size, offsetX: boxW / 2 - size * (minX + maxX) / 2, offsetY: boxH / 2 - size * (minY + maxY) / 2 };
   layoutCache[key] = layout;
   return layout;
@@ -1407,10 +1448,13 @@ function ensureGrid(pool) {
   top.className = "controls";
   top.innerHTML =
     '<label>sort <select id="sortMode"><option value="pool">pool order</option><option value="loss">loss, descending</option><option value="age">age, descending</option></select></label>' +
+    '<label>size <select id="boardSizeSelect"><option value="s">S</option><option value="m">M</option><option value="l">L</option></select></label>' +
     '<label><input type="checkbox" id="showTargetToggle"> show target instead of fill</label>';
   section.appendChild(top);
   top.querySelector("#sortMode").value = state.sortMode;
   top.querySelector("#sortMode").addEventListener("change", function (e) { state.sortMode = e.target.value; renderPool(state.pool); });
+  top.querySelector("#boardSizeSelect").value = state.boardSize;
+  top.querySelector("#boardSizeSelect").addEventListener("change", function (e) { setBoardSize(e.target.value); });
   top.querySelector("#showTargetToggle").checked = state.showTarget;
   top.querySelector("#showTargetToggle").addEventListener("change", function (e) { state.showTarget = e.target.checked; renderPool(state.pool); });
 
