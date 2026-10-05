@@ -10,7 +10,7 @@
 #   - every bucket:PATH the plan names exists in the bucket.
 # Then it creates the VM in $ZONE, or in $ZONE_FALLBACKS when a zone has no Spot capacity: SPOT,
 # --instance-termination-action=DELETE, --max-run-duration=MAX_HOURS, label purpose=hexca, the bucket-only
-# service account with --scopes=storage-read-write, metadata bucket / commit / launch / repo / torch / plan,
+# service account with --scopes=storage-rw, metadata bucket / commit / launch / repo / torch / plan,
 # startup.sh as the startup-script and shutdown.sh as the shutdown-script; and adds "create" to the ledger.
 # --dry-run: the local checks only (git problems are warnings), then prints the command; nothing in the cloud.
 set -uo pipefail
@@ -86,7 +86,7 @@ cmd_for() {  # cmd_for ZONE: the create command, in the array cmd
     --maintenance-policy=TERMINATE
     --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT"
     --boot-disk-size=50GB --boot-disk-type=pd-balanced
-    --service-account="$SA" --scopes=storage-read-write
+    --service-account="$SA" --scopes=storage-rw
     --labels="$LABEL,launch=$launch,commit=${commit:0:12}"
     --metadata="bucket=$BUCKET,commit=$commit,launch=$launch,repo=$REPO,torch=$TORCH"
     --metadata-from-file="startup-script=$CLOUD_DIR/startup.sh,shutdown-script=$CLOUD_DIR/shutdown.sh,plan=$plan")
