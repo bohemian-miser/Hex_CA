@@ -21,10 +21,16 @@ so launch 6's legacy numbers stay comparable with the overnight runs.
 THE CODE (T1, 53 bits, the rule as the game states it): 8 bits "class m carries a line" for m in MAJORS =
 (0, 1, 2, 3, 4, 5, 6, 8), then per leaf type a one-hot of its digit (9 x 5).
 
-STATIC PLANES per cell (the input options of §3), all from the cell's (type, rotation, mirror sign):
-  A  16: type one-hot 9, rotation one-hot 6 (the direction local edge 0 faces), mirror (1 iff the sign is -1)
-  C  55: per direction d (6) the one-hot class (8) of the tile's edge facing d, plane d*8 + j; then the anchor
-         (6, one-hot: the direction local edge 0 faces); then mirror (1)
+STATIC PLANES per cell (the input options of §3), all from the cell's (type, rotation, mirror sign); rot is the
+board direction local edge 0 faces, theta = 2 pi rot / 6, mirror = 1 iff the sign is -1:
+  A          16: type one-hot 9, rotation one-hot 6, mirror
+  C          55: per direction d (6) the one-hot class (8) of the tile's edge facing d, plane d*8 + j; then the
+                 anchor (6, one-hot = A's rotation); then mirror
+  D          11: type one-hot 9, rot / 6 (one number in [0, 1)), mirror
+  D-cs       12: type one-hot 9, cos theta, sin theta, mirror
+  D-fourier  15: type one-hot 9, cos k theta and sin k theta for k = 1, 2, 3 without sin 3 theta (0 at every
+                 60-degree step), mirror: an invertible linear map of A's rotation one-hot (probe only)
+  E           9: type one-hot only (the local-frame design: rotation and mirror are the cell's frame, not inputs)
 A cell's local edge k faces board direction (mirror * k + rot) mod 6 (strand-data.md), so the edge facing
 d is k = mirror * (d - rot) mod 6. Off-board cells get zeros. `geo` = type * 12 + rot * 2 + (mirror < 0), -1
 off the board, indexes every per-cell table here.
@@ -46,7 +52,7 @@ MAJORS = (0, 1, 2, 3, 4, 5, 6, 8)
 N_TYPES, N_DIGITS = 9, 5
 CODE_BITS = len(MAJORS) + N_TYPES * N_DIGITS  # 53
 N_GEO = N_TYPES * 6 * 2                       # (type, rot, mirror)
-STATIC = {"a": 16, "c": 55}
+STATIC = {"a": 16, "c": 55, "d": 11, "d-cs": 12, "d-fourier": 15, "e": 9}
 SPLIT_SALT = "strand-split-v2"
 SPLIT_SALT_V1 = "strand-split-v1"
 HELDOUT_SHARE = 0.2
@@ -128,20 +134,26 @@ class RuleTable:
                                 self.lut_exit[s, t, dg, rot, mb, a] = b
                                 self.lut_exit[s, t, dg, rot, mb, b] = a
                                 self.lut_bits[s, t, dg, rot, mb] |= 1 << int(PAIR_INDEX[a, b])
-        a = np.zeros((N_GEO, STATIC["a"]), np.uint8)
-        c = np.zeros((N_GEO, STATIC["c"]), np.uint8)
+        st = {k: np.zeros((N_GEO, n), np.float32) for k, n in STATIC.items()}
         for t in range(N_TYPES):
             for rot in range(6):
+                th = 2 * np.pi * rot / 6
                 for mb, m in enumerate((1, -1)):
                     g = t * 12 + rot * 2 + mb
-                    a[g, t] = a[g, 9 + rot] = 1
-                    a[g, 15] = mb
+                    for k in st:
+                        st[k][g, t] = k != "c"  # the type one-hot (C has none: the classes stand for it)
+                    st["a"][g, 9 + rot] = 1
+                    st["a"][g, 15] = mb
                     for d in range(6):
                         k = (m * (d - rot)) % 6
-                        c[g, d * 8 + MAJORS.index(int(self.type_majors[t, k]))] = 1
-                    c[g, 48 + rot] = 1
-                    c[g, 54] = mb
-        self.static = {"a": a, "c": c}
+                        st["c"][g, d * 8 + MAJORS.index(int(self.type_majors[t, k]))] = 1
+                    st["c"][g, 48 + rot] = 1
+                    st["c"][g, 54] = mb
+                    st["d"][g, 9:] = rot / 6, mb
+                    st["d-cs"][g, 9:] = np.cos(th), np.sin(th), mb
+                    st["d-fourier"][g, 9:] = (np.cos(th), np.sin(th), np.cos(2 * th), np.sin(2 * th), np.cos(3 * th),
+                                              mb)
+        self.static = st
 
     # -- rules
     def digits_of(self, s: int, index: int) -> np.ndarray:
@@ -213,23 +225,31 @@ class RuleTable:
             self._legacy = out
         return self._legacy
 
+    def allowed(self, split: str = "train") -> list[np.ndarray]:
+        """Per subset, bool [count]: the rules of `split` ('train': neither v2 held-out nor legacy held-out;
+        'heldout': v2 held-out)."""
+        if split == "heldout":
+            return [self.held_out(s) for s in range(self.n_sub)]
+        if split != "train":
+            raise ValueError(split)
+        if getattr(self, "_train", None) is None:
+            tr = [~self.held_out(s) for s in range(self.n_sub)]
+            for s, i in self.legacy_heldout():
+                tr[s][i] = False
+            self._train = tr
+        return self._train
+
     def is_train(self, s: int, index: int) -> bool:
-        if self.held_out(s)[index]:
-            return False
-        return (s, int(index)) not in set(self.legacy_heldout())
+        return bool(self.allowed("train")[s][int(index)])
 
     def sample(self, rng: np.random.Generator, split: str = "train") -> tuple[int, np.ndarray]:
         """(s, digits): the subset uniform over the 7, then the rule uniform within it, from `split` ('train':
-        neither v2-held-out nor legacy held-out; 'heldout': v2 held-out)."""
-        legacy = set(self.legacy_heldout())
-        held = [self.held_out(s) for s in range(self.n_sub)]
+        neither v2 held-out nor legacy held-out; 'heldout': v2 held-out)."""
+        ok = self.allowed(split)
+        s = int(rng.integers(self.n_sub))  # the subset first: rejection only within it keeps the subsets uniform
         while True:
-            s = int(rng.integers(self.n_sub))
             digits = np.array([int(rng.integers(n)) for n in self.n_opt[s]], np.int64)
-            i = self.index_of(s, digits)
-            if split == "train" and not held[s][i] and (s, i) not in legacy:
-                return s, digits
-            if split == "heldout" and held[s][i]:
+            if ok[s][self.index_of(s, digits)]:
                 return s, digits
 
     # -- boards and strands
