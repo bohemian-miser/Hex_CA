@@ -461,12 +461,21 @@ def _poly_points(rng, cq, cr, s):
     return _polar(cq, cr, ang, s * rng.uniform(0.3, 1.0, k))
 
 
-def _spiral_points(rng, cq, cr, s):
-    """A spiral from distance s in towards (cq, cr), 1-2 turns: a long winding way in for the outside."""
+def _spiral_raw(rng, cq, cr, s):
+    """(points, turns, phase): a spiral from distance s in towards (cq, cr), 1-2 turns (ang = sign * t *
+    turns * 2*pi + phase, rad = s * (1 - 0.8*t), t = linspace(0, 1)): a long winding way in for the
+    outside. phase is ang's value at t=0 (the mouth's own angle), for a seal that plugs it (_spiral_wall)."""
     turns = rng.uniform(1.0, 2.0)
     t = np.linspace(0, 1, int(8 * turns) + 2)
-    ang = rng.choice((-1, 1)) * t * turns * 2 * np.pi + rng.uniform(0, 2 * np.pi)
-    return _polar(cq, cr, ang, s * (1 - 0.8 * t))
+    sign = rng.choice((-1, 1))
+    phase = rng.uniform(0, 2 * np.pi)
+    ang = sign * t * turns * 2 * np.pi + phase
+    return _polar(cq, cr, ang, s * (1 - 0.8 * t)), turns, phase
+
+
+def _spiral_points(rng, cq, cr, s):
+    """A spiral from distance s in towards (cq, cr), 1-2 turns: a long winding way in for the outside."""
+    return _spiral_raw(rng, cq, cr, s)[0]
 
 
 def _poly(rng, R, on_board, cq, cr, s):
@@ -567,6 +576,87 @@ def _walls_open(rng, R, on_board):
 
 def _walls_noise(rng, R, on_board):
     return rng.random(on_board.shape) < rng.uniform(0.03, 0.45)
+
+
+def _spiral_wall(rng, R, on_board, cq, cr, s):
+    """(curve, seal) bool [S,S]: a spiral's own hex line (the bare, open curve of _spiral_points) and the
+    short segment that plugs its mouth against its own curve one turn further in (same angle as the mouth,
+    the radius a full turn later): sealing just that closes the whole winding corridor behind it."""
+    pts, turns, phase = _spiral_raw(rng, cq, cr, s)
+    curve = _polyline(R, pts, closed=False)
+    t1 = 1.0 / turns
+    seal_pts = _polar(cq, cr, np.array([phase, phase]), np.array([s, s * (1 - 0.8 * t1)]))
+    seal = _polyline(R, seal_pts, closed=False) & ~curve
+    return curve & on_board, seal & on_board
+
+
+def _spiral_ring(R, on_board, cq, cr, s):
+    """A plain (unjittered) hexagon ring of radius ~s round (cq, cr) -- _ring's own corners, but without its
+    "nudged off true" jitter: jitter sometimes doubles a corner's wall up (two cells deep), which a single
+    knockout then fails to drain. _walls_spiral_knockout needs that to be reliable."""
+    corners = np.array([(1, 0), (1, -1), (0, -1), (-1, 0), (-1, 1), (0, 1)], float) * max(1, round(s)) + (cq, cr)
+    return _polyline(R, corners, closed=True) & on_board
+
+
+def _spiral_pick(rng, R, on_board):
+    """(curve, seal) bool [S,S]: a spiral placed like a _closed shape (a centre and radius s >= 2, sometimes
+    reaching the rim) with its closing wall: a ring well clear round the whole spiral (module docstring:
+    "the spiral sits inside a ring"), reliable at any size; or, only once the spiral is big enough that the
+    gap it plugs is more than a rounding error (s >= 5), the mouth seal against its own curve one turn in
+    instead (_spiral_wall) -- below that the "one turn in" point rounds to a cell the curve already has,
+    sealing nothing. Either way the closing wall is kept a few cells clear of the curve itself, so a single
+    knockout (_walls_spiral_knockout) drains it rather than finding a curve cell still backing up the gap."""
+    s = 2 + max(0, R - 2) * rng.random()
+    cq, cr = _offset(rng, R if rng.random() < 0.25 else max(0, int(R - s - 3)))
+    curve, mouth_seal = _spiral_wall(rng, R, on_board, cq, cr, s)
+    # The ring's own radius stays inside the placement's own margin (+3 at most): the spiral's placement
+    # already keeps cq, cr + s + 3 off the array's far edge, so the ring stays there too, rather than
+    # running off into an unrepresented gap.
+    ring_seal = _spiral_ring(R, on_board, cq, cr, s + rng.uniform(2.0, 3.0))
+    seal = mouth_seal if s >= 5 and rng.random() < 0.4 else ring_seal
+    return curve, seal
+
+
+# STEP BUDGET (measured, not enforced here). A closed spiral's enclosed corridor has no rim cell, so
+# train.py's depth-based step margin (which only looks at rim-connected depth) never stretches T for it;
+# the corridor's own graph diameter (hex steps across it, double-BFS) is what the fill signal has to
+# cross. Over 60 draws per radius: mean / p90 / max diameter was 10/16/24 at R 6, 17/33/57 at R 8,
+# 24/48/89 at R 12, 33/74/90 at R 16, 44/95/148 at R 24 -- comfortably under --steps-mult's default
+# range (3-6 x R) on average, but the tail can run past its 6R end (R 8, 12, 24 here) though still
+# inside 8R, the quick check's eval_mults[0] and the web page's SETTLE_PER_R. Turns and size are left at
+# the same range as every other kind rather than capped for this; a run leaning harder on spirals, or
+# wanting the tail reliably settled within --steps-mult, wants a higher one.
+
+
+def _walls_spiral_open(rng, R, on_board):
+    """A bare spiral, its mouth unsealed: nothing inside it is enclosed (module docstring, "open spirals";
+    like any open stroke, sometimes a dead end against the rim)."""
+    curve, _ = _spiral_pick(rng, R, on_board)
+    return curve & on_board
+
+
+def _walls_spiral_closed(rng, R, on_board):
+    """A spiral sealed shut, its mouth plugged or ringed round: the whole corridor it winds through is
+    enclosed and fills (module docstring, "closed spiral")."""
+    curve, seal = _spiral_pick(rng, R, on_board)
+    return (curve | seal) & on_board
+
+
+def _walls_spiral_knockout(rng, R, on_board):
+    """The same closed-spiral picture with one wall cell knocked out of its seal: nothing inside stays
+    enclosed -- the near-identical pair _walls_spiral_closed makes, one cell apart (module docstring)."""
+    curve, seal = _spiral_pick(rng, R, on_board)
+    return (curve | _knock_out(rng, seal.copy(), 1)) & on_board
+
+
+def _walls_spiral(rng, R, on_board):
+    """The "spiral" kind (module docstring): open, closed, or closed's knocked-out near-twin, about evenly.
+    Like every other kind it sometimes keeps the rim cells it draws (random_walls' own P_OFF_RIM), so a
+    spiral whose mouth or ring reaches the rim is sometimes left attached to it (the bridge rule then
+    applies if that splits the board)."""
+    u = rng.random()
+    fn = _walls_spiral_open if u < 0.3 else _walls_spiral_knockout if u < 0.65 else _walls_spiral_closed
+    return fn(rng, R, on_board)
 
 
 # --------------------------------------------------------------------------
@@ -719,14 +809,21 @@ _KINDS = {  # each (rng, R, on_board) -> bool [S,S] walls
     "open": _walls_open,
     "noise": _walls_noise,
     "bridge": _walls_bridge,
+    "spiral": _walls_spiral,
+    # Not in _MIX (kind=None never draws them): the pure variants _walls_spiral blends, named so
+    # evaluate.py's held-out sets and board_stats() can ask for exactly one.
+    "spiral-closed": _walls_spiral_closed,
+    "spiral-open": _walls_spiral_open,
+    "spiral-knockout": _walls_spiral_knockout,
 }
 
 # Weights for kind=None, tuned (see nca/selftest.py) so 25-30 % of boards have
 # two or more rim regions and about 0.6 have at least one filled cell.
 # "blob"/"poly"/"ring" name the first shape of 1-3; the others are drawn from
-# all three.
-_MIX = {"blob": 0.13, "poly": 0.12, "ring": 0.04, "leaky": 0.16, "messy": 0.13, "open": 0.14, "noise": 0.13,
-        "bridge": 0.15}
+# all three. "spiral" is first-class too (about a tenth to a seventh of boards):
+# a long winding corridor, closed, its knocked-out near-twin, or open.
+_MIX = {"blob": 0.12, "poly": 0.1, "ring": 0.04, "leaky": 0.14, "messy": 0.12, "open": 0.12, "noise": 0.12,
+        "bridge": 0.12, "spiral": 0.12}
 
 # Share of boards of the other kinds drawn with the rim ring left clear of walls. Every
 # kind but "bridge" walls rim cells now and then (shapes over the rim, strokes running
@@ -978,16 +1075,24 @@ def _stamp(rng, w, R, on_board, p_bridge=0.5):
     return w | new
 
 
+def _stamp_spiral(rng, w, R, on_board):
+    """w OR a freshly drawn spiral (_walls_spiral: open, closed, or closed's knocked-out near-twin), next
+    to _stamp's loop-or-bridge: a pool damage kind of its own, so live edits see spirals too."""
+    return w | _walls_spiral(rng, R, on_board)
+
+
 WALL_DAMAGE = ("edit", "burst", "erase", "stamp")
 
 
 def damage_walls(rng: np.random.Generator, walls: np.ndarray, R: int, kind: str, p_bridge: float = 0.5,
                  board=None) -> np.ndarray:
-    """uint8 [S,S]: walls after one damage of `kind` (train.py --damage kinds a-d):
-      edit   a small wall edit (edit_walls: mostly one that opens, seals or shifts something)
-      burst  n ~ U[3, 20] random additions and deletions of wall cells, mixed (_burst)
-      erase  every wall inside a random disc of radius 1-3 opened (_erase)
-      stamp  a fresh closed loop or (with probability p_bridge) a rim-to-rim bridge ORed in (_stamp)
+    """uint8 [S,S]: walls after one damage of `kind` (train.py --damage kinds a-d, plus "state" and "spiral"
+    -- producer.DAMAGE_KINDS):
+      edit    a small wall edit (edit_walls: mostly one that opens, seals or shifts something)
+      burst   n ~ U[3, 20] random additions and deletions of wall cells, mixed (_burst)
+      erase   every wall inside a random disc of radius 1-3 opened (_erase)
+      stamp   a fresh closed loop or (with probability p_bridge) a rim-to-rim bridge ORed in (_stamp)
+      spiral  a fresh spiral, open, closed or closed's knocked-out near-twin, ORed in (_stamp_spiral)
     Stays on the board (board: a ragged mask, None = the hexagon). Deterministic given rng."""
     on_board, ragged = _board(R, board)
     w = walls.astype(bool) & on_board
@@ -995,6 +1100,8 @@ def damage_walls(rng: np.random.Generator, walls: np.ndarray, R: int, kind: str,
         return edit_walls(rng, w.astype(np.uint8), R, board if ragged else None)
     if kind == "stamp":
         out = _stamp(rng, w, R, on_board, p_bridge)
+    elif kind == "spiral":
+        out = _stamp_spiral(rng, w, R, on_board)
     else:
         out = {"burst": _burst, "erase": _erase}[kind](rng, w, R, on_board)
     return (out & on_board).astype(np.uint8)

@@ -380,7 +380,7 @@ def _demo_pool_arrays(rng: np.random.Generator, R: int, n: int, m: int):
     loss = np.zeros((n,), dtype=np.float32)
     age = rng.integers(0, 600, size=n).astype(np.int32)
     edits = rng.integers(0, 9, size=n).astype(np.int32)
-    damage = rng.choice([-1, 0, 0, 1, 1, 2, 3, 4], size=n).astype(np.int8)
+    damage = rng.choice([-1, 0, 0, 1, 1, 2, 3, 4, 5], size=n).astype(np.int8)
 
     qidx0 = (np.arange(S) - R).reshape(1, S)
     ridx0 = (np.arange(S) - R).reshape(S, 1)
@@ -916,7 +916,7 @@ function colorFor(label) {
   return colorMap[label];
 }
 
-var DAMAGE_LABELS = { "-1": "none", "0": "edit", "1": "burst", "2": "erase", "3": "stamp", "4": "state" };
+var DAMAGE_LABELS = { "-1": "none", "0": "edit", "1": "burst", "2": "erase", "3": "stamp", "4": "state", "5": "spiral" };
 
 // ---- small fetch helper --------------------------------------------------------------------
 function getJSON(url) {
