@@ -114,8 +114,16 @@ run_stages() {  # run_stages RUN THREADS: the run's stages, in order
     module=nca.train   # leading "--module M": another trainer with nca.train's conventions (e.g. nca.strand.train)
     if [ "${argv[0]:-}" = --module ]; then module=${argv[1]:-} argv=("${argv[@]:2}"); fi
     [[ $module =~ ^[A-Za-z_][A-Za-z0-9_.]*$ ]] || { log "$dir: bad --module '$module'"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
-    for k in "${!argv[@]}"; do  # bucket:PATH -> a local copy of $BUCKET/PATH
+    for k in "${!argv[@]}"; do  # bucket:PATH -> a local copy of $BUCKET/PATH; gs://B/PATH -> a copy of that object
       a=${argv[$k]}
+      if [[ $a == gs://* ]]; then  # e.g. a private bucket the VM's service account may read (the run bucket is public)
+        rel=gs/${a#gs://}
+        [ -f "$W/bucket/$rel" ] || { mkdir -p "$(dirname "$W/bucket/$rel")" &&
+          gcloud storage cp --project="$PROJECT" --quiet "$a" "$W/bucket/$rel" >/dev/null; } ||
+          { log "$dir: cannot fetch $a"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
+        argv[k]=$W/bucket/$rel
+        continue
+      fi
       [[ $a == bucket:* ]] || continue
       rel=${a#bucket:}
       [ -f "$W/bucket/$rel" ] || get "$rel" "$W/bucket/$rel" || { log "$dir: cannot fetch $a"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
