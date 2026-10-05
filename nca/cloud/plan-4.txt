@@ -1,0 +1,16 @@
+# Launch 4 (2026-10-06): the review's queue (docs/nca-review.md 6), two slots on the one L4, ~3.5 h with setup.
+# Both runs start from launch 3's short-rollout model, hb-big/best.pt (hidden 256, 24 channels, 3R-6R steps,
+# trained at R 5-10 only; 0.85 bridge-exact at R 16 zero-shot). The VM adds --schedule time: the lr steps down
+# at 60% / 85% of each stage's minutes (--iters is only a cap here; the stage ends on its time box).
+#   fa: item 1 + 1b. Curriculum R 6 8 12 16 with ragged board masks in the pool (--mask-mix 0.5: blobs and crops
+#       of Spectacle's hex fields), then R 8 12 16 24 from its best.pt.
+#   fb: the same, plus item 2's near-tie bridges (--near-tie 0.5: half the new bridge boards redrawn until the
+#       two sides' area ratio is >= 0.75), in both stages: the A/B of near-tie data at every radius.
+# (No clamp/overflow or fire-rate arm: an --init inherits its clamp and there is no --fire-rate flag yet.)
+# Go / no-go at +90 min (the stage-1 ends): R 16 bridge quick >= 0.9 in either arm and R 8 >= 0.93; the quick
+# check's "ragged" >= 0.7 -> ragged boards are "just data". Then evaluate (n 200, R 6-24, 8R/16R/32R, ragged sets)
+# on the pulled best.pt files.
+fa | r6816   | 85  | --R 6 8 12 16 --steps-mult 3 6 --lr 5e-5 --lr-floor 5e-6 --batch 16 --pool-size 512 --hidden 256 --channels 24 --mask-mix 0.5 --iters 400000 --collapse-frac 0.85 --eval-every 1000 --eval-n 64 --ckpt-every 1000 --snap-every 100 --init bucket:runs/hb-big/best.pt
+fa | r81224  | 100 | --R 8 12 16 24 --steps-mult 3 6 --lr 5e-5 --lr-floor 5e-6 --batch 8 --pool-size 512 --hidden 256 --channels 24 --mask-mix 0.5 --iters 400000 --collapse-frac 0.85 --eval-every 1000 --eval-n 64 --ckpt-every 1000 --snap-every 100
+fb | r6816nt | 85  | --R 6 8 12 16 --steps-mult 3 6 --lr 5e-5 --lr-floor 5e-6 --batch 16 --pool-size 512 --hidden 256 --channels 24 --mask-mix 0.5 --near-tie 0.5 --iters 400000 --collapse-frac 0.85 --eval-every 1000 --eval-n 64 --ckpt-every 1000 --snap-every 100 --init bucket:runs/hb-big/best.pt
+fb | r81224nt | 100 | --R 8 12 16 24 --steps-mult 3 6 --lr 5e-5 --lr-floor 5e-6 --batch 8 --pool-size 512 --hidden 256 --channels 24 --mask-mix 0.5 --near-tie 0.5 --iters 400000 --collapse-frac 0.85 --eval-every 1000 --eval-n 64 --ckpt-every 1000 --snap-every 100

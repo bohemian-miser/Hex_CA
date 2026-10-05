@@ -57,7 +57,7 @@ PLATEAU_LOSS = 0.03    # PLATEAU needs the loss to have fallen less than this (3
 DIVERGE_RISE = 2.0     # DIVERGED: the recent loss window this many times the one before
 Z = 2.0                # a change is real beyond Z standard errors
 # (name, +1 if higher is better / -1 if lower is) in display order; editN come from the "edit" list
-METRICS = (("mix", 1), ("bridge", 1), ("page", 1), ("none", -1), ("both", 1), ("exact", 1))
+METRICS = (("mix", 1), ("bridge", 1), ("page", 1), ("ragged", 1), ("none", -1), ("both", 1), ("exact", 1))
 
 
 def read_log(path):
@@ -228,13 +228,15 @@ def analyse(run_dir, window=3, now=None):
             row["seScatter"] = math.sqrt(sum(spread)) if len(spread) == 2 else 0.0
             row["change"] = (row["recent"] - row["before"]) * sign.get(name, 1)  # > 0 = better
         table[name] = row
-    if "score" in table and "seBinomial" in table["score"]:  # the score is the mean of 4 shares
-        parts = [table[n]["seBinomial"] for n in ("mix", "bridge", "page") if "seBinomial" in table.get(n, {})]
+    if "score" in table and "seBinomial" in table["score"]:  # the score is the mean of 4 shares (5 with ragged)
+        n_parts = last_check.get("scoreParts", 4)
+        names_in = ("mix", "bridge", "page", "ragged") if n_parts > 4 else ("mix", "bridge", "page")
+        parts = [table[n]["seBinomial"] for n in names_in if "seBinomial" in table.get(n, {})]
         edits = [table[n]["seBinomial"] for n in table if n.startswith("edit") and "seBinomial" in table[n]]
         if edits:
             parts.append(mean(edits))  # the 3 edit steps share boards: no averaging-down assumed
         if parts:
-            table["score"]["seBinomial"] = math.sqrt(sum(x * x for x in parts)) / 4
+            table["score"]["seBinomial"] = math.sqrt(sum(x * x for x in parts)) / n_parts
     for row in table.values():
         if "change" in row:
             row["se"] = max(row["seBinomial"], row["seScatter"])

@@ -8,8 +8,10 @@ loss is the fill MSE alone.
 
 It trains from a persistent pool per radius (--pool, --pool-size boards each). Each iteration draws one
 radius R from --R and a batch of --batch boards from that pool, each with the state it was left in:
-  - the worst of the batch (loss of its stored state) starts over from the fresh state on its board;
-  - batch/8 others are replaced by brand-new boards (random_walls; --bridge-frac of them kind "bridge");
+  - batch/8 random ones are replaced by brand-new boards (random_walls; --bridge-frac of them kind "bridge",
+    --near-tie of the bridge boards drawn near a tie; --mask-mix of them on a ragged board shape, nca/masks.py,
+    the rest on the hexagon);
+  - the worst of the batch (loss of its stored state) starts over from the fresh state on its (new) board;
   - each of the rest, with probability --damage, gets ONE damage (kind drawn per board):
       edit    a small wall edit (data.edit_walls)
       burst   3-20 random wall additions and deletions, mixed
@@ -19,6 +21,11 @@ radius R from --R and a batch of --batch boards from that pool, each with the st
               1..R/2 (walls and targets unchanged)
     after a wall damage the board's targets are recomputed. Damage piles up on the pool board: nothing
     toggles back to an original.
+All the board work (new boards, damage, targets, T) is made by a PRODUCER (nca/producer.py) from its own copy
+of the pools' boards and its own rng (--producer: inline, or a thread / worker process running a few
+iterations ahead, so a GPU need not wait for it; bit-identical whichever: selftest); only the choice of the
+worst sample, which needs the model, stays on the training thread. Seeded CPU runs are reproducible (same
+seed, same everything) with --schedule iters; the stream is not the one of the trainer before the producer.
 Then T ~ U[a*R, b*R] steps run from the stored states (a, b = --steps-mult; never fewer than the batch's
 deepest rim depth + MARGIN), loss = min over each board's acceptable targets (data.targets; K_POOL kept,
 padded) of the fill MSE over on-board cells, averaged over the last --last-k steps; Adam with per-parameter
@@ -68,6 +75,15 @@ rollback count and the warm-up's start are kept in ckpt.pt (--resume restores th
 LR: --lr (default 5e-4: 2e-3 collapsed, see above) x 1 to 60% of --iters, x0.3 to 85%, x0.1 after, x the
 rollback scale, never below --lr-floor (1e-5); and after every fresh optimiser (iteration 0 of a fresh or --init
 run, a rollback) a linear warm-up over --warmup (100) iterations. The log's "lr" is the one the window used last.
+--schedule time puts the two steps at 60% / 85% of the TIME BOX instead (the --minutes of the run's or stage's
+first start, kept in the config; a --resume counts the minutes already used, elapsedSec in ckpt.pt): a box
+that cannot reach --iters still decays (nca/cloud/startup.sh passes it). The start line's "schedule" says
+which ({mode, decayAt, boxMin, usedMin} or {mode, decayAt, iters}); with time, every line has "schedFrac".
+The decay then depends on the clock, so such a run is not bit-reproducible.
+
+TIMING: every log line splits secPerIter into dataSec (the training thread's time on the board work: making
+it inline, or waiting for the producer and applying its item) and modelSec (the rest), and gives prodSec, the
+producer's own seconds per iteration wherever it ran.
 
 --minutes stops before an iteration that would end past the limit, counting the slowest iteration so far
 and, if one is due, the last quick check's time (kept in the checkpoint), so a chunk keeps to the limit with
@@ -112,16 +128,15 @@ import torch
 
 from .data import (EPS, N_AUX, WALL_DAMAGE, aux_flood, aux_targets, damage_walls, disc, pad_targets, page_loops,
                    random_walls, targets)
-from .evaluate import _bridge_board, boards, score, summarise
+from .evaluate import _bridge_board, _ragged_any, boards, score, summarise
 from .hexgrid import CONST_NAMES, mask as hex_mask, rim
 from .model import PERCEPTIONS, HexNCA, const_stack, fresh_state, load_expanded
+from .producer import (BAND, DAMAGE_KINDS, K_POOL, MARGIN, STATS_EVERY, Producer, Source, answers, data_rng,
+                       draw_boards, pool_stats, steer)
 
-MARGIN = 4      # extra steps past the deepest rim-region cell
-K_POOL = 4      # targets kept per pool board (K is 1 on ~95% of boards, 2 on ~4.5%)
 EVAL_N = 32     # held-out boards per set per radius for the quick log metric
 EVAL_SEED = 999 # same held-out boards whatever --seed is
-DAMAGE_KINDS = WALL_DAMAGE + ("state",)  # --damage kinds a-d (the walls) and e (the state)
-BAND = {"fill": (0.35, 0.8), "multiRim": (0.15, 1.0), "density": (0.0, 0.45)}  # pool_stats kept in these
+DECAY_AT = (0.6, 0.85)  # the lr steps down (x0.3, then x0.1) at these shares of --iters, or of the time box
 N_EDITS = 3     # the quick check's edit sequence: edits per board,
 EDIT_MULT = 6   # and EDIT_MULT*R steps after each
 STOP_SKIPS = 20 # non-finite steps in a row that stop the run
@@ -172,72 +187,32 @@ def model_to(model, device):
     return model
 
 
-def answers(walls, R, aux=False):
-    """(fills uint8 [K_POOL,S,S], depth, aux float32 [5,S,S] or None) of one board: its targets padded to a
-    fixed K for the pool, and (only if asked) its aux targets."""
-    f, d = targets(walls, R)
-    return pad_targets([f], K_POOL)[0], d, aux_targets(walls, R) if aux else None
-
-
-def draw(rng, R, n, bridge_frac=0.0, aux=False):
+def draw(rng, R, n, bridge_frac=0.0, aux=False, mask_mix=0.0, near_tie=0.0):
     """(walls [n,S,S], fills [n,K_POOL,S,S], depth [n,S,S], aux [n,5,S,S] or None) of n fresh boards from the
-    training mix, each drawn as kind "bridge" instead with probability bridge_frac."""
-    walls = np.stack([random_walls(rng, R, "bridge" if rng.random() < bridge_frac else None) for _ in range(n)])
-    fills, depth = zip(*(targets(w, R) for w in walls))
-    return (walls, pad_targets(fills, K_POOL), np.stack(depth),
-            np.stack([aux_targets(w, R) for w in walls]) if aux else None)
+    training mix (producer.draw_boards without the masks; with mask_mix > 0 use that for the masks too)."""
+    return draw_boards(rng, R, n, bridge_frac, aux, mask_mix, near_tie)[:4]
 
 
-def damage_state(rng, state, R):
+def damage_state(rng, state, R, board=None):
     """distill's damage, in place on ONE board's state [C,S,S]: every channel but ch0 (the walls) zeroed inside
-    a disc of radius 1..max(1, R//2) round a random on-board cell. Returns the disc (bool [S,S])."""
-    cells = np.argwhere(hex_mask(R) == 1)
+    a disc of radius 1..max(1, R//2) round a random on-board cell (board: its mask, None = the hexagon).
+    Returns the disc (bool [S,S]). (A pool run gets these from the producer: zero_disc.)"""
+    cells = np.argwhere((hex_mask(R) if board is None else board) == 1)
     row, col = cells[rng.integers(len(cells))]
-    d = disc(R, row, col, int(rng.integers(1, max(1, R // 2) + 1)))
+    return zero_disc(state, R, row, col, int(rng.integers(1, max(1, R // 2) + 1)))
+
+
+def zero_disc(state, R, row, col, rad):
+    """Every channel but ch0 of ONE board's state [C,S,S] zeroed within hex distance rad of (row, col)."""
+    d = disc(R, row, col, rad)
     state[1:, torch.from_numpy(d).to(state.device)] = 0
     return d
 
 
-def pool_stats(walls, fills, R):
-    """{fill, multiRim, density} of a pool (walls [n,S,S], fills [n,K,S,S]): the share of boards whose primary
-    target fills a cell, the share with 2+ rim regions (= the primary target fills a rim cell: with one rim
-    region no rim cell fills, with 2+ all but one rim region fill), the mean wall density on board."""
-    prim = fills[:, 0] > 0
-    return {"fill": round(float(prim.any((1, 2)).mean()), 3),
-            "multiRim": round(float(prim[:, rim(R)].any(1).mean()), 3),
-            "density": round(float(walls[:, hex_mask(R) == 1].mean()), 3)}
-
-
-def steer(stats):
-    """How a pool's damage leans, from its pool_stats: {p: probabilities over DAMAGE_KINDS, pBridge: share of
-    stamps that are bridges, newMult: new boards per batch x this, why: the stats out of BAND}. In band:
-    uniform, 0.5, 1. Out of band (each applies on top of the others):
-      fill share low       stamps x3 (a stamped loop or bridge fills something), erase and burst x0.5
-      fill share high      erase and burst x3, stamps x0.25
-      2+ rim regions low   stamps x2, and 0.9 of them bridges
-      density high         erase x3, no stamps
-    and any of them doubles the new boards."""
-    w = dict.fromkeys(DAMAGE_KINDS, 1.0)
-    p_bridge, why = 0.5, []
-    if stats["fill"] < BAND["fill"][0]:
-        w["stamp"], w["erase"], w["burst"] = 3 * w["stamp"], 0.5 * w["erase"], 0.5 * w["burst"]
-        why.append("fill low")
-    if stats["fill"] > BAND["fill"][1]:
-        w["stamp"], w["erase"], w["burst"] = 0.25 * w["stamp"], 3 * w["erase"], 3 * w["burst"]
-        why.append("fill high")
-    if stats["multiRim"] < BAND["multiRim"][0]:
-        w["stamp"], p_bridge = 2 * w["stamp"], 0.9
-        why.append("2+ rim low")
-    if stats["density"] > BAND["density"][1]:
-        w["stamp"], w["erase"] = 0.0, 3 * w["erase"]
-        why.append("density high")
-    p = np.array([w[k] for k in DAMAGE_KINDS])
-    return {"p": (p / p.sum()).round(4).tolist(), "pBridge": p_bridge, "newMult": 2 if why else 1, "why": why}
-
-
 def per_sample_loss(fill, fills, mk):
-    """[B,K] mean squared error of fill [B,1,S,S] against each target fills [B,K,S,S], on-board cells."""
-    return (((fill - fills) ** 2) * mk).flatten(2).sum(2) / mk.sum()
+    """[B,K] mean squared error of fill [B,1,S,S] against each target fills [B,K,S,S], on-board cells (mk:
+    [1,1,S,S] the hexagon, or [B,1,S,S] a mask per board; each board's error is over its own cells)."""
+    return (((fill - fills) ** 2) * mk).flatten(2).sum(2) / mk.flatten(1).sum(1, keepdim=True)
 
 
 def aux_loss(state, aux, mk):
@@ -275,17 +250,23 @@ def arc_rule(state, walls, mk):
     return (mk > 0) & (walls == 0) & (enclosed | (span < c[:, 4:5] - EPS))
 
 
-def heldout(radii, consts, n=EVAL_N, device=None):
+def heldout(radii, consts, n=EVAL_N, device=None, ragged=None):
     """{set: {R: (walls, fills, sides, consts)}}: fixed boards for the quick check, n per set per radius, mix,
-    bridge and page (the demo page's random loops, data.page_loops: never trained on). consts = {R: const stack
-    [1,n,S,S]} (mask first). Their aux floods are recomputed per check (aux_flood). A larger n keeps the first
-    EVAL_N boards of each set (the draws come in order) and adds more."""
-    out = {"mix": {}, "bridge": {}, "page": {}}
+    bridge and page (the demo page's random loops, data.page_loops: never trained on), and (ragged, default:
+    when the consts are the mask alone) "ragged": boards on ragged masks (nca/masks.py), half bridge boards
+    with 2+ rim regions, half the training mix (evaluate._ragged_any). consts = {R: const stack [1,n,S,S]}
+    (mask first); the ragged set's consts are its masks, [n,1,S,S]. Their aux floods are recomputed per check
+    (aux_flood). A larger n keeps the first EVAL_N boards of each set (the draws come in order) and adds more."""
+    if ragged is None:
+        ragged = all(c.shape[1] == 1 for c in consts.values())
+    sets = [("mix", random_walls, EVAL_SEED), ("bridge", _bridge_board, EVAL_SEED + 50),
+            ("page", page_loops, EVAL_SEED + 100)] + ([("ragged", _ragged_any, EVAL_SEED + 200)] if ragged else [])
+    out = {name: {} for name, _, _ in sets}
     for R in radii:
-        for name, gen, seed in (("mix", random_walls, EVAL_SEED), ("bridge", _bridge_board, EVAL_SEED + 50),
-                                ("page", page_loops, EVAL_SEED + 100)):
-            w, f, sides = boards(np.random.default_rng(seed + R), R, n, gen)
-            out[name][R] = (to_t(w, device), (torch.from_numpy(f) > 0).to(device or "cpu"), sides, consts[R])
+        for name, gen, seed in sets:
+            w, f, sides, ms = boards(np.random.default_rng(seed + R), R, n, gen)
+            cs = consts[R] if ms is None else to_t(ms, device)
+            out[name][R] = (to_t(w, device), (torch.from_numpy(f) > 0).to(device or "cpu"), sides, cs)
     return out
 
 
@@ -372,6 +353,9 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
     """
     cap = lambda name: name[0].upper() + name[1:]
     res = {m: {"none": [], "both": [], "gap": [], "bridgeByR": {}, **{k: [] for k in held}} for m in mults}
+    if "ragged" in held:
+        for r in res.values():
+            r["raggedByR"] = {}
     for name, per_r in held.items():
         for R, (walls, fills, sides, cs) in per_r.items():
             mk = cs[:, :1]
@@ -414,6 +398,8 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
                                                   - p[b][np.isin(lab, ids) & ~prim[b]].mean()
                                                   for b, (lab, ids, _) in enumerate(sides)]))
                     res[m]["bridgeByR"][R] = round(float(s["exact"]), 3)
+                if name == "ragged":
+                    res[m]["raggedByR"][R] = round(float(s["exact"]), 3)
     out = {m: {k: (round(float(np.mean(v)), 4) if isinstance(v, list) and k != "auxTeachCh" else v)
                for k, v in r.items()} for m, r in res.items()}
     for r in out.values():
@@ -423,12 +409,13 @@ def quick_eval(model, held, mults, aux=False, arc=True, teach_check=False):
 
 
 def lr_at(it: int, iters: int, lr: float, scale: float = 1.0, floor: float = 0.0, warm_from=None,
-          warmup: int = 0) -> float:
-    """Step decay: full lr to 60%, x0.3 to 85%, x0.1 after; times `scale` (the collapse guard halves it at each
+          warmup: int = 0, frac: float = None) -> float:
+    """Step decay: full lr to 60%, x0.3 to 85%, x0.1 after (DECAY_AT) -- of it / iters, or of `frac` when given
+    (--schedule time: the share of the time box used); times `scale` (the collapse guard halves it at each
     rollback), never below `floor`; then, `warmup` iterations from `warm_from` (a fresh optimiser; None = none),
     a linear warm-up: x (it - warm_from + 1) / warmup."""
-    f = it / max(1, iters)
-    x = max(floor, lr * scale * (1.0 if f < 0.6 else 0.3 if f < 0.85 else 0.1))
+    f = it / max(1, iters) if frac is None else frac
+    x = max(floor, lr * scale * (1.0 if f < DECAY_AT[0] else 0.3 if f < DECAY_AT[1] else 0.1))
     if warm_from is not None and warmup > 0 and 0 <= it - warm_from < warmup:
         x *= (it - warm_from + 1) / warmup
     return x
@@ -488,11 +475,12 @@ def save_ckpt(path, model, opt, it, cfg, rng, pools=None, best=-1.0, eval_sec=0.
     os.replace(tmp, path)
 
 
-def new_pool(rng, R, n, channels, bridge_frac, aux=False, device=None):
-    """A pool of n fresh boards at radius R: walls, targets, depth, aux targets (only with aux), state (a
-    tensor on `device`; the rest numpy)."""
-    w, f, d, a = draw(rng, R, n, bridge_frac, aux)
-    pool = {"walls": w, "fill": f, "depth": d, "state": fresh_state(to_t(w, device), channels)}
+def new_pool(rng, R, n, channels, bridge_frac, aux=False, device=None, mask_mix=0.0, near_tie=0.0):
+    """A pool of n fresh boards at radius R: walls, targets, depth, mask (uint8 [n,S,S]: each board's shape, the
+    hexagon or, with probability mask_mix, a ragged one), aux targets (only with aux), state (a tensor on
+    `device`; the rest numpy)."""
+    w, f, d, a, m = draw_boards(rng, R, n, bridge_frac, aux, mask_mix, near_tie)
+    pool = {"walls": w, "fill": f, "depth": d, "mask": m, "state": fresh_state(to_t(w, device), channels)}
     if aux:
         pool["aux"] = a
     return bookkeeping(pool)
@@ -516,6 +504,7 @@ def write_snapshot(path, it, pools, last_R, last_idx):
     min(pool size, SNAP_N) slots of its pool: walls_R uint8 [n,S,S], fill_R float16 [n,S,S] (ch1 of the stored
     state), target_R uint8 [n,S,S] (the acceptable target closest to the thresholded fill; the primary on a
     tie), ntargets_R uint8 [n] (distinct acceptable targets), loss_R float32 [n] (NaN if never in a batch yet),
+    mask_R uint8 [n,S,S] (each board's shape: the hexagon or a ragged mask; pools from before masks: none),
     age_R int32 [n] (iterations since its last fresh start), edits_R int32 [n] (damages since then), damage_R
     int8 [n] (the last one's kind: -1 none, then DAMAGE_KINDS' order: edit, burst, erase, stamp, state), and
     state_R float16 [m,C,S,S], the full state of the first m = min(n, SNAP_M)."""
@@ -523,11 +512,13 @@ def write_snapshot(path, it, pools, last_R, last_idx):
            "last_R": np.int64(last_R), "last_idx": np.asarray(last_idx, dtype=np.int64)}
     for R, P in pools.items():
         n = min(len(P["walls"]), SNAP_N)
-        on = hex_mask(R) == 1
+        on = P["mask"][:n] == 1 if "mask" in P else hex_mask(R)[None] == 1
         fill = P["state"][:n, 1].cpu().numpy()
         fills = P["fill"][:n]  # [n,K,S,S]
         wrong = (((fill > 0.5) & on)[:, None] != (fills > 0)).sum((2, 3))  # [n,K]; off board both are 0
         out[f"walls_{R}"] = P["walls"][:n].astype(np.uint8)
+        if "mask" in P:
+            out[f"mask_{R}"] = P["mask"][:n].astype(np.uint8)
         out[f"fill_{R}"] = fill.astype(np.float16)
         out[f"target_{R}"] = fills[np.arange(n), wrong.argmin(1)].astype(np.uint8)  # argmin: the first of a tie
         out[f"ntargets_{R}"] = np.array([len({t.tobytes() for t in f}) for f in fills], dtype=np.uint8)
@@ -603,6 +594,21 @@ def main():
                         "channel's hex max and min)")
     p.add_argument("--bridge-frac", type=float, default=0.25,
                    help="share of fresh boards drawn as kind \"bridge\" on top of the mix's own")
+    p.add_argument("--mask-mix", type=float, default=None,
+                   help="share of new pool boards drawn on a ragged mask (nca/masks.py: blobs, crops of Spectacle's "
+                        "hex fields) instead of the hexagon (default 0.5; needs --n-consts 1; with --resume: the run's "
+                        "unless given)")
+    p.add_argument("--near-tie", type=float, default=None,
+                   help="share of new bridge boards drawn near a tie: bridges near half way round, redrawn until the "
+                        "two largest rim regions' area ratio is >= 0.75 (data.random_walls; default 0)")
+    p.add_argument("--schedule", choices=("iters", "time"), default=None,
+                   help="where the lr decays (x0.3 at 60%%, x0.1 at 85%%): of --iters (default), or of the time box "
+                        "(time: --minutes at the start of the run or stage, kept by --resume, which counts the time "
+                        "already used; not bit-reproducible, since the decay depends on the clock)")
+    p.add_argument("--producer", choices=("auto", "inline", "thread", "process"), default="auto",
+                   help="pool runs: who makes the boards, damage and targets (nca/producer.py): inline on the "
+                        "training thread, a thread, or a worker process; auto = process on cuda, inline on cpu. "
+                        "Bit-identical results whichever")
     p.add_argument("--pool", action=argparse.BooleanOptionalAction, default=True,
                    help="persistent sample pools (one per radius) with damage (the default); --no-pool: fresh "
                         "starts only (v5, v6)")
@@ -657,6 +663,8 @@ def main():
                 "use --no-aux-dense with --pool, or --no-pool")
     if args.teach and any(args.teach) and not args.resume and not (args.aux and args.aux_dense and not args.pool):
         p.error("--teach feeds in the reference flood F_t: it needs --aux --aux-dense and --no-pool")
+    if args.schedule == "time" and not args.minutes and not args.resume:
+        p.error("--schedule time needs --minutes (the time box the lr decay is placed in)")
 
     torch.set_num_threads(args.threads or min(4, os.cpu_count() or 1))
     device = pick_device(args.device)
@@ -682,6 +690,19 @@ def main():
             cfg["teachFrom"] = [start_it, p_now]
         if args.lr:  # a new peak lr for the rest of the run (the schedule and the rollback scale still apply)
             cfg["lr"] = args.lr
+        cfg.setdefault("maskMix", 0.0)  # runs from before ragged masks: hexagons only
+        cfg.setdefault("nearTie", 0.0)
+        cfg.setdefault("schedule", "iters")
+        if args.mask_mix is not None:
+            cfg["maskMix"] = args.mask_mix
+        if args.near_tie is not None:
+            cfg["nearTie"] = args.near_tie
+        if args.schedule and args.schedule != cfg["schedule"]:  # a new schedule mode from here on
+            cfg["schedule"] = args.schedule
+            if args.schedule == "time" and not cfg.get("scheduleMin"):
+                if not args.minutes:
+                    p.error("--schedule time needs --minutes")
+                cfg["scheduleMin"] = args.minutes
         for k, v in (("lrFloor", 0.0), ("warmup", 0), ("collapseFrac", args.collapse_frac),
                      ("collapseLossX", args.collapse_loss_x), ("maxRollbacks", args.max_rollbacks)):
             cfg.setdefault(k, v)  # older checkpoints: no floor, no warm-up (the optimiser carries on), the guard on
@@ -712,6 +733,9 @@ def main():
             "lr": args.lr or LR, "lrFloor": args.lr_floor, "warmup": args.warmup, "collapseFrac": args.collapse_frac,
             "collapseLossX": args.collapse_loss_x, "maxRollbacks": args.max_rollbacks, "batch": args.batch, "iters": args.iters or 4000, "seed": args.seed,
             "bridgeFrac": args.bridge_frac, "pool": args.pool, "poolSize": args.pool_size,
+            "maskMix": 0.5 if args.mask_mix is None else args.mask_mix,
+            "nearTie": args.near_tie or 0.0,
+            "schedule": args.schedule or "iters", "scheduleMin": args.minutes if args.schedule == "time" else None,
             "damage": args.damage if args.pool else None, "damageKinds": list(DAMAGE_KINDS) if args.pool else None,
             "init": args.init,
             "loss": "min over acceptable targets of MSE(ch1, fill) over on-board cells, mean of the last lastK steps"
@@ -729,6 +753,10 @@ def main():
                 cfg["teach"], cfg["teachFrom"] = list(p01), [0, p01[0]]
 
     n_consts = cfg.get("nConsts", 1)  # checkpoints from before v3 have only the mask
+    if cfg.get("maskMix", 0) > 0 and (n_consts != 1 or cfg.get("aux")):
+        if args.mask_mix:  # asked for: refuse
+            p.error("--mask-mix needs --n-consts 1 and no --aux (ragged boards have no theta/aux planes)")
+        cfg["maskMix"] = 0.0  # the default: the hexagon only for these recipes
     perception = cfg.setdefault("perception", "taps")  # and from before v4 no pool
     floods = cfg.get("floods", False)  # spec v6
     eval_n = cfg["evalN"] = args.eval_n or cfg.get("evalN", EVAL_N)  # runs from before --eval-n used EVAL_N
@@ -758,11 +786,17 @@ def main():
     lr_scale = ckpt.get("lrScale", 1.0) if ckpt else 1.0
     rollbacks = ckpt.get("rollbacks", 0) if ckpt else 0
     warm_from = ckpt.get("warmFrom") if ckpt else 0
-    guard = lambda: {"lrScale": lr_scale, "rollbacks": rollbacks, "warmFrom": warm_from}
+    guard = lambda: {"lrScale": lr_scale, "rollbacks": rollbacks, "warmFrom": warm_from, "elapsedSec": elapsed(),
+                     "dataRng": data_state[0]}
+    # --schedule time: the share of the time box used, counted across --resume (elapsedSec in ckpt.pt).
+    prior_sec = ckpt.get("elapsedSec", 0.0) if ckpt else 0.0
+    elapsed = lambda: round(prior_sec + time.time() - t_start, 1)
+    sched_frac = lambda: (elapsed() / (60.0 * cfg["scheduleMin"]) if cfg.get("schedule") == "time"
+                          and cfg.get("scheduleMin") else None)
     lr_of = lambda i: lr_at(i, cfg["iters"], cfg["lr"], lr_scale, cfg.get("lrFloor", 0.0), warm_from,
-                            cfg.get("warmup", 0))
+                            cfg.get("warmup", 0), sched_frac())
 
-    held = heldout(radii, consts, eval_n, device)
+    held = heldout(radii, consts, eval_n, device, ragged=n_consts == 1 and not use_aux)
     eseq = {R: edit_sequence(R, consts[R], eval_n, device=device) for R in radii}
     m0 = args.eval_mults[0]
 
@@ -773,7 +807,11 @@ def main():
                           teach_check=use_aux and dense and bool(cfg.get("teach"))).items()}
         rec.update(edit_eval(model, eseq, m0))
         q = rec[f"q{m0}"]
-        rec["score"] = round((q["mix"] + q["bridge"] + q["page"] + float(np.mean(rec["edit"]))) / 4, 4)
+        parts = [q["mix"], q["bridge"], q["page"], float(np.mean(rec["edit"]))]
+        if cfg.get("maskMix", 0) > 0 and "ragged" in q:  # a run that trains on ragged boards is judged on them too
+            parts.append(q["ragged"])
+        rec["score"] = round(sum(parts) / len(parts), 4)
+        rec["scoreParts"] = len(parts)
         rec["evalN"] = eval_n  # boards per set per radius behind these shares (nca.progress's noise)
         return rec
 
@@ -781,7 +819,10 @@ def main():
              "editChanged": [round(float(np.mean([e[3][k] for e in eseq.values()])), 3) for k in range(N_EDITS)],
              "editHold": [round(float(np.mean([e[4][k] for e in eseq.values()])), 3) for k in range(N_EDITS)],
              "evalN": eval_n, "threads": torch.get_num_threads(), "torch": torch.__version__,
-             "lrScale": lr_scale, "rollbacks": rollbacks}
+             "lrScale": lr_scale, "rollbacks": rollbacks,
+             "schedule": {"mode": cfg.get("schedule", "iters"), "decayAt": list(DECAY_AT),
+                          **({"boxMin": cfg["scheduleMin"], "usedMin": round(prior_sec / 60, 2)}
+                             if cfg.get("schedule") == "time" else {"iters": cfg["iters"]})}}
     if device.type == "cuda":
         start["gpu"] = torch.cuda.get_device_name(device)
     if use_aux:
@@ -798,19 +839,36 @@ def main():
         log.write(json.dumps(rec) + "\n")
         log.flush()
 
-    emit(start)  # at every (re)start: the config; its "iters" is the target (a --resume may raise it)
 
-    pools, steering = None, {}
+    pools, steering, source = None, {}, None
+    mask_mix, near_tie = cfg.get("maskMix", 0.0), cfg.get("nearTie", 0.0)
     if cfg["pool"]:
         pools = ckpt["pool"] if ckpt and ckpt.get("pool") else \
-            {R: new_pool(rng, R, cfg["poolSize"], cfg["channels"], bf, use_aux, device) for R in radii}
+            {R: new_pool(rng, R, cfg["poolSize"], cfg["channels"], bf, use_aux, device, mask_mix, near_tie)
+             for R in radii}
         for R, P in pools.items():  # aux targets for a pool that lacks them (or has v3's 4 planes)
             P["state"] = P["state"].to(device)
             if use_aux and ("aux" not in P or P["aux"].shape[1] != N_AUX):
                 P["aux"] = np.stack([aux_targets(w, R) for w in P["walls"]])
+            if "mask" not in P:  # a pool from before ragged masks: every board is the hexagon
+                P["mask"] = np.repeat(hex_mask(R)[None], len(P["walls"]), 0).astype(np.uint8)
             bookkeeping(P, start_it)
-        steering = (ckpt or {}).get("steer") or {R: steer(pool_stats(P["walls"], P["fill"], R))
+        steering = (ckpt or {}).get("steer") or {R: steer(pool_stats(P["walls"], P["fill"], R, P["mask"]))
                                                  for R, P in pools.items()}
+        # The board work runs in a producer (nca/producer.py) with its own rng, continued from the checkpoint.
+        if ckpt and ckpt.get("dataRng"):
+            d_state = ckpt["dataRng"]
+        else:
+            d_state = data_rng(cfg["seed"], start_it).bit_generator.state
+        mode = args.producer if args.producer != "auto" else ("process" if device.type == "cuda" else "inline")
+        spec = {"R": radii, "batch": B, "bridgeFrac": bf, "damage": cfg["damage"], "maskMix": mask_mix,
+                "nearTie": near_tie, "aux": use_aux, "steps": cfg["steps"]}
+        board_keys = ("walls", "fill", "depth", "mask") + (("aux",) if use_aux else ())
+        source = Source(Producer(spec, {R: {k: P[k] for k in board_keys} for R, P in pools.items()}, d_state,
+                                 steering, start_it), mode)
+        start["producer"] = mode
+    data_state = [d_state if cfg["pool"] else None]  # the producer's rng after the last item applied
+    emit(start)  # at every (re)start: the config; its "iters" is the target (a --resume may raise it)
 
     def n_steps(R, depth_max):
         t0, t1 = cfg["steps"][R]
@@ -849,6 +907,8 @@ def main():
         emit(rec)
 
     t_win, losses, parts, taught = time.time(), [], [], []
+    t_data, t_prod = [], []  # per iteration: the training thread's seconds on data, the producer's own
+    pool_rec = None  # the pools' statistics of the last item that carried them (logged at the next line)
     kinds = dict.fromkeys(DAMAGE_KINDS, 0)
     skipped = skip_run = 0
     win_skipped, win_steps, history = 0, 0, []  # the collapse guard's loss windows (since the last fresh optimiser)
@@ -866,59 +926,57 @@ def main():
                   "slowestIterSec": round(slowest, 2), "evalSec": round(eval_sec, 1)})
             break
         t_it = time.time()
-        R = int(rng.choice(radii))
-        cs = consts[R]
-        mk = cs[:, :1]
         if cfg["pool"]:
-            P, st = pools[R], steering[R]
-            idx = rng.choice(len(P["walls"]), B, replace=False)
+            # The board work of this iteration, made by the producer (nca/producer.py): R, the batch's slots,
+            # their boards after this iteration's new boards and damage, and T.
+            item = source.get()
+            R, idx = item["R"], item["idx"]
+            P = pools[R]
             tidx = torch.from_numpy(idx).to(device)
-            walls_np, fill_np, depth_np = P["walls"][idx], P["fill"][idx], P["depth"][idx]  # copies
-            aux_np = P["aux"][idx] if use_aux else None
             state = P["state"][tidx].clone()
-            with torch.no_grad():
-                cur = per_sample_loss(state[:, 1:2], to_t(fill_np, device), mk).min(1).values.cpu().numpy()
-            order = np.argsort(-cur)  # worst first
+            # The board shapes: per board on a ragged run (consts = the masks), else the radius's const stack.
+            disc_R = hex_mask(R)[None]
+            ragged_run = mask_mix > 0 or bool((P["mask"][idx] != disc_R).any() or (item["mask"] != disc_R).any())
+            cs_old = to_t(P["mask"][idx], device) if ragged_run else consts[R]
+            with torch.no_grad():  # each sample's loss on the board it was left on
+                cur = per_sample_loss(state[:, 1:2], to_t(P["fill"][idx], device), cs_old[:, :1]).min(1).values
             # The worst sample starts over from the fresh state on its board (a new board instead, as in
-            # distill, drifts the pool towards the easy boards).
-            j = order[0]
-            state[j] = fresh_state(to_t(walls_np[j][None], device), cfg["channels"])[0]
-            fresh = [j]
-            # batch/8 random others get brand-new boards (twice as many while the pool is steered).
-            rest = rng.permutation(order[1:])
-            n_new = min(len(rest), max(1, B // 8) * st["newMult"])
-            w, f, d, a = draw(rng, R, n_new, bf, use_aux)
-            for k, j in enumerate(rest[:n_new]):
-                walls_np[j], fill_np[j], depth_np[j] = w[k], f[k], d[k]
-                if use_aux:
-                    aux_np[j] = a[k]
-                state[j] = fresh_state(to_t(w[k][None], device), cfg["channels"])[0]
-                fresh.append(j)
+            # distill, drifts the pool towards the easy boards); so do the slots given a brand-new board.
+            j = int(cur.argmax())
+            walls_np, fill_np, depth_np, mask_np = item["walls"], item["fill"], item["depth"], item["mask"]
+            aux_np = item["aux"]
+            walls = to_t(walls_np, device)
+            fresh = sorted(set(item["new"]) | {j})
+            for pos, k in item["damaged"]:  # one damage each; the state carries on (wall damage: new walls)
+                if pos in fresh:
+                    continue
+                P["edits"][idx[pos]] += 1
+                P["last"][idx[pos]] = k
+            for pos, row, col, rad in item["stateDamage"]:
+                if pos not in fresh:
+                    zero_disc(state[pos], R, row, col, rad)
+            for k, v in item["kinds"].items():
+                kinds[k] += v
+            fi = torch.tensor(fresh, device=device)
+            state[fi] = fresh_state(walls[fi], cfg["channels"])
             P["born"][idx[fresh]], P["edits"][idx[fresh]], P["last"][idx[fresh]] = it, 0, -1
-            # Each of the rest, with probability --damage, gets one damage and carries on from its state.
-            for j in rest[n_new:]:
-                if rng.random() >= cfg["damage"]:
-                    continue
-                k = int(rng.choice(len(DAMAGE_KINDS), p=st["p"]))
-                kind = DAMAGE_KINDS[k]
-                kinds[kind] += 1
-                P["edits"][idx[j]] += 1
-                P["last"][idx[j]] = k
-                if kind == "state":
-                    damage_state(rng, state[j], R)
-                    continue
-                walls_np[j] = damage_walls(rng, walls_np[j], R, kind, st["pBridge"])
-                fill_np[j], depth_np[j], aux_j = answers(walls_np[j], R, use_aux)
-                if use_aux:
-                    aux_np[j] = aux_j
-            walls, target = to_t(walls_np, device), to_t(fill_np, device)
+            target = to_t(fill_np, device)
             state[:, 0:1] = walls
+            cs = to_t(mask_np, device) if ragged_run else consts[R]
+            T = item["T"]
+            t_prod.append(item["sec"])
+            if "pool" in item:
+                pool_rec, steering = item["pool"], item["steer"]
         else:
+            R = int(rng.choice(radii))
+            cs = consts[R]
+            t_prod.append(0.0)
             walls_np, fill_np, depth_np, aux_np = draw(rng, R, B, bf, use_aux)
             walls, target = to_t(walls_np, device), to_t(fill_np, device)
             state = fresh_state(walls, cfg["channels"])
-
-        T = n_steps(R, depth_np.max())
+            T = n_steps(R, depth_np.max())
+        mk = cs[:, :1]
+        t_data.append(time.time() - t_it)
         if use_aux and dense:  # [T,B,5,S,S]: the reference flood at every step from the fresh state
             aux_t = torch.from_numpy(aux_flood(walls_np, R, T)).to(device)
         elif use_aux:
@@ -970,31 +1028,40 @@ def main():
 
         if cfg["pool"]:
             P["state"][tidx] = state.detach()
-            P["walls"][idx], P["fill"][idx], P["depth"][idx] = walls_np, fill_np, depth_np
+            P["walls"][idx], P["fill"][idx], P["depth"][idx], P["mask"][idx] = walls_np, fill_np, depth_np, mask_np
             P["loss"][idx] = acc.detach().min(1).values.cpu().numpy()
             if use_aux:
                 P["aux"][idx] = aux_np
             last[0] = (R, idx)
+            data_state[0] = item["rng"]
         if skip_run >= STOP_SKIPS:
             emit({"iteration": it, "stopped": f"{STOP_SKIPS} non-finite steps in a row", "skipped": skipped})
             raise SystemExit(f"{STOP_SKIPS} non-finite steps in a row; the last checkpoint is {ckpt_path}")
 
         if it % 50 == 0 or it == cfg["iters"]:
+            spi = (time.time() - t_win) / max(1, len(taught))
             rec = {"iteration": it, "loss": float(np.mean(losses)) if losses else None,
-                   "secPerIter": (time.time() - t_win) / max(1, len(taught)),
+                   "secPerIter": spi,
+                   # secPerIter split: the training thread's seconds on data per iteration (inline: making
+                   # it; thread/process: waiting for it, plus applying it), the rest (model: the rollout,
+                   # backward, step, bookkeeping), and the producer's own seconds per item (wherever it ran)
+                   "dataSec": round(float(np.mean(t_data)), 5) if t_data else None,
+                   "modelSec": round(spi - float(np.mean(t_data)), 5) if t_data else None,
+                   "prodSec": round(float(np.mean(t_prod)), 5) if t_prod else None,
                    "lr": lr_of(it - 1),
                    "maxRssMB": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024}
             if parts:
                 rec["lossFill"], rec["lossAux"] = (float(x) for x in np.mean(parts, 0))
+            if cfg.get("schedule") == "time":
+                rec["schedFrac"] = round(sched_frac(), 4)
             if cfg.get("teach"):  # p at the window's last iteration, and the share of steps actually taught
                 rec["teachP"], rec["taught"] = round(teach_p(it - 1, cfg), 4), round(float(np.mean(taught)), 4)
             if cfg["pool"]:
                 rec["damage"] = kinds
             if skipped:
                 rec["skipped"] = skipped
-            if it % 200 == 0 and cfg["pool"]:  # the pools' statistics, and the steering they set
-                rec["pool"] = {R: pool_stats(P["walls"], P["fill"], R) for R, P in pools.items()}
-                steering = {R: steer(s) for R, s in rec["pool"].items()}
+            if pool_rec is not None:  # the pools' statistics (every STATS_EVERY), and the steering they set
+                rec["pool"], pool_rec = pool_rec, None
                 if any(s["why"] for s in steering.values()):
                     rec["steer"] = {R: s for R, s in steering.items() if s["why"]}
             # The collapse guard (module docstring): the loss rule first, so a window that trips it never
@@ -1013,6 +1080,7 @@ def main():
             if rec["loss"] is not None and math.isfinite(rec["loss"]):
                 history.append(rec["loss"])
             t_win, losses, parts, taught = time.time(), [], [], []
+            t_data, t_prod = [], []
             kinds = dict.fromkeys(DAMAGE_KINDS, 0)
             win_skipped = win_steps = 0
             if why:
@@ -1046,6 +1114,8 @@ def main():
             snapshot(it)
     if it >= cfg["iters"] and not collapsed:  # the run reached its target: a clean end, in the log (nca.progress: FINISHED)
         emit({"stopped": "done", "iteration": it, "minutes": round((time.time() - t_start) / 60, 2)})
+    if source:
+        source.close()
     log.close()
 
 

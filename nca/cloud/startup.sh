@@ -13,7 +13,8 @@
 #      another, each in runs/<run>-<stage> with --minutes = what is left of its minutes: --resume if its
 #      ckpt.pt exists, else --init from the previous stage's best.pt (its best quick check; ckpt.pt only if
 #      it has no best.pt), unless its args name an --init (an arg bucket:PATH is fetched from the bucket
-#      first, e.g. --init bucket:init/pure-a.pt). A stage whose log ended {"stopped": "done"} or
+#      first, e.g. --init bucket:init/pure-a.pt; leading args "--module M" run python -m M instead of
+#      nca.train, e.g. --module nca.strand.train). A stage whose log ended {"stopped": "done"} or
 #      {"stopped": "collapsed"} (the trainer's collapse guard ran out of rollbacks: the next stage starts
 #      from its best.pt), or {"stopped": "time"} with under 2 of its minutes left, is skipped (so a finished
 #      stage dir of the same name already in the bucket counts as done; a preempted one resumes).
@@ -103,15 +104,26 @@ print(d["stopped"] or "-", round(d["elapsedMin"], 2), d["verdict"])' 2>/dev/null
 }
 
 run_stages() {  # run_stages RUN THREADS: the run's stages, in order
-  local run=$1 threads=$2 prev="" i=0 n r stage last="" minutes args dir stopped used verdict left a rel
+  local run=$1 threads=$2 prev="" i=0 n r stage last="" minutes args dir stopped used verdict left a rel module
   local -a argv mode
   n=$(plan_lines | awk -F'|' -v r="$run" '$1 == r' | wc -l)
   while IFS='|' read -r r stage minutes args; do
     [ "$r" = "$run" ] || continue
     i=$((i + 1)) dir=$run-$stage last=$stage
     read -r -a argv <<<"$args"
-    for k in "${!argv[@]}"; do  # bucket:PATH -> a local copy of $BUCKET/PATH
+    module=nca.train   # leading "--module M": another trainer with nca.train's conventions (e.g. nca.strand.train)
+    if [ "${argv[0]:-}" = --module ]; then module=${argv[1]:-} argv=("${argv[@]:2}"); fi
+    [[ $module =~ ^[A-Za-z_][A-Za-z0-9_.]*$ ]] || { log "$dir: bad --module '$module'"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
+    for k in "${!argv[@]}"; do  # bucket:PATH -> a local copy of $BUCKET/PATH; gs://B/PATH -> a copy of that object
       a=${argv[$k]}
+      if [[ $a == gs://* ]]; then  # e.g. a private bucket the VM's service account may read (the run bucket is public)
+        rel=gs/${a#gs://}
+        [ -f "$W/bucket/$rel" ] || { mkdir -p "$(dirname "$W/bucket/$rel")" &&
+          gcloud storage cp --project="$PROJECT" --quiet "$a" "$W/bucket/$rel" >/dev/null; } ||
+          { log "$dir: cannot fetch $a"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
+        argv[k]=$W/bucket/$rel
+        continue
+      fi
       [[ $a == bucket:* ]] || continue
       rel=${a#bucket:}
       [ -f "$W/bucket/$rel" ] || get "$rel" "$W/bucket/$rel" || { log "$dir: cannot fetch $a"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
@@ -133,14 +145,16 @@ run_stages() {  # run_stages RUN THREADS: the run's stages, in order
       if [ -f "$CODE/runs/$prev/best.pt" ]; then mode=(--init "runs/$prev/best.pt"); else mode=(--init "runs/$prev/ckpt.pt"); fi
     fi
     [[ " ${argv[*]} " == *" --threads "* ]] || argv+=(--threads "$threads")
+    # the lr decay at 60% / 85% of the stage's time box, not of an --iters the box may never reach
+    [[ " ${argv[*]} " == *" --schedule "* ]] || argv+=(--schedule time)
     set_state "$run" "$stage" "$i" "$n" running
     mkdir -p "$CODE/runs/$dir"
-    log "$dir: python -m nca.train --name $dir ${argv[*]} ${mode[*]} --minutes $left"
-    (cd "$CODE" && "$PY" -m nca.train --name "$dir" "${argv[@]}" "${mode[@]}" --minutes "$left") \
+    log "$dir: python -m $module --name $dir ${argv[*]} ${mode[*]} --minutes $left"
+    (cd "$CODE" && "$PY" -m "$module" --name "$dir" "${argv[@]}" "${mode[@]}" --minutes "$left") \
       >>"$CODE/runs/$dir/stdout.log" 2>&1
     local rc=$?
     if [ $rc -ne 0 ]; then
-      log "$dir: nca.train exited $rc; this run stops here (see runs/$dir/stdout.log)"
+      log "$dir: $module exited $rc; this run stops here (see runs/$dir/stdout.log)"
       set_state "$run" "$stage" "$i" "$n" failed
       return 1
     fi

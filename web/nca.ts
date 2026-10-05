@@ -35,7 +35,7 @@ const clampInt = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi
 /** The largest radius the weights were trained at (meta.trainedR is a number or a list), else a fallback. */
 const trainedRs = Array.isArray(meta.trainedR) ? meta.trainedR : typeof meta.trainedR === 'number' ? [meta.trainedR] : [];
 const settings = {
-  radius: clampInt(trainedRs.length ? Math.max(...trainedRs) : 8, 4, MAX_R),
+  radius: clampInt(trainedRs.length ? Math.min(10, Math.max(...trainedRs)) : 8, 4, MAX_R), // capped: a big board is slow in the browser
   speed: 60,
 };
 

@@ -10,6 +10,12 @@ oracle() is its primary one. Training pictures come from random_walls / batch /
 edit_walls. page_loops is a port of the demo page's "Random loop" button, kept
 apart for evaluation (an out-of-distribution check): nothing in training draws
 from it.
+
+BOARDS. Every function that takes `board` (uint8/bool [S,S], None = the hexagon of radius R, hexgrid.mask)
+works on any board shape inside the radius-R array: a ragged mask (nca/masks.py: random blobs, crops of
+Spectacle's hex fields). The rim of a board is its on-board cells with an off-board neighbour (edge(); a
+cell outside the array counts as off board), which for the hexagon is exactly hexgrid.rim(R). With
+board=None (or the hexagon itself) every result is bit-identical to the hexagon-only code before masks.
 """
 
 import math
@@ -45,6 +51,31 @@ def _dilate(arr: np.ndarray) -> np.ndarray:
     for dr, dc in NEIGHBOURS:
         out |= _look(arr, dr, dc)
     return out
+
+
+def edge(on: np.ndarray) -> np.ndarray:
+    """bool [S,S]: the rim of the board `on` (bool [S,S]): its cells with an off-board hex neighbour, a cell
+    outside the array counting as off board. edge(mask(R) == 1) == rim(R) (selftest)."""
+    on = on.astype(bool)
+    inner = on.copy()
+    for dr, dc in NEIGHBOURS:
+        inner &= _look(on, dr, dc, fill=False)
+    return on & ~inner
+
+
+def _board(R: int, board=None):
+    """(on bool [S,S], ragged): the board's cells, and whether it is NOT the hexagon of radius R (board None
+    or equal to mask(R) is the hexagon: then every caller takes the hexagon-only code path, bit for bit)."""
+    disc = mask(R) == 1
+    if board is None:
+        return disc, False
+    on = np.asarray(board).astype(bool)
+    return on, not np.array_equal(on, disc)
+
+
+def _rim_of(R: int, on: np.ndarray, ragged: bool) -> np.ndarray:
+    """The rim of a board from _board: rim(R) for the hexagon, edge(on) otherwise."""
+    return edge(on) if ragged else rim(R)
 
 
 def _axial_dist(R: int, cq: float, cr: float) -> np.ndarray:
@@ -104,13 +135,14 @@ def _labels(open_cells: np.ndarray, R: int) -> np.ndarray:
     return np.array(lab, dtype=np.int32).reshape(S, S)
 
 
-def _rim_depth(open_cells: np.ndarray, R: int) -> np.ndarray:
-    """int16 [S,S]: BFS distance from the rim through open cells (rim = 0) in rim regions, -1 elsewhere."""
+def _rim_depth(open_cells: np.ndarray, R: int, rim_cells: np.ndarray = None) -> np.ndarray:
+    """int16 [S,S]: BFS distance from the rim (rim_cells, default the hexagon's) through open cells (rim = 0) in
+    rim regions, -1 elsewhere."""
     S = side(R)
     free = open_cells.ravel().tolist()
     nb = _nbrs(R)
     depth = [-1] * (S * S)
-    queue = np.flatnonzero(open_cells & rim(R)).tolist()
+    queue = np.flatnonzero(open_cells & (rim(R) if rim_cells is None else rim_cells)).tolist()
     for i in queue:
         depth[i] = 0
     for i in queue:  # grows as it goes: a BFS
@@ -127,18 +159,37 @@ EPS = 0.02
 _THETA = {}  # R -> float64 [2,S,S]: theta1, theta2 (the float32 consts, widened)
 
 
-def _theta_extremes(lab: np.ndarray, R: int):
+def board_theta(on: np.ndarray, R: int) -> np.ndarray:
+    """float64 [2,S,S]: theta1, theta2 of a RAGGED board `on`, as hexgrid.consts defines them but about the
+    centroid of the board's cells (cell centre x = sqrt(3) (q + r/2), y = 1.5 r) instead of about (0, 0).
+
+    The span measure (targets' second "largest") is the angle of the board's outline that a rim region
+    covers; on a ragged board "the angle round the board" is taken round its centroid. On a concave board two
+    far-apart stretches of rim can share angles, so the span is a rough measure there; the max-area region
+    (Spectacle's own rule) is always a candidate besides it."""
+    S = side(R)
+    rr, qq = np.mgrid[0:S, 0:S].astype(np.float64) - R
+    x, y = _SQ3 * (qq + rr / 2.0), 1.5 * rr
+    n = on.sum()
+    cx, cy = x[on].sum() / n, y[on].sum() / n
+    t1 = np.mod(np.arctan2(y - cy, x - cx) / (2.0 * np.pi) + 1.0, 1.0)
+    return np.stack([t1, np.mod(t1 + 0.5, 1.0)]) * on
+
+
+def _theta_extremes(lab: np.ndarray, R: int, board=None):
     """(has a rim cell bool [n], max theta1, min theta1, max theta2, min theta2 float64 [n]) per region number
-    of `lab`, over the region's rim cells (0 for a region with none). float64 copies of the float32 consts,
-    so differences of them are exact (the same on the TS side, which does its arithmetic in doubles)."""
+    of `lab`, over the region's rim cells (0 for a region with none). On the hexagon: float64 copies of the
+    float32 consts, so differences of them are exact (the same on the TS side, which does its arithmetic in
+    doubles); on a ragged board: board_theta (angles about its centroid)."""
     n = int(lab.max()) + 1
-    on_rim = (lab >= 0) & rim(R)
+    on, ragged = _board(R, board)
+    on_rim = (lab >= 0) & _rim_of(R, on, ragged)
     rl = lab[on_rim]
     has = np.bincount(rl, minlength=n) > 0
     out = [has]
     if R not in _THETA:
         _THETA[R] = consts(R)[1:3].astype(np.float64)
-    for theta in _THETA[R]:  # theta1, theta2
+    for theta in (board_theta(on, R) if ragged else _THETA[R]):  # theta1, theta2
         v = theta[on_rim]
         hi, lo = np.full(n, -np.inf), np.full(n, np.inf)
         np.maximum.at(hi, rl, v)
@@ -147,7 +198,7 @@ def _theta_extremes(lab: np.ndarray, R: int):
     return out
 
 
-def _spans(lab: np.ndarray, R: int) -> np.ndarray:
+def _spans(lab: np.ndarray, R: int, board=None) -> np.ndarray:
     """float64 [n]: angular span of each region's rim cells, min(max1 - min1, max2 - min2) (0 with none).
 
     theta2 = theta1 + 0.5 (mod 1) catches the arcs that straddle theta1 = 0, so
@@ -155,11 +206,11 @@ def _spans(lab: np.ndarray, R: int) -> np.ndarray:
     covers the region's rim cells: the side of a bridge whose ends are closer
     along the rim has the smaller span.
     """
-    _, hi1, lo1, hi2, lo2 = _theta_extremes(lab, R)
+    _, hi1, lo1, hi2, lo2 = _theta_extremes(lab, R, board)
     return np.minimum(hi1 - lo1, hi2 - lo2)
 
 
-def _rim_regions(lab: np.ndarray, R: int):
+def _rim_regions(lab: np.ndarray, R: int, board=None):
     """(rim region numbers, their areas, their spans), ordered best "largest" first.
 
     Order: area descending, then span descending, then lowest first cell
@@ -167,15 +218,16 @@ def _rim_regions(lab: np.ndarray, R: int):
     """
     n = int(lab.max()) + 1
     on = lab >= 0
+    bon, ragged = _board(R, board)
     area = np.bincount(lab[on], minlength=n)
-    rimc = np.bincount(lab[on & rim(R)], minlength=n)
-    span = _spans(lab, R) if n else np.zeros(0)
+    rimc = np.bincount(lab[on & _rim_of(R, bon, ragged)], minlength=n)
+    span = _spans(lab, R, board) if n else np.zeros(0)
     ids = np.flatnonzero(rimc > 0)
     ids = ids[np.lexsort((ids, -span[ids], -area[ids]))]  # last key is the primary sort key
     return ids, area[ids], span[ids]
 
 
-def targets(walls: np.ndarray, R: int):
+def targets(walls: np.ndarray, R: int, board=None):
     """(fills uint8 [K,S,S], depth int16 [S,S]): every acceptable answer, fills[0] the primary.
 
     Regions = 6-connected components of on-board non-wall cells; a rim region
@@ -190,11 +242,15 @@ def targets(walls: np.ndarray, R: int):
     span, then by lowest cell index; the others follow in the same order.
     Walls and off-board cells are 0 everywhere. depth = BFS distance from the
     rim through open cells, for cells in rim regions (rim = 0); -1 elsewhere.
+    board: a ragged mask (module docstring): its rim is edge(board) (on-board cells with an off-board
+    neighbour) and its spans are angles about its centroid (board_theta); None = the hexagon.
     """
-    open_cells = (mask(R) == 1) & (walls == 0)
+    on, ragged = _board(R, board)
+    board = board if ragged else None
+    open_cells = on & (walls == 0)
     lab = _labels(open_cells, R)
-    depth = _rim_depth(open_cells, R)
-    ids, area, span = _rim_regions(lab, R)
+    depth = _rim_depth(open_cells, R, _rim_of(R, on, ragged))
+    ids, area, span = _rim_regions(lab, R, board)
     if len(ids) == 0:
         return open_cells.astype(np.uint8)[None], depth
     keep = (area == area[0]) | (span >= span.max() - EPS)  # a candidate: max area or (near) max span
@@ -202,9 +258,9 @@ def targets(walls: np.ndarray, R: int):
     return fills, depth
 
 
-def oracle(walls: np.ndarray, R: int):
+def oracle(walls: np.ndarray, R: int, board=None):
     """(primary fill uint8 [S,S], depth int16 [S,S]): targets() for call sites that want one answer."""
-    fills, depth = targets(walls, R)
+    fills, depth = targets(walls, R, board)
     return fills[0], depth
 
 
@@ -520,8 +576,14 @@ def _walls_noise(rng, R, on_board):
 _RING = {}
 
 
-def _rim_ring(R: int) -> np.ndarray:
-    """int [6R, 2]: (row, col) of the rim cells in order round the board (cached per R)."""
+def _rim_ring(R: int, on_board: np.ndarray = None) -> np.ndarray:
+    """int [n, 2]: (row, col) of the rim cells in order round the board (the hexagon: 6R cells, cached per R).
+    A ragged board (on_board not the hexagon): its edge() cells in order of angle round its centroid
+    (board_theta) -- on a concave board that is not a walk along the outline, only a way round it."""
+    if on_board is not None and _board(R, on_board)[1]:
+        cells = np.argwhere(edge(on_board))
+        t1 = board_theta(on_board.astype(bool), R)[0]
+        return cells[np.argsort(t1[cells[:, 0], cells[:, 1]], kind="stable")]
     if R not in _RING:
         cells = np.argwhere(rim(R))
         q, r = cells[:, 1] - R, cells[:, 0] - R
@@ -545,21 +607,26 @@ def _path(rng, R, on_board, a, b):
     to the rim, never a loop).
     """
     S = side(R)
+    ragged = _board(R, on_board)[1]
+    rim_cells = _rim_of(R, on_board, ragged)
     pa, pb = _qr(a, R), _qr(b, R)
     u = rng.random()
+    line = None
     if u < 0.35:
         line = _polyline(R, np.stack([pa, pb]), closed=False)
-        if (line & on_board & ~rim(R)).any() and rng.random() < 0.6:
-            return line
-        mid = (pa + pb) / 2 * rng.uniform(0.1, 0.9)  # the midpoint pulled in towards the centre
-        return _polyline(R, np.stack([pa, mid, pb]), closed=False)
-    if u < 0.6:
+        if not ((line & on_board & ~rim_cells).any() and rng.random() < 0.6):
+            mid = (pa + pb) / 2 * rng.uniform(0.1, 0.9)  # the midpoint pulled in towards the centre
+            line = _polyline(R, np.stack([pa, mid, pb]), closed=False)
+    elif u < 0.6:
         c = np.array(_offset(rng, max(0, R - 1)), dtype=float)
         s = np.linspace(0, 1, 12)[:, None]
-        return _polyline(R, (1 - s) ** 2 * pa + 2 * s * (1 - s) * c + s ** 2 * pb, closed=False)
+        line = _polyline(R, (1 - s) ** 2 * pa + 2 * s * (1 - s) * c + s ** 2 * pb, closed=False)
+    # A ragged board: a line that leaves the board would come out in pieces; take the cheapest path instead.
+    if line is not None and not (ragged and (line & ~on_board).any()):
+        return line
     cost = _cost_field(rng, R, rng.choice((0.0, 0.3, 1.0)))
     ia, ib = int(a[0] * S + a[1]), int(b[0] * S + b[1])
-    allowed = (on_board & ~rim(R)).ravel()
+    allowed = (on_board & ~rim_cells).ravel()
     allowed[[ia, ib]] = True
     out = np.zeros(S * S, dtype=bool)
     p = _cheapest_path(cost, ia, ib, allowed.tolist())
@@ -585,42 +652,53 @@ def _thicken(rng, walls, on_board):
     return (walls | more) & on_board
 
 
-def _bridge(rng, R, on_board, from_centre=False):
+def _bridge(rng, R, on_board, from_centre=False, near=False):
     """One bridge: a wall path from a rim cell to another a random way round the rim.
 
     The way round sets how lopsided the two sides are: a few cells round a
     corner cuts off a corner (as little as the corner cell), half way round
     splits the board near evenly. from_centre: just a path from the centre to
-    the rim (the caller mirrors it through the centre).
+    the rim (the caller mirrors it through the centre). near (the near-tie
+    knob): never round a corner, and the way round drawn from the upper part
+    (sqrt(u), u ~ U[0.5, 1]): near half way round. On a ragged board the
+    "corner" is any rim cell (the ring is in angle order round its centroid).
     """
-    ring = _rim_ring(R)
+    ragged = _board(R, on_board)[1]
+    ring = _rim_ring(R, on_board if ragged else None)
     n = len(ring)
+    if n < 2:
+        return np.zeros_like(on_board)
     if from_centre:
         return _thicken(rng, _path(rng, R, on_board, (R, R), ring[rng.integers(n)]), on_board)
-    if rng.random() < 0.2:  # round a corner, 1 to R/2+1 cells each side of it
-        q, r = ring[:, 1] - R, ring[:, 0] - R
-        corners = np.flatnonzero((np.abs(q) == R).astype(int) + (np.abs(r) == R) + (np.abs(q + r) == R) >= 2)
+    if rng.random() < 0.2 and not near:  # round a corner, 1 to R/2+1 cells each side of it
+        if ragged:
+            corners = np.arange(n)
+        else:
+            q, r = ring[:, 1] - R, ring[:, 0] - R
+            corners = np.flatnonzero((np.abs(q) == R).astype(int) + (np.abs(r) == R) + (np.abs(q + r) == R) >= 2)
         c = int(rng.choice(corners))
         i, j = c - int(rng.integers(1, R // 2 + 2)), c + int(rng.integers(1, R // 2 + 2))
     else:
         i = int(rng.integers(n))
-        j = i + 2 + int((n // 2 - 2) * math.sqrt(rng.random()))  # sqrt: the cut-off area grows ~ arc^2
+        u = rng.uniform(0.5, 1.0) if near else rng.random()
+        j = i + 2 + int(max(0, n // 2 - 2) * math.sqrt(u))  # sqrt: the cut-off area grows ~ arc^2
     return _thicken(rng, _path(rng, R, on_board, ring[i % n], ring[j % n]), on_board)
 
 
-def _walls_bridge(rng, R, on_board):
+def _walls_bridge(rng, R, on_board, near=False):
     """1-3 bridges; sometimes leaky (1-2 of their cells knocked out), sometimes with loops or clutter.
 
     One board in six is point-symmetric: its bridges run from the centre to
     the rim and everything is mirrored through the centre, (q, r) -> (-q, -r),
-    so the two sides of a bridge tie exactly.
+    so the two sides of a bridge tie exactly (on the hexagon only: a ragged
+    board is not point-symmetric). near: each bridge near half way round (_bridge).
     """
     walls = np.zeros_like(on_board)
     if R < 1:
         return walls
-    sym = rng.random() < 1 / 6
+    sym = rng.random() < 1 / 6 and not _board(R, on_board)[1]
     for _ in range(int(rng.choice((1, 2, 3), p=(0.6, 0.28, 0.12)))):
-        walls |= _bridge(rng, R, on_board, from_centre=sym)
+        walls |= _bridge(rng, R, on_board, from_centre=sym, near=near)
     if rng.random() < 0.2:
         _knock_out(rng, walls, int(rng.integers(1, 3)))
     if rng.random() < 0.3:
@@ -658,14 +736,44 @@ _MIX = {"blob": 0.13, "poly": 0.12, "ring": 0.04, "leaky": 0.16, "messy": 0.13, 
 P_OFF_RIM = 0.5
 
 
-def random_walls(rng: np.random.Generator, R: int, kind: str = None) -> np.ndarray:
-    """uint8 [S,S] wall picture (0/1), zero off board. Deterministic given rng."""
-    on_board = mask(R) == 1
+# The near-tie knob (random_walls near_tie, train.py --near-tie): a bridge board drawn "near" is redrawn up to
+# NEAR_TRIES times until the area ratio of its two largest rim regions is at least NEAR_RATIO (else the
+# nearest of them is kept).
+NEAR_RATIO = 0.75
+NEAR_TRIES = 8
+
+
+def area_ratio(walls: np.ndarray, R: int, board=None) -> float:
+    """Area of the second-largest rim region over the largest (evaluate's bins); nan with fewer than 2."""
+    on, ragged = _board(R, board)
+    _, area, _ = _rim_regions(_labels(on & (walls == 0), R), R, board if ragged else None)
+    return float(area[1] / area[0]) if len(area) >= 2 else float("nan")
+
+
+def random_walls(rng: np.random.Generator, R: int, kind: str = None, board=None, near_tie: float = 0.0) -> np.ndarray:
+    """uint8 [S,S] wall picture (0/1), zero off board. Deterministic given rng.
+
+    board: a ragged mask (module docstring), None = the hexagon. near_tie: the share of "bridge" boards
+    (of the mix's own or asked for by kind) drawn near a tie: bridges near half way round, redrawn until the
+    area ratio of the two largest rim regions is >= NEAR_RATIO (NEAR_TRIES at most). 0 draws nothing extra
+    from rng (the stream of a run without the knob is unchanged)."""
+    on_board, ragged = _board(R, board)
     if kind is None:
         kind = rng.choice(list(_MIX.keys()), p=list(_MIX.values()))
+    if kind == "bridge" and near_tie > 0 and rng.random() < near_tie:
+        best, best_ratio = None, -1.0
+        for _ in range(NEAR_TRIES):
+            w = (_walls_bridge(rng, R, on_board, near=True) & on_board).astype(np.uint8)
+            ratio = area_ratio(w, R, board)
+            if ratio == ratio and ratio > best_ratio:  # (nan: fewer than 2 rim regions)
+                best, best_ratio = w, ratio
+            if best_ratio >= NEAR_RATIO:
+                break
+        return best if best is not None else w
     walls = _KINDS[kind](rng, R, on_board)
-    if kind != "bridge" and rng.random() < P_OFF_RIM and (walls & ~rim(R)).any():  # (not if that leaves nothing)
-        walls &= ~rim(R)
+    rim_cells = _rim_of(R, on_board, ragged)
+    if kind != "bridge" and rng.random() < P_OFF_RIM and (walls & ~rim_cells).any():  # (not if that leaves nothing)
+        walls &= ~rim_cells
     return (walls & on_board).astype(np.uint8)
 
 
@@ -697,7 +805,7 @@ def batch(rng: np.random.Generator, R: int, n: int):
 # Edits: what a user drawing on a settled board does.
 # --------------------------------------------------------------------------
 
-def _splitters(w: np.ndarray, R: int) -> np.ndarray:
+def _splitters(w: np.ndarray, R: int, on=None) -> np.ndarray:
     """bool [S,S]: open cells that would split their region if walled.
 
     That is when two separate runs of walls round the cell are already joined:
@@ -706,12 +814,12 @@ def _splitters(w: np.ndarray, R: int) -> np.ndarray:
     then closes a ring of walls -- a loop, or a bridge with the edge -- round
     part of its region. On a hex grid this is exact.
     """
-    on_board = mask(R) == 1
+    on_board, ragged = _board(R, on)
     lab = _labels(w & on_board, R)  # wall components
-    edge = int(lab.max()) + 1
-    lab = np.where(np.isin(lab, lab[w & rim(R)]), edge, lab)  # those on the rim join the edge
-    lab[~on_board] = edge
-    ring = [_look(lab, dr, dc, fill=edge) for dr, dc in _ROUND]
+    edge_id = int(lab.max()) + 1
+    lab = np.where(np.isin(lab, lab[w & _rim_of(R, on_board, ragged)]), edge_id, lab)  # those on the rim join the edge
+    lab[~on_board] = edge_id
+    ring = [_look(lab, dr, dc, fill=edge_id) for dr, dc in _ROUND]
     starts = [(ring[k] >= 0) & (ring[k - 1] < 0) for k in range(6)]  # a run of walls begins at k
     out = np.zeros_like(on_board)
     for k1 in range(6):
@@ -720,10 +828,11 @@ def _splitters(w: np.ndarray, R: int) -> np.ndarray:
     return out & on_board & ~w
 
 
-def _drain(rng, w, R, filled, keep):
+def _drain(rng, w, R, filled, keep, on=None):
     """Knock out 1-2 wall cells that each sit between a filled cell and the unfilled region:
     a loop drains, or a bridge breaks (with no rim region: walls on the rim next to a filled cell)."""
-    gaps = np.argwhere(w & _dilate(filled) & (_dilate(keep) if keep.any() else rim(R)))
+    on_board, ragged = _board(R, on)
+    gaps = np.argwhere(w & _dilate(filled) & (_dilate(keep) if keep.any() else _rim_of(R, on_board, ragged)))
     if not len(gaps):
         return None
     w = w.copy()
@@ -732,24 +841,24 @@ def _drain(rng, w, R, filled, keep):
     return w
 
 
-def _seal(rng, w, R, filled, keep, tries=4):
+def _seal(rng, w, R, filled, keep, on=None, tries=4):
     """Wall a cell that splits the unfilled region -- the last gap of a loop or of a bridge: part of it fills.
 
     Of a few such cells, the one that changes the most of the answer (a real
     gap rather than a nook by the rim).
     """
-    cand = np.argwhere(_splitters(w, R) & keep)
+    cand = np.argwhere(_splitters(w, R, on) & keep)
     best, most = None, 0
     for i in rng.permutation(len(cand))[:tries]:
         w2 = w.copy()
         w2[tuple(cand[i])] = True
-        n = int((oracle(w2, R)[0] != filled).sum())
+        n = int((oracle(w2, R, on)[0] != filled).sum())
         if n > most:
             best, most = w2, n
     return best
 
 
-def _shift(rng, w, R, filled, keep, layers=3):
+def _shift(rng, w, R, filled, keep, on=None, layers=3):
     """Move the bridge between the unfilled region and the biggest filled rim region into the
     unfilled one, a layer at a time (up to `layers`), until that side is the smaller: the sides swap.
 
@@ -757,11 +866,12 @@ def _shift(rng, w, R, filled, keep, layers=3):
     of the unfilled side next to it, open its cells next to the other side.
     None if there is no such bridge or the sides don't swap.
     """
-    on_board = mask(R) == 1
+    on_board, ragged = _board(R, on)
+    on = on if ragged else None
     w = w.copy()
     for _ in range(layers):
         lab = _labels(on_board & ~w, R)
-        ids = _rim_regions(lab, R)[0]
+        ids = _rim_regions(lab, R, on)[0]
         if len(ids) < 2:
             return None
         x, y = lab == ids[0], lab == ids[1]
@@ -771,15 +881,16 @@ def _shift(rng, w, R, filled, keep, layers=3):
             return None
         w |= x & _dilate(bridge)
         w &= ~(bridge & _dilate(y))
-        if not oracle(w, R)[0][y].any():  # y is the unfilled side now
+        if not oracle(w, R, on)[0][y].any():  # y is the unfilled side now
             return w
     return None
 
 
-def _pocket(rng, w, R, filled, keep):
+def _pocket(rng, w, R, filled, keep, on=None):
     """Wall in a cell of the unfilled region that is already walled on 2+ sides (adds its 1-4 free neighbours): it fills."""
+    on_board, ragged = _board(R, on)
     n_free = sum(_look(~w, dr, dc) for dr, dc in NEIGHBOURS)
-    n_free = np.where(keep & ~rim(R), n_free, 9)  # a rim cell stays outside whatever is round it
+    n_free = np.where(keep & ~_rim_of(R, on_board, ragged), n_free, 9)  # a rim cell stays outside whatever is round it
     if n_free.min() > 4:
         return None
     cells = np.argwhere(n_free == n_free.min())  # the most walled-in first
@@ -795,7 +906,7 @@ def _pocket(rng, w, R, filled, keep):
 P_MOVE = 0.4
 
 
-def edit_walls(rng: np.random.Generator, walls: np.ndarray, R: int) -> np.ndarray:
+def edit_walls(rng: np.random.Generator, walls: np.ndarray, R: int, board=None) -> np.ndarray:
     """A small edit of a wall picture, mostly one that changes the answer (the primary target).
 
     With probability P_MOVE, in random order, whichever applies first of:
@@ -805,17 +916,18 @@ def edit_walls(rng: np.random.Generator, walls: np.ndarray, R: int) -> np.ndarra
     the bigger side until the other side is the bigger -- else wall in a
     half-enclosed pocket. Otherwise, or if none applies (an empty board), it
     toggles 1-4 cells among the walls and the cells next to them (often
-    harmless). Always changes at least one on-board cell.
+    harmless). Always changes at least one on-board cell. board: a ragged mask, None = the hexagon.
     """
-    on_board = mask(R) == 1
+    on_board, ragged = _board(R, board)
+    board = board if ragged else None
     w = walls.astype(bool) & on_board
-    filled = oracle(w, R)[0].astype(bool)
+    filled = oracle(w, R, board)[0].astype(bool)
     keep = on_board & ~w & ~filled  # the rim region the primary target leaves unfilled (none: empty)
 
     if rng.random() < P_MOVE:
         moves = [(_drain, _seal, _shift)[i] for i in rng.permutation(3)]
         for move in moves + [_pocket]:
-            out = move(rng, w, R, filled, keep)
+            out = move(rng, w, R, filled, keep, board)
             if out is not None:
                 return out.astype(np.uint8)
 
@@ -869,17 +981,18 @@ def _stamp(rng, w, R, on_board, p_bridge=0.5):
 WALL_DAMAGE = ("edit", "burst", "erase", "stamp")
 
 
-def damage_walls(rng: np.random.Generator, walls: np.ndarray, R: int, kind: str, p_bridge: float = 0.5) -> np.ndarray:
+def damage_walls(rng: np.random.Generator, walls: np.ndarray, R: int, kind: str, p_bridge: float = 0.5,
+                 board=None) -> np.ndarray:
     """uint8 [S,S]: walls after one damage of `kind` (train.py --damage kinds a-d):
       edit   a small wall edit (edit_walls: mostly one that opens, seals or shifts something)
       burst  n ~ U[3, 20] random additions and deletions of wall cells, mixed (_burst)
       erase  every wall inside a random disc of radius 1-3 opened (_erase)
       stamp  a fresh closed loop or (with probability p_bridge) a rim-to-rim bridge ORed in (_stamp)
-    Stays on the board. Deterministic given rng."""
-    on_board = mask(R) == 1
+    Stays on the board (board: a ragged mask, None = the hexagon). Deterministic given rng."""
+    on_board, ragged = _board(R, board)
     w = walls.astype(bool) & on_board
     if kind == "edit":
-        return edit_walls(rng, w.astype(np.uint8), R)
+        return edit_walls(rng, w.astype(np.uint8), R, board if ragged else None)
     if kind == "stamp":
         out = _stamp(rng, w, R, on_board, p_bridge)
     else:
