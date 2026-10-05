@@ -325,7 +325,179 @@ def main() -> None:
     aux_checks(rng)
     model_checks(rng)
     flood_checks(rng)
+    damage_checks()
+    pool_stat_checks()
+    snapshot_checks()
     print("\nALL OK")
+
+
+def damage_checks() -> None:
+    """The training pool's damage kinds (data.damage_walls a-d, train.damage_state e)."""
+    import torch
+
+    from .data import WALL_DAMAGE, damage_walls, disc
+    from .train import damage_state
+
+    print("\n-- damage (train.py --damage) --")
+    rng = np.random.default_rng(777)
+    hexd = lambda R, a, b: max(abs(int(a[1]) - int(b[1])), abs(int(a[0]) - int(b[0])),
+                               abs(int(a[1]) - int(b[1]) + int(a[0]) - int(b[0])))
+    n_boards, on_ok, changed = 0, True, {k: 0 for k in WALL_DAMAGE}
+    burst_ok, burst_add, burst_del, erase_ok, stamp_ok = True, 0, 0, True, True
+    for _ in range(40):
+        R = int(rng.integers(3, 9))
+        on = mask(R) == 1
+        w = random_walls(rng, R)
+        for kind in WALL_DAMAGE:
+            d = damage_walls(np.random.default_rng(int(rng.integers(1 << 30))), w, R, kind)
+            on_ok &= d.dtype == np.uint8 and d.shape == w.shape and set(np.unique(d)) <= {0, 1} \
+                and int(d[~on].sum()) == 0
+            diff = d != w
+            changed[kind] += bool(diff.any())
+            if kind == "burst":
+                burst_ok &= 1 <= int(diff.sum()) <= 20
+                burst_add += int((diff & (d == 1)).sum())
+                burst_del += int((diff & (d == 0)).sum())
+            if kind == "erase":  # removed = exactly the walls inside a disc of radius 1-3 round one of the walls
+                removed = diff & (w == 1)
+                erase_ok &= not (diff & (d == 1)).any() and removed.any() == bool(w.any()) and (not w.any() or any(
+                    np.array_equal(removed, (w == 1) & disc(R, r0, c0, rad))
+                    for r0, c0 in np.argwhere(w == 1) for rad in (1, 2, 3)))
+            if kind == "stamp":
+                stamp_ok &= not (diff & (d == 0)).any()  # only adds walls
+        n_boards += 1
+    check(on_ok, f"damage_walls, every kind on {n_boards} boards (R 3-8): uint8 0/1, nothing off board")
+    check(changed["edit"] == n_boards, "edit (edit_walls) always changes the board")
+    check(burst_ok and burst_add > 0 and burst_del > 0,
+          f"burst changes 1-20 cells, additions ({burst_add}) and deletions ({burst_del}) mixed")
+    check(erase_ok and changed["erase"] >= n_boards - 2,
+          "erase only removes walls: exactly every wall within distance 1-3 of a wall cell (the disc's centre)")
+    check(stamp_ok and changed["stamp"] >= 0.9 * n_boards, f"stamp only adds walls (changed {changed['stamp']} of "
+          f"{n_boards} boards)")
+
+    # A stamp on an empty board: a bridge splits it into 2+ rim regions, a loop encloses something.
+    R, nb, nl = 8, 0, 0
+    on = mask(R) == 1
+    empty = np.zeros((side(R), side(R)), dtype=np.uint8)
+    for _ in range(40):
+        b = damage_walls(rng, empty, R, "stamp", p_bridge=1.0)
+        nb += len(_rim_regions(_labels(on & (b == 0), R), R)[0]) >= 2
+        loop = damage_walls(rng, empty, R, "stamp", p_bridge=0.0)
+        nl += bool(targets(loop, R)[0][0].any())
+    check(nb >= 36 and nl >= 24, f"a stamped bridge splits an empty board into 2+ rim regions ({nb}/40), a stamped "
+          f"loop fills something ({nl}/40; a blob run over the rim is open to the edge)")
+
+    # Edits pile up: three in a row change the board further (nothing toggles back).
+    w = random_walls(rng, 6)
+    w1 = damage_walls(rng, w, 6, "stamp")
+    w2 = damage_walls(rng, w1, 6, "stamp")
+    check(not np.array_equal(w1, w2) and ((w1 == 1) <= (w2 == 1)).all(), "damage applies to the board as it is "
+          "(a second stamp keeps the first)")
+
+    # State damage (distill's): zeroes channels 1.. inside the disc, nothing else.
+    ok, n_zeroed = True, 0
+    for _ in range(30):
+        R = int(rng.integers(3, 11))
+        S, on = side(R), mask(R) == 1
+        w = torch.from_numpy(random_walls(rng, R)).float()
+        st = torch.from_numpy((rng.random((16, S, S)) * 2 - 1).astype(np.float32)) * torch.from_numpy(on)
+        st[0] = w
+        before = st.clone()
+        dsc = damage_state(rng, st, R)
+        rad = max(hexd(R, a, b) for a in np.argwhere(dsc & on) for b in np.argwhere(dsc & on)) / 2
+        inside = torch.from_numpy(dsc)
+        ok &= torch.equal(st[0], before[0]) and torch.equal(st[:, ~inside], before[:, ~inside]) \
+            and bool((st[1:, inside] == 0).all()) and bool((dsc & on).any()) and rad <= max(1, R // 2)
+        n_zeroed += int((inside & torch.from_numpy(on)).sum())
+    check(ok, f"damage_state zeroes channels 1.. inside a disc of radius <= R/2 round an on-board cell, and only "
+          f"there; walls (ch0) untouched (30 boards, {n_zeroed} cells zeroed)")
+
+
+def pool_stat_checks() -> None:
+    """train.pool_stats against a direct count, and train.steer."""
+    from .train import BAND, DAMAGE_KINDS, K_POOL, draw, pool_stats, steer
+
+    print("\n-- pool statistics --")
+    rng = np.random.default_rng(778)
+    R = 6
+    on = mask(R) == 1
+    w, f, _, _ = draw(rng, R, 120, 0.25)
+    st = pool_stats(w, f, R)
+    multi = np.mean([len(_rim_regions(_labels(on & (x == 0), R), R)[0]) >= 2 for x in w])
+    fill = np.mean([targets(x, R)[0][0].any() for x in w])
+    dens = np.mean([x[on].mean() for x in w])
+    check(f.shape[1] == K_POOL and abs(st["multiRim"] - multi) < 1e-3 and abs(st["fill"] - fill) < 1e-3
+          and abs(st["density"] - dens) < 1e-3,
+          f"pool_stats = a direct count on 120 boards: fill {st['fill']}, 2+ rim regions {st['multiRim']} "
+          f"(= the primary target fills a rim cell), density {st['density']}")
+    ok_band = all(BAND[k][0] <= st[k] <= BAND[k][1] for k in BAND)
+    calm = steer(st)
+    check(ok_band and calm["why"] == [] and calm["newMult"] == 1 and calm["p"] == [0.2] * 5,
+          "a fresh pool is in BAND, and steer leaves it alone (uniform damage, new boards as usual)")
+    i = {k: n for n, k in enumerate(DAMAGE_KINDS)}
+    lo = steer({"fill": 0.2, "multiRim": 0.1, "density": 0.2})
+    dense = steer({"fill": 0.6, "multiRim": 0.4, "density": 0.6})
+    high = steer({"fill": 0.9, "multiRim": 0.4, "density": 0.2})
+    check(lo["p"][i["stamp"]] > 0.5 and lo["pBridge"] == 0.9 and lo["newMult"] == 2
+          and dense["p"][i["stamp"]] == 0 and dense["p"][i["erase"]] > 0.4 and dense["newMult"] == 2
+          and high["p"][i["stamp"]] < 0.05 and high["p"][i["erase"]] > 0.3,
+          "steer: fill or 2+ rim regions low -> more stamps (bridges), density high -> erase and no stamps, fill "
+          "high -> erase and burst; any of them doubles the new boards")
+
+
+def snapshot_checks() -> None:
+    """A 3-iteration pure training run (a subprocess, in a temp dir) writes runs/<name>/pool.npz to the
+    dashboard contract, and log.jsonl starts with the config and its --iters."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    from .train import DAMAGE_KINDS
+
+    print("\n-- pool.npz snapshot (a 3-iteration run) --")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [sys.executable, "-m", "nca.train", "--name", "snap", "--R", "3", "4", "--iters", "3", "--batch", "8",
+               "--pool-size", "64", "--snap-every", "1", "--eval-mults", "1", "--hidden", "16"]
+        t = time.time()
+        res = subprocess.run(cmd, cwd=tmp, env={**os.environ, "PYTHONPATH": root}, capture_output=True, text=True)
+        check(res.returncode == 0, f"python -m nca.train ... --iters 3 runs ({time.time() - t:.1f} s)"
+              + ("" if res.returncode == 0 else ": " + res.stderr[-800:]))
+        with open(os.path.join(tmp, "runs", "snap", "log.jsonl")) as f:
+            first = json.loads(f.readline())
+        check(first["config"]["iters"] == 3 and first["config"]["R"] == [3, 4],
+              "log.jsonl's first line is the config, with the --iters target")
+        z = np.load(os.path.join(tmp, "runs", "snap", "pool.npz"))
+        B, n, m, C = 8, 48, 6, 16
+        want = {"iteration": (np.int64, ()), "radii": (np.int64, (2,)), "last_R": (np.int64, ()),
+                "last_idx": (np.int64, (B,))}
+        for R in (3, 4):
+            S = side(R)
+            want.update({f"walls_{R}": (np.uint8, (n, S, S)), f"fill_{R}": (np.float16, (n, S, S)),
+                         f"target_{R}": (np.uint8, (n, S, S)), f"ntargets_{R}": (np.uint8, (n,)),
+                         f"loss_{R}": (np.float32, (n,)), f"age_{R}": (np.int32, (n,)),
+                         f"edits_{R}": (np.int32, (n,)), f"damage_{R}": (np.int8, (n,)),
+                         f"state_{R}": (np.float16, (m, C, S, S))})
+        bad = [k for k, (dt, sh) in want.items() if k not in z.files or z[k].dtype != dt or z[k].shape != sh]
+        check(not bad and sorted(z.files) == sorted(want),
+              f"pool.npz loads with np.load and has every key of the contract with its shape and dtype ({len(want)} "
+              f"keys)" + (f"; wrong: {bad}" if bad else ""))
+        ok = int(z["iteration"]) == 3 and list(z["radii"]) == [3, 4] and int(z["last_R"]) in (3, 4)
+        for R in (3, 4):
+            on = mask(R) == 1
+            ok &= not z[f"walls_{R}"][:, ~on].any() and not z[f"fill_{R}"][:, ~on].any() \
+                and not z[f"target_{R}"][:, ~on].any() and not z[f"state_{R}"][:, :, ~on].any()
+            ok &= bool((z[f"ntargets_{R}"] >= 1).all()) and bool((z[f"age_{R}"] >= 0).all()) \
+                and bool((z[f"age_{R}"] <= 3).all()) and bool((z[f"edits_{R}"] >= 0).all())
+            ok &= bool(((z[f"damage_{R}"] >= -1) & (z[f"damage_{R}"] < len(DAMAGE_KINDS))).all())
+            ok &= bool(((z[f"edits_{R}"] == 0) == (z[f"damage_{R}"] == -1)).all())
+            ok &= np.array_equal(z[f"state_{R}"][:, 1], z[f"fill_{R}"][:m])
+        lr = int(z["last_R"])
+        ok &= bool(np.isfinite(z[f"loss_{lr}"][z["last_idx"][z["last_idx"] < n]]).all())
+        check(ok, "...and its values make sense: off-board 0, ages 0..3, edits 0 iff no damage kind, the batch "
+              "that just ran has a loss, state_R[:, 1] = fill_R")
 
 
 def _components(cells: np.ndarray) -> int:

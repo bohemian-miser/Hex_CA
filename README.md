@@ -357,6 +357,21 @@ At R=32 a bridge settled by ~260 steps in ~25 s on this machine (also a Pi
 5) at the page's max 600 steps/s, badge matching; no console errors. Honest
 limit: ~15 boards by hand, none of it past R=32.
 
+### Watching a run
+
+`python -m nca.dashboard [--port 8765] [--runs runs]` serves a small local,
+read-only page (`http://127.0.0.1:8765/`) over whatever's under `runs/`:
+per-run progress (loss, every quick-check metric and pool statistic the log
+happens to have, whatever their names) alongside the live sample pool
+itself — walls, fill, target, loss, age and last damage kind, a grid per
+radius, sorted by pool order, loss or age, a click on a board carrying a
+full state (the first few of each radius) opening all 16 channels as small
+multiples. It reads `runs/<name>/log.jsonl` and the trainer's periodic
+`runs/<name>/pool.npz` snapshot (`--snap-every`) and never writes anything;
+a run with no snapshot yet still shows its charts. `--demo` fabricates a
+throwaway `runs/_demo/` run first, to try the page on before any training
+has happened.
+
 ### Licence
 
 AGPL-3.0-only — see `LICENSE`.
