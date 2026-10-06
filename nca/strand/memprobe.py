@@ -5,9 +5,9 @@
 For each backprop window G it runs, in a FRESH process, one gradient window of nca/strand/train2.py's iteration
 on level-4 crops (the largest boards, S 42): consts built by train2.Planes, G steps of the model with the loss
 over the last min(8, G) steps, backward. It reports the process's peak RSS above its RSS just before the window
-(VmHWM after resetting it, so every transient counts, E's checkpointed recompute included). Two windows give the memory per
-step (the slope: activations kept for backward) and the rest (the intercept: the largest transient); both scale
-with batch x cells. --eval adds a no-gradient read-out at the eval batch. The GPU adds its context (~0.3-0.5 GB a
+(VmHWM after resetting it, so every transient counts, E's re-gathered taps in backward included). Two windows
+give the memory per step (the slope: activations kept for backward) and the rest (the intercept: the largest
+transient); both scale with batch x cells. --eval adds a no-gradient read-out at the eval batch. The GPU adds its context (~0.3-0.5 GB a
 process) and the allocator's slack, and holds the pool states (slots x channels x S^2 floats per level).
 """
 
@@ -73,8 +73,7 @@ def one(args):
     else:
         seen, saved = set(), [0]
 
-        def pack(x):  # autograd's saved tensors, each storage once (device-independent; E's checkpoint inputs are
-            # kept alive by the checkpoint itself, not saved here)
+        def pack(x):  # autograd's saved tensors, each storage once (device-independent)
             st = x.untyped_storage()
             if st.data_ptr() not in seen:
                 seen.add(st.data_ptr())

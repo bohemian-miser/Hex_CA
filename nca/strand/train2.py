@@ -14,9 +14,10 @@ INPUTS (the consts, mask first; --inputs; the static planes are rules.py's):
   d-cs  mask 1 + D-cs's 12 (type one-hot 9, cos and sin of 2 pi rot / 6, mirror 1)               + tap 59 =  72
   e     mask 1 + E's 9 (type one-hot only)                                                       + tap 59 =  69
         and nets.FrameNCA: each cell runs the update in its own frame (option E: rotation and mirror are not
-        inputs but which permutation of the shared weights the cell uses; the consts carry the frame index as
-        a last plane for that, never as a feature). Hidden state: --dir-groups directional groups of 6
-        channels (default (channels - 13) // 12) after ch1-12, scalars after them.
+        inputs but which permutation of its taps and directional channels the cell reads; the consts carry the
+        frame index as a last plane for that, never as a feature). Hidden state: --dir-groups directional
+        groups of 6 channels (default (channels - 13) // 12) after ch1-12, scalars after them.
+  e-bc  E, plus the rule's 53-bit code on EVERY board cell (E's diagnostic, as c-bc is C's)          + 59 = 122
   The tap, in every arm, on the tapped cell only and held every step: the rule's code (53: 8 class bits, then
   9 x 5 digit one-hot; rules.py) and the tapped chord's two edge directions (6). No owner slot (one player in
   M1). A chord is never an input.
@@ -36,9 +37,9 @@ TASKS
        until its whole settle time has passed (a re-route can open or close it far from the tap). 12 output
        planes; start it from an m1a checkpoint (--init).
   Ideal steps: m1a grow + 1 (walker.Strand.grow_steps); m1b max(grow + 1, the latest open news + 1).
-MODEL: nets.StrandNCA (nets.FrameNCA for e) = HexNCA's taps step with --depth hidden layers (default 1 = HexNCA); --channels (96): ch0
-the mask, ch1-6 edges, ch7-12 closed, ch13.. hidden (83 at 96); --hidden 128; clamp [-2, 2]. Boards padded to
-S x S per level (L2 12, L3 37, L4 crops 42).
+MODEL: nets.StrandNCA (nets.FrameNCA for e, e-bc) = HexNCA's taps step with --depth hidden layers (default 1 =
+HexNCA); --channels (96): ch0 the mask, ch1-6 edges, ch7-12 closed, ch13.. hidden (83 at 96); --hidden 128; clamp
+[-2, 2]. Boards padded to S x S per level (L2 12, L3 37, L4 crops 42).
 POOL, DAMAGE, LOSS, SCHEDULE, COLLAPSE GUARD, --resume, --init, ckpt.pt / best.pt: as nca/strand/train.py's
 docstring, except: damage "edit" = 1-3 board cells with chords (never the tapped one) re-typed to another
 random (type, rotation) -- a static-input edit, so their chords change under the slot's rule and the strand
@@ -92,7 +93,8 @@ from .nets import FrameNCA, StrandNCA
 from .rules import default_dir as v2_default_dir
 from .walker import PAIRS, walk
 
-INPUTS = ("a", "c", "c-bc", "d", "d-cs", "e")
+INPUTS = ("a", "c", "c-bc", "d", "d-cs", "e", "e-bc")
+BROADCAST = ("c-bc", "e-bc")  # the rule's code on every board cell (diagnostics)
 TAP = CODE_BITS + 6                # 59 planes on the tapped cell: the code, the tapped chord's two edges
 OUT = {"m1a": slice(1, 7), "m1b": slice(1, 13)}
 N_FIXED = 13                       # ch0 mask + 6 edges + 6 closed; hidden channels after
@@ -109,11 +111,16 @@ PROBE_CELLS = 30000
 
 def static_of(inputs):
     """rules.py's static table behind an --inputs option."""
-    return "c" if inputs == "c-bc" else inputs
+    return {"c-bc": "c", "e-bc": "e"}.get(inputs, inputs)
+
+
+def framed(inputs):
+    """Option E's nets.FrameNCA (local frames; the consts end with the frame plane)."""
+    return static_of(inputs) == "e"
 
 
 def n_inputs(inputs):
-    return 1 + STATIC[static_of(inputs)] + (CODE_BITS if inputs == "c-bc" else 0) + TAP
+    return 1 + STATIC[static_of(inputs)] + (CODE_BITS if inputs in BROADCAST else 0) + TAP
 
 
 def dir_groups_of(channels, groups):
@@ -122,7 +129,7 @@ def dir_groups_of(channels, groups):
 
 
 def make_model(channels, hidden, clamp, n_in, depth=1, inputs="c", dir_groups=None):
-    if inputs != "e":
+    if not framed(inputs):
         return StrandNCA(channels, hidden, depth, clamp, n_in)
     G = dir_groups_of(channels, dir_groups)
     # directional groups of concat(state, consts): edges, closed, G hidden groups; the tap's two chord edges
@@ -163,8 +170,8 @@ class Planes:
         lut = np.zeros((N_GEO + 1, st.shape[1]), np.float32)
         lut[:N_GEO] = st
         self.lut = torch.from_numpy(lut).to(device)
-        self.bc = inputs == "c-bc"
-        self.frames = inputs == "e"  # E: one more plane, the cell's frame (FrameNCA picks its weights by it)
+        self.bc = inputs in BROADCAST
+        self.frames = framed(inputs)  # E: one more plane, the cell's frame (FrameNCA permutes by it)
         self.n_in = n_inputs(inputs)
         self.device = device
         self.tap_at = 1 + st.shape[1] + (CODE_BITS if self.bc else 0)  # first tap plane
@@ -702,7 +709,7 @@ def main(argv=None):
     t_start = time.time()
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--name", required=True)
-    p.add_argument("--inputs", choices=INPUTS, default="c", help="static input option (§3); c-bc = diagnostic")
+    p.add_argument("--inputs", choices=INPUTS, default="c", help="static input option (§3); c-bc, e-bc = diagnostics")
     p.add_argument("--task", choices=("m1a", "m1b"), default="m1a")
     p.add_argument("--levels", type=int, nargs="+", default=[2], help="training levels (2, 3, 4 = level-4 crops)")
     p.add_argument("--eval-levels", type=int, nargs="+", default=[3, 4], help="quick-check levels (held-out rules)")
@@ -728,7 +735,7 @@ def main(argv=None):
     p.add_argument("--channels", type=int, default=96)
     p.add_argument("--depth", type=int, default=1, help="hidden layers of the per-cell update MLP (1 = HexNCA's)")
     p.add_argument("--dir-groups", type=int, default=-1,
-                   help="--inputs e: hidden directional groups (6 channels each); default (channels - 13) // 12")
+                   help="--inputs e, e-bc: hidden directional groups (6 channels each); default (channels - 13) // 12")
     p.add_argument("--clamp", type=float, nargs=2, default=[-2.0, 2.0], metavar=("LO", "HI"))
     p.add_argument("--resume", action="store_true")
     p.add_argument("--init", help="start from this checkpoint's weights (same --inputs/--channels/--hidden)")
@@ -792,7 +799,7 @@ def main(argv=None):
                         f"{args.depth} ({n_in} consts)")
         if args.channels <= N_FIXED:
             p.error(f"--channels must be > {N_FIXED}")
-        if args.inputs == "e" and N_FIXED + 6 * dir_groups_of(args.channels, args.dir_groups) > args.channels:
+        if framed(args.inputs) and N_FIXED + 6 * dir_groups_of(args.channels, args.dir_groups) > args.channels:
             p.error("--dir-groups: 13 + 6 x groups must fit in --channels")
         cfg = {"task": args.task, "inputs": args.inputs, "levels": sorted(args.levels),
                "evalLevels": sorted(args.eval_levels), "evalSets": list(args.eval_sets), "data": args.data,

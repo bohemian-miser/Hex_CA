@@ -234,9 +234,9 @@ faces, and the mirror sign; theta = 2 pi rot / 6):
 | D-fourier | 15 | type one-hot 9, cos / sin k theta for k = 1, 2, 3 without sin 3 theta (0 at every 60 degrees), mirror: an invertible linear map of A's rotation one-hot (probe only) |
 | E | 9 | type one-hot only; the rotation and mirror are the cell's frame (nets.FrameNCA), not inputs |
 
-`train2 --inputs` takes a, c, c-bc (C plus the code broadcast to every cell: the diagnostic ceiling), d, d-cs
-and e. Consts = mask + static + tap: 76 / 115 / 168 / 71 / 72 / 69 (E: + the frame plane, which picks the
-weights and is never a feature).
+`train2 --inputs` takes a, c, c-bc (C plus the code broadcast to every cell: the diagnostic ceiling), d, d-cs,
+e and e-bc (E plus the broadcast code, E's diagnostic). Consts = mask + static + tap: 76 / 115 / 168 / 71 / 72 /
+69 / 122 (E: + the frame plane, which picks the cell's permutation and is never a feature).
 
 **Parity** (`rules --parity`): of 2,000 rule-boards over all 7 subsets, the table's rendering equals Spectacle's
 on every cell, all 32,000 taps walk identically (cells, entry / exit edges, order, signed index, closed), and
@@ -336,3 +336,21 @@ level-4 crops, S 42, at two window lengths): per backprop step at batch 8, E 19.
 checkpointed 7-tap recompute), C 35.6 MB (+43), big 75.9 MB (+33); autograd's saved tensors are ~70 % of that.
 At the trainer's window of 48 and batch 16: E 2.5 GB, C 3.5 GB, big 7.35 GB. `nca/cloud/plan-7.txt` sizes its
 batches from these (all three arms at 16, ~15.6 GB with pools and CUDA contexts).
+
+**E, rewritten as one gather** (after launch 7, whose tap-e ran 2.33 s / iteration on the L4 against C's 0.09 and
+was stopped). The first `FrameNCA` permuted the shared weights to each of the 12 frames and ran the frames one
+after another: per step a `nonzero` per frame (a host sync on a GPU), a row gather, two matmuls and a full-size
+`index_copy` per frame, the 12 permuted weight copies rebuilt, and the whole update checkpointed, so all of it
+ran again in backward: ~320 dispatched ops and 23 host syncs per gradient step against C's 27 and none. Now every
+cell's 7 taps, its directional channels in its own frame, are gathered from the zero-padded board by one
+per-cell index (cached per consts tensor, so built once a rollout) straight into the rows of the shared per-cell
+MLP: one matmul, 51 ops a step, no syncs, no frame loop, no per-cell weights; backward keeps only the board rows
+(about the input's size) and gathers again. Parameters and state_dict are unchanged (launch 7's tap-e
+checkpoints load). selftest2 keeps the first version as the reference: outputs and every gradient agree to
+5e-15 (float64, all 12 frames, depth 1 and 2, e and e-bc); the equivariance check stays exact (0.0).
+CPU per iteration relative to C at plan 7's settings (level 2, batch 16, 8 + 48 steps, forward + backward +
+Adam; the Pi loaded, medians of repeated runs): E 0.66-0.69 at one thread (the first version 1.93-2.36),
+0.86-0.89 at three (3.1-3.3), 0.67-0.75 at level 3 with three threads (1.92-2.33); E-bc 0.84, E at hidden
+512 1.98. Memory per backprop step at batch 8 (memprobe, level-4 crops, windows 4 / 20): E 47-50 MB (saved
+tensors 28), E-bc 52 (31), E at hidden 512 64.5 (50), C 39 (24.5) the same day; `nca/cloud/plan-8.txt` sizes
+its three E arms from these.
