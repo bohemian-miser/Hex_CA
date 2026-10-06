@@ -22,8 +22,9 @@
 # against the first, per-frame version to 5e-15 in float64, equivariance exact): 51 ops per gradient step and no
 # host syncs, where the first version had ~320 ops and 23 syncs (C: 27). On the Pi's CPU at these settings (level 2,
 # batch 16, 8 + 48 steps, forward + backward + Adam), per iteration relative to C: E 0.66 (was 1.9-2.4), E-bc
-# 0.84, E-wide 1.98; at level 3 E 0.67 (was 1.92). Not measured on the L4: expect E near C's 0.09 s / iteration at
-# l2 (some more small ops per step) and at or under C's time at l3 / l4; E-wide about twice C's. Watch secPerIter.
+# 0.84, E-wide 1.98; at level 3 E 0.67-0.75 (was 1.9-2.3). Not measured on the L4: expect E near C's 0.09 s /
+# iteration at l2 (some more small ops per step) and at or under C's time at l3 / l4; E-wide about twice C's.
+# Watch secPerIter.
 # Memory (python -m nca.strand.memprobe: CPU peak RSS over a gradient window on level-4 crops, S 42, batch 8,
 # windows 4 / 20): per backprop step E 50 MB, E-bc 52, E-wide 64.5 (autograd's saved tensors 28 / 31 / 50; C 39 /
 # 24.5 the same day). At window 48 and batch 16: E 4.9 GB, E-bc 5.2, E-wide 6.4 = 16.5 GB, + the pools (256 slots

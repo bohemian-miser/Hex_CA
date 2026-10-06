@@ -349,7 +349,8 @@ MLP: one matmul, 51 ops a step, no syncs, no frame loop, no per-cell weights; ba
 checkpoints load). selftest2 keeps the first version as the reference: outputs and every gradient agree to
 5e-15 (float64, all 12 frames, depth 1 and 2, e and e-bc); the equivariance check stays exact (0.0).
 CPU per iteration relative to C at plan 7's settings (level 2, batch 16, 8 + 48 steps, forward + backward +
-Adam; the Pi loaded, medians): E 0.66-0.69 at one thread (the first version 1.93-2.36), 0.86 at three (3.31),
-0.67 at level 3 with three threads (1.92); E-bc 0.84, E at hidden 512 1.98. Memory per backprop step at batch 8
-(memprobe, level-4 crops, windows 4 / 20): E 50 MB (saved tensors 28), E-bc 52 (31), E at hidden 512 64.5 (50),
-C 39 (24.5) the same day; `nca/cloud/plan-8.txt` sizes its three E arms from these.
+Adam; the Pi loaded, medians of repeated runs): E 0.66-0.69 at one thread (the first version 1.93-2.36),
+0.86-0.89 at three (3.1-3.3), 0.67-0.75 at level 3 with three threads (1.92-2.33); E-bc 0.84, E at hidden
+512 1.98. Memory per backprop step at batch 8 (memprobe, level-4 crops, windows 4 / 20): E 47-50 MB (saved
+tensors 28), E-bc 52 (31), E at hidden 512 64.5 (50), C 39 (24.5) the same day; `nca/cloud/plan-8.txt` sizes
+its three E arms from these.
