@@ -60,7 +60,13 @@ QUICK CHECK (held-out rules only; --eval-sets, at --eval-levels):
   fresh state. "q": exact (natural mix) and balanced (bucket mean; the score best.pt keeps), each the mean
   over (set, level); iou; steps {ratio, excess}; byLevel; bySet {legacy, wide: exact, balanced, byLevel,
   byLen}; bySubset (exact, n); byLen; m1b adds parts {edges, closed} (the shares with the six edge planes /
-  the six closed planes right). And "code", the CODE-FIDELITY PROBE (§5.4): a ridge linear probe from the
+  the six closed planes right). "exit", the RIGHT-EXIT RATE at the read-out, pooled over every quick-check tap:
+  walking out from the tap both ways, each hop from a drawn chord to the next chord of the strand is a try, a
+  hit if that chord is drawn too, and a way stops at its first miss (exit_hops) -- rate (hits / tries), c1 / c2
+  / c3 (the same by the next cell's chord count under the rule: 1, 2, 3; c1 is passing through, c2 and c3 need
+  the right exit), n (tries), tap (share of taps with the tapped chord drawn). A line of n chords is exact
+  only if about n hops all hit, so exact hides progress in the rate (0.82 -> 0.95 lifts a 20-chord line from
+  ~2 % to ~36 %). And "code", the CODE-FIDELITY PROBE (§5.4): a ridge linear probe from the
   hidden channels (13..) of drawn strand cells (never the tapped one) to the 53 code bits, fitted on the
   training pools (train rules), tested on the quick check's read-out states (held-out rules): bits (per-bit
   accuracy, digits decoded by argmax), classes / digits / exact (shares of cells with the 8 class bits / the
@@ -330,7 +336,9 @@ def step_loss(state, task, a, b, oc, closed, age, mk, ncell):
 
 class EvalSet:
     """Fixed held-out taps of one (set, level): geo [n,S,S], rule [n,10], tap [n,4], a / oc [n,6,S,S],
-    closed [n]; items: bucket, subset (key), w (natural mix within the set-level), ideal, length."""
+    closed [n]; items: bucket, subset (key), w (natural mix within the set-level), ideal, length; walks: per tap
+    (rows, cols, ins, outs, chords, tap_pos, closed), the strand in walking order and each step's cell's chord
+    count under the rule (exit_hops)."""
 
     def __init__(self, name, level, S, rows, task, mult, cap, natural=None):
         self.name, self.level, self.S, self.task = name, level, S, task
@@ -341,6 +349,7 @@ class EvalSet:
         self.oc = np.stack([r["oc"] for r in rows])
         self.closed = np.array([r["closed"] for r in rows], bool)
         self.items = {k: np.array([r[k] for r in rows]) for k in ("bucket", "subset", "w", "ideal", "length")}
+        self.walks = [r["walk"] for r in rows]  # per tap: the strand in walking order, for the exit counts
         self.H = int(min(cap, max(mult * S, int(self.items["ideal"].max(initial=1)) + 8)))
 
     def counts(self):
@@ -350,9 +359,44 @@ class EvalSet:
 
 def _row(tab, geo, rule, tap, st, task, bucket, w):
     a, oc, ideal = strand_targets(st, geo.shape, task)
+    bits = tab.render_bits(int(rule[0]), np.asarray(rule[1:], np.int64), geo)[st.rows, st.cols].astype(np.int64)
+    chords = ((bits[:, None] >> np.arange(15)) & 1).sum(1).astype(np.int8)
+    walk_ = (st.rows.astype(np.int16), st.cols.astype(np.int16), st.ins.astype(np.int8), st.outs.astype(np.int8),
+             chords, st.tap_pos, bool(st.closed))
     return {"geo": geo, "rule": np.asarray(rule, np.int64), "tap": np.asarray(tap, np.int64), "a": a,
             "oc": oc, "closed": bool(st.closed), "bucket": bucket, "subset": tab.keys[int(rule[0])], "w": w,
-            "ideal": ideal, "length": len(st)}
+            "ideal": ideal, "length": len(st), "walk": walk_}
+
+
+def exit_hops(drawn, chords, p, closed):
+    """The right-exit counts of one strand at the read-out: (tries [3], hits [3]) by the next cell's chord count
+    (1, 2, 3). drawn [n] bool = chord k of the strand (walking order) is drawn (both its edges); p = the tapped
+    chord's position. From the tap, both ways: every hop from a drawn chord to the next one is a try, and a hit
+    if that one is drawn too; a way stops at its first miss or the strand's end (a circuit: where it meets what
+    the other way has counted). Nothing is tried if the tapped chord itself is not drawn."""
+    n = len(drawn)
+    tries, hits = np.zeros(3, np.int64), np.zeros(3, np.int64)
+    if not drawn[p]:
+        return tries, hits
+    seen = {p}
+    for way in (1, -1):
+        k = p
+        while True:
+            nx = k + way
+            if closed:
+                nx %= n
+            elif not 0 <= nx < n:
+                break
+            if nx in seen:
+                break
+            seen.add(nx)
+            c = min(max(int(chords[nx]), 1), 3) - 1
+            tries[c] += 1
+            if not drawn[nx]:
+                break
+            hits[c] += 1
+            k = nx
+    return tries, hits
 
 
 def legacy_set(task, tab, legacy_dir, level, n, mult, cap):
@@ -435,13 +479,14 @@ def wide_set(task, tab, bd, level, n, mult, cap, per_subset=40, boards_per_rule=
 @torch.no_grad()
 def evaluate(stepper, planes, ev, channels, device, batch, codes, probe=False):
     """Roll each tap of ev from the fresh state for ev.H steps. Per tap: exact at the end, the settle step, edge
-    IoU (the six edge planes); m1b also edges / closed (each half right); probe: per drawn strand cell (not
-    the tapped one) its hidden channels, the code and its distance from the tap.
+    IoU (the six edge planes), the right-exit counts at the end (exit_hops: tries / hits [3], tapDrawn); m1b
+    also edges / closed (each half right); probe: per drawn strand cell (not the tapped one) its hidden
+    channels, the code and its distance from the tap.
     stepper(state, walls, consts, t, sl) -> state (t = 1..H, sl = the slice of ev's taps)."""
     task = ev.task
     out = OUT[task]
     n, H = len(ev.geo), ev.H
-    res = {k: [] for k in ("last", "last_e", "last_c", "iou")}
+    res = {k: [] for k in ("last", "last_e", "last_c", "iou", "tries", "hits", "tapDrawn")}
     cells = {"x": [], "y": [], "dist": []}
     for s0 in range(0, n, batch):
         sl = slice(s0, min(n, s0 + batch))
@@ -466,6 +511,13 @@ def evaluate(stepper, planes, ev, channels, device, batch, codes, probe=False):
                 last_e = torch.where(wrong[:, :6].flatten(1).any(1), t, last_e)
                 last_c = torch.where(wrong[:, 6:].flatten(1).any(1), t, last_c)
         pred = (state[:, 1:7] > 0.5) & mk
+        pn = pred.cpu().numpy()
+        for i, (rr, cc, ii, oo, ch, p, cl) in enumerate(ev.walks[sl]):
+            drawn = pn[i, ii, rr, cc] & pn[i, oo, rr, cc]
+            tr, ht = exit_hops(drawn, ch, p, cl)
+            res["tries"].append(tr)
+            res["hits"].append(ht)
+            res["tapDrawn"].append(bool(drawn[p]))
         inter = (pred & on).flatten(1).sum(1).float()
         union = (pred | on).flatten(1).sum(1).float()
         res["iou"].append(torch.where(union > 0, inter / union.clamp(min=1), torch.ones_like(union)).cpu().numpy())
@@ -480,7 +532,9 @@ def evaluate(stepper, planes, ev, channels, device, batch, codes, probe=False):
             cells["y"].append(codes(ev.rule[sl])[b_i.cpu().numpy()])
             cells["dist"].append(dist[b_i, r_i, c_i].cpu().numpy())
     last = np.concatenate(res["last"])
-    out_d = {"exact": last < H, "settle": last + 1, "iou": np.concatenate(res["iou"])}
+    out_d = {"exact": last < H, "settle": last + 1, "iou": np.concatenate(res["iou"]),
+             "tries": np.array(res["tries"]).reshape(-1, 3), "hits": np.array(res["hits"]).reshape(-1, 3),
+             "tapDrawn": np.array(res["tapDrawn"], bool)}
     if task == "m1b":
         out_d["edges"] = np.concatenate(res["last_e"]) < H
         out_d["closed"] = np.concatenate(res["last_c"]) < H
@@ -547,6 +601,12 @@ def summarise(task, evs, results, tab):
         if rs:
             ratio = np.concatenate([x["ratio"][x["bk"] == j] for x in rs])
             q["byLen"][name] = {"exact": rnd(np.mean([x["byLen"][j] for x in rs])), "steps": med(ratio)}
+    tries = np.sum([r["tries"].sum(0) for r in results], 0)
+    hits = np.sum([r["hits"].sum(0) for r in results], 0)
+    rate = lambda h, t: round(float(h / t), 4) if t else None  # noqa: E731
+    q["exit"] = {"rate": rate(hits.sum(), tries.sum()), "c1": rate(hits[0], tries[0]), "c2": rate(hits[1], tries[1]),
+                 "c3": rate(hits[2], tries[2]), "n": int(tries.sum()),
+                 "tap": round(float(np.mean(np.concatenate([r["tapDrawn"] for r in results]))), 4)}
     q["levels"] = len(levels)
     return q
 

@@ -13,9 +13,9 @@
      (ends at their own distance, circuits = the draw time); edit damage re-types 1-3 cells, never the tap's
   4. the legacy set = train.py's quick-check taps (same boards, taps, targets), and its chords rendered from
      the table = the v1 chord planes
-  5. the quick check: the oracle state scores exact 1.0 (steps ratio 1, excess 0) for m1a and m1b, one step
-     late excess 1, an extra edge exact < 0.5; the code probe reads an injected code back exactly and a
-     random state at chance
+  5. the quick check: the oracle state scores exact 1.0 (steps ratio 1, excess 0, right-exit rate 1.0) for m1a
+     and m1b, one step late excess 1, an extra edge exact < 0.5; exit_hops on hand-made strands, and q.exit of
+     a model that draws nothing; the code probe reads an injected code back exactly and a random state at chance
   6. option E (nets.FrameNCA): the per-cell gather gives the first, per-frame-weights version's outputs and
      gradients (float64, random frames, depth 1 and 2: frame_reference_step below); a rotated and a mirrored
      board, inputs and tap, give the same per-cell outputs in local frames (float64, e and e-bc); zeroing the
@@ -260,12 +260,33 @@ def oracle_checks(tab, bd):
             q["steps"]["excess"] == 0.0 and set(q["bySet"]) == {"legacy", "wide"}
         if task == "m1b":
             ok &= q["parts"] == {"edges": 1.0, "closed": 1.0}
-        check(f"{task}: the oracle state scores exact 1.0, steps ratio 1, excess 0 on both sets "
-              f"({json.dumps(q)[:120]}...)", ok)
+        ex = q["exit"]
+        ok &= ex["rate"] == 1.0 and ex["tap"] == 1.0 and \
+            ex["n"] == sum(int(n) - 1 for ev in evs for n in ev.items["length"])
+        check(f"{task}: the oracle state scores exact 1.0, steps ratio 1, excess 0, right-exit rate 1.0 with n - 1 "
+              f"tries a strand on both sets ({json.dumps(q)[:120]}...)", ok)
         q = run(lag=1)
         check(f"{task}: an oracle one step late: exact 1.0, excess 1", q["exact"] == 1.0 and q["steps"]["excess"] == 1.0)
         q = run(extra=True)
         check(f"{task}: marking edge 0 on every cell as well: exact {q['exact']} < 0.5", q["exact"] < 0.5)
+    # the right-exit counts (q.exit): tries / hits by the next cell's chord count (1, 2, 3)
+    t, h = T.exit_hops(np.array([1, 1, 1, 0, 1], bool), np.array([1, 2, 1, 3, 1]), 0, False)
+    ok = list(t) == [1, 1, 1] and list(h) == [1, 1, 0]  # 0 -> 1 (2 chords) hit, -> 2 (1) hit, -> 3 (3) miss: stop
+    t, h = T.exit_hops(np.ones(5, bool), np.full(5, 2), 2, False)
+    ok &= list(t) == [0, 4, 0] and list(h) == [0, 4, 0]  # both ways to the ends
+    t, h = T.exit_hops(np.ones(4, bool), np.ones(4, int), 1, True)
+    ok &= list(t) == [3, 0, 0] and list(h) == [3, 0, 0]  # a circuit: n - 1 hops, each chord once
+    t, h = T.exit_hops(np.array([1, 0, 1, 1, 1, 1], bool), np.full(6, 2), 3, True)
+    ok &= list(t) == [0, 5, 0] and list(h) == [0, 4, 0]  # round both ways to the missing chord, tried once
+    t, h = T.exit_hops(np.array([1, 0, 1], bool), np.ones(3, int), 1, False)
+    ok &= not t.any() and not h.any()  # the tapped chord not drawn: nothing tried
+    check("exit_hops: tries and hits by chord count; a way stops at its first miss; a circuit counts each chord "
+          "once; nothing tried without the tapped chord", ok)
+    ev = T.wide_set("m1a", tab, bd, 2, 12, 8, 2000)
+    q = T.summarise("m1a", [ev], [T.evaluate(lambda st, w, c, t, sl: st, T.Planes(tab, "c", torch.device("cpu")), ev,
+                                             32, torch.device("cpu"), 8, T.Codes(tab))], tab)
+    check(f"q.exit of a model that draws nothing: rate None, tap 0, n 0 ({q['exit']})",
+          q["exit"] == {"rate": None, "c1": None, "c2": None, "c3": None, "n": 0, "tap": 0.0})
     # the code probe
     rng = np.random.default_rng(4)
     P = T.new_pool(rng, tab, bd, "L2", 12, 200, 80, "m1a", torch.device("cpu"))  # enough codes to span the space

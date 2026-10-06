@@ -1,0 +1,61 @@
+# Launch 9: three arms of option E at --depth 2 (nets.FrameNCA, two hidden layers in the per-cell update), from
+# scratch, lr 5e-4 through l2 and l3, the loss over the whole backprop window (--last-k 48). Each arm is its own
+# process on the one L4.
+# Why (launch 8 read on the Pi, 2026-10-07): there is no bug. train2's loop overfits one rule exactly (e-bc and
+# c-bc; with damage too), and every arm of launch 8 drew the tapped strand and almost nothing else. What stops the
+# lines is the per-step routing at the growing front: at a cell with 2-3 chords the update has to pick the exit
+# that pairs with the entry edge. Right-exit rate per hop (fresh taps, level 2, read-out after 80 steps): E-bc
+# 0.82 (1-chord cells 0.96, 2-chord 0.81, 3-chord 0.41-0.57; held-out rules 0.83), E 0.66, C 0.55, big-C 0.59. At
+# 0.82 a line dies ~5 chords out: short strands ~0.3 exact, medium and long 0. E-bc's rate did not move in 3,000
+# l3 iterations at lr 2e-4. The routing probe (probe.py --arms e-route: type + code + entry edge -> the drawn
+# edges, one cell, no CA) puts it on the update net: 1 hidden layer x 128 reaches 0.82 at 1 M samples (= the
+# NCA) and 0.95 at 3 M; 2 layers x 128 reach 0.95 at 1 M and 0.99 held-out at 3 M; at lr 5e-4 instead of 3e-3,
+# 2 M samples: 1 layer 0.66, 2 layers 0.84. Hence depth 2 and no early drop to 2e-4.
+#   tap-e2     E, hidden 128, depth 2
+#   tap-e2-bc  E-bc, hidden 128, depth 2: the diagnostic (the code on every cell). Well above tap-e2 = the line
+#              does not carry the code; the same = routing is the whole problem
+#   tap-e2-w   E, hidden 256, depth 2: width on top of depth
+# Stages per arm (startup.sh chains them, --init from the previous stage's best.pt; it adds --schedule time, so the
+# lr decays x0.3 at 60 % and x0.1 at 85 % of each stage's minutes):
+#   l2 90 min (level 2: routing is learnable there and cheap), l3 210 (2 + 3), l4 120 (3 + level-4 crops,
+#   lr 2e-4), m1b 45 (2 + 3 + 4, lr 2e-4) = 465 min a run + SETUP_MIN 25 = 490 min = 8.2 VM-hours.
+# --last-k 48 (was 8): the loss over every step of the gradient window, each against its own age's target. With 8,
+# only ages >= 29 (level 2) / 41 (level 3) were ever scored, so nothing asked a line to start on time: launch 8's
+# E-bc first drew the tapped chord at step ~9 (C at ~4). On the Pi, train2 on one rule with damage 0.3 (4 taps,
+# level 2, 32 channels): lastK 8 exact 1.0 at iteration 350, settle ratio 2.2 (15-18 steps late); lastK 48 exact
+# 1.0 at 300, ratio 1.16 (0.75 steps late). Memory: saved tensors +1-1.5 % (below). Loss values are not
+# comparable with launch 8's.
+# Cost: ~$0.41/h (g2-standard-4 Spot, L4, disk and address) x 8.2 h = ~$3.4; each Spot reclaim adds a relaunch's
+# setup (~25 min) and at most 500 iterations (checkpoints every 500: <= ~2 min of l2, ~10 of l3 / l4), ~$0.25
+# each: ~$4.4 with launch 8's four. Launch with MAX_HOURS=10 (cap $4.1 a launch); the ledger had 25.4 of
+# BUDGET_HOURS 45 on 2026-10-07.
+# Memory (python -m nca.strand.memprobe --batch 8 --window 4 20 [--last-k 48]: CPU peak RSS over one gradient
+# window on level-4 crops, S 42; autograd's saved tensors in brackets), per backprop step at batch 8: tap-e2
+# 51.0-51.4 MB (35), tap-e2-bc 46-49 (38), tap-e2-w 68-73 (49); launch 8's E 46 (28) the same day. At window 48 and
+# batch 16 (from the larger figure, E-bc's rounded up to E's): 5.1 + 5.2 + 7.1 = 17.4 GB, + the pools (256 slots x
+# levels, float32, <= 0.32 GB each) + CUDA contexts (~0.4 GB each) = ~19.6 GB of the L4's ~22.5 usable; by the
+# saved tensors ~14 GB. Batch 16 for all three, as launches 7 and 8. Launch 8's last VM held 6.6 GB on the L4 with two
+# arms (E, E-bc) at l3, where this RSS method predicts ~8.9 GB: real use ran ~25 % under it (~15 GB here). The quick
+# check's read-out (eval batch 64, no gradient, after the window is freed) peaks at 0.6-0.9 GB.
+# Quick checks: held-out rules only, as plan-8 (legacy + wide, levels 3 and 4, 120 taps each), now with q.exit
+# (the right-exit rate: rate, c1 / c2 / c3 by the next cell's chord count, n, tap), a default dashboard series.
+# Read q.exit.rate first: exact needs ~n hits in a row, so it moves late (0.82 -> 0.95 lifts a 20-chord line from
+# ~2 % to ~36 %). Launch 8's tap-e-bc-l3 best.pt on this check at level 2 (60 + 60 taps): rate 0.895 (c1 0.95, c2
+# 0.84, c3 0.43), exact 0.31. Alive: q.exit.c2 rising past ~0.9 during l2. Checks every ~15 min in l2 (evalSec was
+# 80-120 s, 185 at hidden 512) and ~17 in l3 / l4; tap-e2-w's iterations are slower, so it checks more often.
+# Speed (not measured on the L4): launch 8's E ran 0.165 s / iteration at l2 and ~1.0 at l3 with three arms on the
+# GPU; expect tap-e2 / tap-e2-bc a little slower, tap-e2-w ~1.5x: ~30k / ~20k iterations in l2, ~12k / ~8k in l3.
+# Data: plan-7's (the private bucket's strand-v2.tgz and launch 5's strand.tgz); the three runs now fetch each file
+# once (startup.sh's fetch: flock + a temp file per run, then mv), where launch 8's tap-e-wide died on that race.
+tap-e2    | l2  | 90  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 2 --eval-levels 3 4 --channels 96 --hidden 128 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 5000 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2    | l3  | 210 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 2 3 --eval-levels 3 4 --channels 96 --hidden 128 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1000 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2    | l4  | 120 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 3 4 --eval-levels 3 4 --channels 96 --hidden 128 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 1000 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2    | m1b | 45  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1b --levels 2 3 4 --eval-levels 3 4 --channels 96 --hidden 128 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2-bc | l2  | 90  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e-bc --task m1a --levels 2 --eval-levels 3 4 --channels 96 --hidden 128 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 5000 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2-bc | l3  | 210 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e-bc --task m1a --levels 2 3 --eval-levels 3 4 --channels 96 --hidden 128 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1000 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2-bc | l4  | 120 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e-bc --task m1a --levels 3 4 --eval-levels 3 4 --channels 96 --hidden 128 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 1000 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2-bc | m1b | 45  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e-bc --task m1b --levels 2 3 4 --eval-levels 3 4 --channels 96 --hidden 128 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2-w  | l2  | 90  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 2 --eval-levels 3 4 --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 3500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2-w  | l3  | 210 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 2 3 --eval-levels 3 4 --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 700 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2-w  | l4  | 120 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 3 4 --eval-levels 3 4 --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 700 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e2-w  | m1b | 45  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1b --levels 2 3 4 --eval-levels 3 4 --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 350 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half

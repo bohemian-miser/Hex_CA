@@ -354,3 +354,21 @@ Adam; the Pi loaded, medians of repeated runs): E 0.66-0.69 at one thread (the f
 512 1.98. Memory per backprop step at batch 8 (memprobe, level-4 crops, windows 4 / 20): E 47-50 MB (saved
 tensors 28), E-bc 52 (31), E at hidden 512 64.5 (50), C 39 (24.5) the same day; `nca/cloud/plan-8.txt` sizes
 its three E arms from these.
+
+**Launch 8's plateau** (read on the Pi, 2026-10-07; nothing touched on the VM). Every arm held out at exact ~0.15
+(short ~0.3, medium and long 0), E-bc included. Not a bug: train2's loop overfits one rule (e-bc and c-bc, 4 taps,
+level 2) to exact 1.0 in 150 iterations, 350 with damage, and a minimal full-backprop loop does it in 75-100.
+The models draw the tapped strand and almost nothing else (E-bc at step 60: 70 % of its edges on, 1 % of other
+strands', none elsewhere); the lines stop because the update picks the wrong exit at cells with 2-3 chords. The
+**right-exit rate** per hop from the tap (fresh taps, level 2): E-bc 0.82 (1-chord cells 0.96, 2-chord 0.81,
+3-chord 0.41-0.57; held-out rules 0.83, so not generalisation), E 0.66, C 0.55, big-C 0.59; at 0.82 a line dies
+~5 chords out. It is the update net's routing: `probe.py --arms e-route` (type + code + the entry edge -> the
+edges drawn, one cell) at 1 hidden layer x 128 reaches 0.82 after 1 M samples and 0.95 after 3 M, at 2 layers
+0.95 and 0.99; at the NCA's lr 5e-4 (2 M samples) 0.66 and 0.84 -- and l3 ran at 2e-4, where E-bc's rate did not
+move in 3,000 iterations. The quick check now logs it as `q.exit` (rate, c1 / c2 / c3, n, tap; train2's
+docstring), a default dashboard series. Also: with the loss on the last 8 steps of a 48-step window, no line
+younger than 29 steps (level 2; 41 at level 3) was ever scored, and E-bc first drew the tapped chord at step ~9;
+`--last-k 48` scores the whole window (one rule with damage: exact 1.0 at 300 iterations instead of 350, 0.75
+steps late instead of 15-18). `nca/cloud/plan-9.txt`: three E arms at depth 2, lr 5e-4 through l2 and l3,
+`--last-k 48`. Memory per backprop step at batch 8 (memprobe, level-4 crops): E depth 2 51 MB (saved tensors 35),
+E-bc 46-49 (38), E at hidden 256 68-73 (49); `--last-k 48` adds ~1 % to the saved tensors.
