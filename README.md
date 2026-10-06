@@ -393,6 +393,17 @@ each other — never trained, just shown. Each tap's input is training's: the
 rule's 53-bit code and the tapped chord's two edges on the tapped tile, held
 every step.
 
+**When two patterns meet** (`npx tsx scripts/strand-meet.ts WEIGHTS`: the page's runner on a shared board, `tap-e2-l3` and `tap-e2-w-l3`:
+pairs of taps of training rules whose strands share tiles, each strand drawn exactly when alone; 25 pairs on
+levels 2 and 3). The game wants the line that is hit to disappear; these models do roughly the reverse:
+- *A line already drawn, then a second tap whose strand runs into it:* the first line stays, losing 10 of its
+  379 chords, most of them on the shared tiles. The newcomer stops within a chord of the first tile it shares
+  with the old line on 32 of the 38 ways that reach it. It runs on only where the two strands merely cross in
+  one tile.
+- *Both taps from step 0:* both strands usually lose a few chords where they meet. Both are exact on 2 of 25
+  pairs.
+- The `-bc` and v1 models carry one rule on every tile, so their taps can't share a board.
+
 `python -m nca.strand.export CKPT` writes a strand checkpoint (FrameNCA at any
 depth, the plain-conv StrandNCA, v1) as `web/strand-weights.json`'s format
 (float32, exact; the run's held-out numbers from its `log.jsonl`); `--board-data`
