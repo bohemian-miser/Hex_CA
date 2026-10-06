@@ -1384,14 +1384,15 @@ function buildLegend(container, series, hiddenSet, chart, onToggle) {
 }
 
 // ---- metric visibility: ~60 quick-check series in one tangle by default is not useful -- show a
-// sensible few (strand: exact/balanced/byLen; flood: each q<N> group's both/bridge/mix) and hide the
-// rest behind the legend's existing toggles (or "show all"), remembered per browser (localStorage,
+// sensible few (strand: exact/balanced/byLen, the code probe and the right-exit rate; flood: each q<N>
+// group's both/bridge/mix) and hide the rest behind the legend's existing toggles (or "show all"),
+// remembered per browser (localStorage,
 // best-effort: a private window or cleared storage just means it decides afresh every visit). Decided
 // PER LABEL, once, the first time it's seen -- so a metric that starts appearing later (e.g. q.code
 // once the probe kicks in) still gets a sensible default instead of silently popping in hidden or not.
 var METRIC_HIDDEN_KEY = "ncaDash.hiddenMetrics";
 var STRAND_METRIC_SHOW = ["q.exact", "q.balanced", "q.byLen.short.exact", "q.byLen.medium.exact",
-                          "q.byLen.long.exact", "q.code.exact"];
+                          "q.byLen.long.exact", "q.code.exact", "q.exit.rate"];
 function loadStoredHidden(key) {
   try {
     var p = JSON.parse(localStorage.getItem(key) || "null");

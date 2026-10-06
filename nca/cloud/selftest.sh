@@ -8,6 +8,7 @@
 #   vm1  a 2-run plan (a: 2 stages chained by --init; b: one time-boxed stage with --init bucket:...) -> DONE
 #   vm2  the same plan plus run c, sent TERM once c has a checkpoint in the bucket (a preemption)
 #   vm3  a fresh VM on the same bucket: a and b are skipped, c resumes from its checkpoint and finishes
+#   vm4  three runs naming the same bucket: file at once (each must wait for the one fetch, not fail)
 # then pull.sh, watch.sh (each exit), the ledger, launch.sh --dry-run and publish.sh.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -58,14 +59,15 @@ check "b-s1 started --init from the bucket's init/tiny.pt and ended by its time 
 bad=$(find "$B/runs" -type f | grep -vE '/(log\.jsonl|pool\.npz|gallery\.npz|ckpt\.pt|best\.pt|stdout\.log)$')
 check "only whitelisted files under the bucket's runs/ ${bad:+(not: $bad)}" test -z "$bad"
 check "status.json: phase done, both runs, launch vm1" test "$(j "$B/status.json" '(d["phase"], sorted(d["runs"]), d["launch"])')" = "('done', ['a', 'b'], 'vm1')"
-check "the dashboard: dash/index.html (static), runs-vm.json with the 3 stage dirs, runs-pi.json an empty placeholder" \
-  test "$(grep -c 'var STATIC = true;' "$B/dash/index.html")|$(j "$B/dash/runs-vm.json" 'sorted(r["name"] for r in d)')|$(cat "$B/dash/runs-pi.json")|$(ls "$B/dash/a-s2")" = "1|['a-s1', 'a-s2', 'b-s1']|[]|log.json
+check "the dashboard: dash/index.html (static), runs-vm.json with the 3 stage dirs, runs-pi.json an empty placeholder, a run's log, pool and gallery" \
+  test "$(grep -c 'var STATIC = true;' "$B/dash/index.html")|$(j "$B/dash/runs-vm.json" 'sorted(r["name"] for r in d)')|$(cat "$B/dash/runs-pi.json")|$(ls "$B/dash/a-s2")" = "1|['a-s1', 'a-s2', 'b-s1']|[]|gallery.json
+log.json
 pool.json"
 
 echo "-- vm2: plan2, TERM once run c has a checkpoint in the bucket (a preemption)"
 vm vm2 "$WORK/plan2.txt" &
 vm2=$!
-for _ in $(seq 240); do [ -f "$B/runs/c-s1/ckpt.pt" ] && break; sleep 0.5; done
+for _ in $(seq 1200); do [ -f "$B/runs/c-s1/ckpt.pt" ] && break; sleep 0.5; done  # up to 10 min: a busy Pi is slow
 check "c-s1 checkpointed (iteration 200) and synced" test -f "$B/runs/c-s1/ckpt.pt"
 main=$(pgrep -f "startup.sh main" -P "$vm2" | head -1)
 kill -TERM "${main:-$vm2}"
@@ -84,6 +86,18 @@ check "vm3 skipped a-s1, a-s2 (done) and b-s1 (time box used)" test "$(grep -c '
 check "c-s1 resumed from its checkpoint (a start line with startIteration > 0) and ended done at 400" \
   test "$(grep -c '"startIteration": [1-9]' "$B/runs/c-s1/log.jsonl")|$(lastline "$B/runs/c-s1/log.jsonl" '(d["stopped"], d["iteration"])')" = "1|('done', 400)"
 check "DONE: vm3, ok, three runs done" test "$(j "$B/DONE" '(d["launch"], d["ok"], sorted(k for k, v in d["runs"].items() if v["state"] == "done"))')" = "('vm3', True, ['a', 'b', 'c'])"
+
+echo "-- vm4: three runs fetch the same bucket: file at once (launch 8's startup race), on a bucket of its own"
+B4=$WORK/bucket4
+rm -rf "$B4" "$WORK/vm4" && mkdir -p "$B4/init" && cp "$B/init/tiny.pt" "$B4/init/tiny.pt"
+for r in x y z; do echo "$r | s1 | 5 | $TINY --iters 1 --init bucket:init/tiny.pt"; done >"$WORK/plan4.txt"
+HEXCA_TEST=1 W=$WORK/vm4 BUCKET=$B4 PLAN_FILE=$WORK/plan4.txt SRC=$ROOT PY=$PY SYNC_SEC=2 NAME=vm4 LAUNCH=vm4 \
+  FETCH_DELAY=2 bash "$HERE/startup.sh" main >"$WORK/vm4.log" 2>&1
+check "vm4 exits 0" test $? -eq 0
+check "vm4: all three runs done, the file fetched once (the others waited on its lock), the copy whole" \
+  test "$(j "$B4/DONE" '(d["ok"], sorted(k for k, v in d["runs"].items() if v["state"] == "done"))')|$(grep -c 'fetched init/tiny.pt' "$WORK/vm4.log")|$(cmp -s "$B4/init/tiny.pt" "$WORK/vm4/bucket/init/tiny.pt" && echo same)" = "(True, ['x', 'y', 'z'])|1|same"
+check "vm4: no temp file left beside the copy (only tiny.pt and its lock)" \
+  test "$(LC_ALL=C ls -A "$WORK/vm4/bucket/init" | tr '\n' ' ')" = "tiny.pt tiny.pt.lock "
 
 fi  # SKIP_VMS
 
@@ -184,7 +198,7 @@ echo "-- publish.sh from 'the Pi' next to the VM's"
 rm -f "$B/dash/play.html"
 RUNS=$WORK/seed/runs bash "$HERE/publish.sh" seed >/dev/null 2>&1
 check "publish.sh --source pi: runs-pi.json lists the Pi's run (hasWeights); runs-vm.json still the VM's 4 stage dirs; play.html and seed/weights.json (needs npm run build)" \
-  test "$(j "$B/dash/runs-pi.json" '[(r["name"], r["hasWeights"]) for r in d]')|$(j "$B/dash/runs-vm.json" 'len(d)')|$(ls "$B/dash/seed" | tr '\n' ' ')|$(j "$B/dash/seed/weights.json" 'd["meta"]["iterations"] >= 0')|$(grep -c '<canvas id="board"' "$B/dash/play.html")" = "[('seed', True)]|4|log.json pool.json weights.json |True|1"
+  test "$(j "$B/dash/runs-pi.json" '[(r["name"], r["hasWeights"]) for r in d]')|$(j "$B/dash/runs-vm.json" 'len(d)')|$(ls "$B/dash/seed" | tr '\n' ' ')|$(j "$B/dash/seed/weights.json" 'd["meta"]["iterations"] >= 0')|$(grep -c '<canvas id="board"' "$B/dash/play.html")" = "[('seed', True)]|4|gallery.json log.json pool.json weights.json |True|1"
 WB=$WORK/wb-weights && rm -rf "$WB"
 BUCKET=$WB RUNS=$WORK/seed/runs bash "$HERE/publish.sh" --weights-only seed nosuchrun >/dev/null 2>&1
 check "publish.sh --weights-only: play.html and seed/weights.json, nothing else" \

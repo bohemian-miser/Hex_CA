@@ -81,7 +81,8 @@ One stage per line, `run-name | stage-name | minutes | nca.train args` (see `pla
 
 - the same run-name: stages one after another, in `runs/<run>-<stage>`; a later stage starts with `--init`
   from the previous stage's `best.pt` (its best quick check; `ckpt.pt` only if there is none) unless it
-  names its own `--init`; `bucket:PATH` is fetched first;
+  names its own `--init`; `bucket:PATH` (and a `gs://` URL) is fetched first, once a VM however many runs
+  name it (an `flock` on the local copy, a temp file per run, then `mv`: the others wait, they don't fail);
 - different run-names: in parallel, a process each on the one GPU (`--threads` = 4 / runs unless given);
 - minutes: the stage's time box (`--minutes`). Each run's total + `SETUP_MIN` (25) must fit in `MAX_HOURS`.
   The VM adds `--schedule time` unless the args name a `--schedule`: the lr decays at 60% and 85% of the

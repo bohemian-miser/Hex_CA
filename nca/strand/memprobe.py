@@ -4,7 +4,7 @@
 
 For each backprop window G it runs, in a FRESH process, one gradient window of nca/strand/train2.py's iteration
 on level-4 crops (the largest boards, S 42): consts built by train2.Planes, G steps of the model with the loss
-over the last min(8, G) steps, backward. It reports the process's peak RSS above its RSS just before the window
+over the last min(--last-k, G) steps (train2's --last-k; default 8), backward. It reports the process's peak RSS above its RSS just before the window
 (VmHWM after resetting it, so every transient counts, E's re-gathered taps in backward included). Two windows
 give the memory per step (the slope: activations kept for backward) and the rest (the intercept: the largest
 transient); both scale with batch x cells. --eval adds a no-gradient read-out at the eval batch. The GPU adds its context (~0.3-0.5 GB a
@@ -64,7 +64,7 @@ def one(args):
             state = model.step(state, mk, cs)
     base = status_mb("VmRSS")
     reset_peak()
-    G, K = args.window, min(8, args.window)
+    G, K = args.window, min(args.last_k, args.window)
     if args.eval:
         with torch.no_grad():
             ev = T.fresh(cs[:, :1], args.channels)
@@ -89,7 +89,7 @@ def one(args):
         acc.mean().backward()
     peak = status_mb("VmHWM")
     print(json.dumps({"inputs": args.inputs, "channels": args.channels, "hidden": args.hidden, "depth": args.depth,
-                      "batch": args.batch, "window": G, "S": S, "eval": args.eval, "baseMB": round(base, 1),
+                      "batch": args.batch, "window": G, "lastK": K, "S": S, "eval": args.eval, "baseMB": round(base, 1),
                       "peakAboveMB": round(peak - base, 1),
                       "savedMB": None if args.eval else round(saved[0] / 2 ** 20, 1),
                       "peakMB": round(peak, 1)}), flush=True)
@@ -104,6 +104,7 @@ def main(argv=None):
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--window", type=int, nargs="+", default=[4, 12])
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--last-k", type=int, default=8, help="train2's --last-k: the loss over this many last steps")
     ap.add_argument("--eval", action="store_true", help="a no-gradient read-out instead of a gradient window")
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
@@ -114,7 +115,8 @@ def main(argv=None):
     for G in args.window:
         cmd = [sys.executable, "-m", "nca.strand.memprobe", "--child", "--inputs", args.inputs, "--channels",
                str(args.channels), "--hidden", str(args.hidden), "--depth", str(args.depth), "--batch", str(args.batch),
-               "--window", str(G), "--threads", str(args.threads)] + (["--eval"] if args.eval else [])
+               "--window", str(G), "--threads", str(args.threads), "--last-k", str(args.last_k)] + \
+            (["--eval"] if args.eval else [])
         out = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ))
         if out.returncode:
             raise SystemExit(out.stderr)

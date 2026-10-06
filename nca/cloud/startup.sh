@@ -78,6 +78,36 @@ sync_up() {  # sync_up DIR REL: add and update, never delete
   if [[ $BUCKET == gs://* ]]; then gcloud storage rsync -r --project="$PROJECT" --quiet "$1" "$BUCKET/$2" >/dev/null
   else mkdir -p "$BUCKET/$2" && rsync -a "$1/" "$BUCKET/$2/"; fi
 }
+# fetch SRC DEST: one object into a local file, once however many runs ask for it at the same time. SRC is a
+# gs:// URL (gcloud) or a path in $BUCKET (get). The runs of a plan start together and often name the same
+# file (the data .tgz, an --init checkpoint): the first takes an flock on DEST.lock, downloads to a temp file of
+# its own next to DEST (gcloud's DEST_.gstmp is per destination: two downloads to one DEST collide, which is how
+# "cannot fetch ...strand.tgz" ended tap-e-wide in launch 8) and mv's it into place, so DEST is either absent or
+# whole; the others wait on the lock (FETCH_WAIT s, default 30 min), then find DEST there. 3 tries, FETCH_PAUSE
+# (10) s apart. HEXCA_TEST only: FETCH_DELAY s of sleep before the mv (widens the window for the selftest).
+fetch_to() {  # fetch_to SRC FILE: one download
+  if [[ $1 == gs://* ]]; then gcloud storage cp --project="$PROJECT" --quiet "$1" "$2" >/dev/null; else get "$1" "$2"; fi
+}
+fetch() {
+  local src=$1 dest=$2
+  [ -f "$dest" ] && return 0
+  mkdir -p "$(dirname "$dest")" || return 1
+  (
+    flock -w "${FETCH_WAIT:-1800}" 9 || { log "fetch $src: no lock on $dest.lock in ${FETCH_WAIT:-1800} s"; exit 1; }
+    [ -f "$dest" ] && exit 0   # fetched by another run while this one waited
+    for try in 1 2 3; do
+      tmp=$(mktemp "$dest.part.XXXXXX") || exit 1
+      if fetch_to "$src" "$tmp"; then
+        [ -z "$TEST" ] || [ -z "${FETCH_DELAY:-}" ] || sleep "$FETCH_DELAY"
+        if mv -f "$tmp" "$dest"; then log "fetched $src"; exit 0; fi
+      fi
+      rm -f "$tmp"
+      log "fetch $src: try $try failed"
+      [ "$try" -lt 3 ] && sleep "${FETCH_PAUSE:-10}"
+    done
+    exit 1
+  ) 9>"$dest.lock"
+}
 sync_down() {  # sync_down REL DIR
   mkdir -p "$2"
   if [[ $BUCKET == gs://* ]]; then gcloud storage rsync -r --project="$PROJECT" --quiet "$BUCKET/$1" "$2" >/dev/null 2>&1
@@ -104,7 +134,7 @@ print(d["stopped"] or "-", round(d["elapsedMin"], 2), d["verdict"])' 2>/dev/null
 }
 
 run_stages() {  # run_stages RUN THREADS: the run's stages, in order
-  local run=$1 threads=$2 prev="" i=0 n r stage last="" minutes args dir stopped used verdict left a rel module
+  local run=$1 threads=$2 prev="" i=0 n r stage last="" minutes args dir stopped used verdict left a rel src module
   local -a argv mode
   n=$(plan_lines | awk -F'|' -v r="$run" '$1 == r' | wc -l)
   while IFS='|' read -r r stage minutes args; do
@@ -115,18 +145,11 @@ run_stages() {  # run_stages RUN THREADS: the run's stages, in order
     if [ "${argv[0]:-}" = --module ]; then module=${argv[1]:-} argv=("${argv[@]:2}"); fi
     [[ $module =~ ^[A-Za-z_][A-Za-z0-9_.]*$ ]] || { log "$dir: bad --module '$module'"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
     for k in "${!argv[@]}"; do  # bucket:PATH -> a local copy of $BUCKET/PATH; gs://B/PATH -> a copy of that object
-      a=${argv[$k]}
-      if [[ $a == gs://* ]]; then  # e.g. a private bucket the VM's service account may read (the run bucket is public)
-        rel=gs/${a#gs://}
-        [ -f "$W/bucket/$rel" ] || { mkdir -p "$(dirname "$W/bucket/$rel")" &&
-          gcloud storage cp --project="$PROJECT" --quiet "$a" "$W/bucket/$rel" >/dev/null; } ||
-          { log "$dir: cannot fetch $a"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
-        argv[k]=$W/bucket/$rel
-        continue
-      fi
-      [[ $a == bucket:* ]] || continue
-      rel=${a#bucket:}
-      [ -f "$W/bucket/$rel" ] || get "$rel" "$W/bucket/$rel" || { log "$dir: cannot fetch $a"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
+      a=${argv[$k]}             # (gs:// e.g. a private bucket the VM's service account may read; the run bucket is public)
+      if [[ $a == gs://* ]]; then src=$a rel=gs/${a#gs://}
+      elif [[ $a == bucket:* ]]; then rel=${a#bucket:} src=${a#bucket:}
+      else continue; fi
+      fetch "$src" "$W/bucket/$rel" || { log "$dir: cannot fetch $a"; set_state "$run" "$stage" "$i" "$n" failed; return 1; }
       argv[k]=$W/bucket/$rel
     done
     read -r stopped used verdict < <(progress "$dir")

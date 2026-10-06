@@ -13,7 +13,12 @@ target):
   d-cs       D-cs (12: type, cos, sin, mirror)         -> the same
   d-fourier  D-fourier (15: type, cos/sin k theta, k = 1..3, mirror) -> the same
   e          E's local frame (9: type only)            -> the 15 chord bits in the tile's own frame (local pairs)
-Every arm runs at every --hidden width (one hidden layer).
+  e-route    E's local frame + the edge a line enters by (one-hot 6, local) -> the 6 local edges the line draws
+             in this cell: the entry and its chord's other end, nothing if no chord uses the entry. This is the
+             per-step decision the strand NCA makes at its growing front (the chord set alone, arm e, is
+             easier: at width 128 and depth 1 e reaches 0.95, e-route 0.82 after 1 M samples, 2026-10-06), so
+             it ranks update nets by what the CA needs. Cell-exact = all 6 edges right.
+Every arm runs at every --hidden width, with --depth hidden layers (default 1).
 Reported per arm: held-out bit accuracy and cell-exact (all 15 bits right) at each check, cell-exact on 20,000
 fixed draws of TRAIN rules too (is the lookup learned at all, apart from generalising to new rules), the samples and
 seconds to reach 0.9 / 0.99 / 0.999 / 1.0 cell-exact, the final numbers and cell-exact per subset. Same width,
@@ -31,10 +36,12 @@ import torch
 import torch.nn as nn
 
 from .rules import CODE_BITS, N_DIGITS, N_GEO, N_TYPES, RuleTable
+from .walker import PAIRS
 
 
 def draws(tab: RuleTable, rng: np.random.Generator, n: int, split: str):
-    """n random (geo, s, digits) with rules from `split` ('train' / 'heldout'), vectorised with rejection."""
+    """n random (geo, s, digits, entry) with rules from `split` ('train' / 'heldout'), vectorised with rejection;
+    entry = a uniform local edge (e-route's)."""
     allowed = tab.allowed(split)
     s = rng.integers(tab.n_sub, size=n)  # subsets uniform; rejection only within a subset
     d = np.zeros((n, N_TYPES), np.int64)
@@ -50,7 +57,8 @@ def draws(tab: RuleTable, rng: np.random.Generator, n: int, split: str):
         d[todo[ok]] = dd[ok]
         todo = todo[~ok]
     geo = rng.integers(N_GEO, size=n)
-    return geo, s, d
+    entry = rng.integers(6, size=n)  # e-route's entry edge (drawn last: the other arms' draws are unchanged)
+    return geo, s, d, entry
 
 
 class Encoder:
@@ -62,10 +70,12 @@ class Encoder:
         for s in range(tab.n_sub):
             codes[s] = tab.code(s, np.zeros(N_TYPES, np.int64))[:8]
         self.class_bits = torch.from_numpy(codes)
-        self.static = torch.from_numpy(tab.static[arm].astype(np.float32))
-        self.n_in = self.static.shape[1] + CODE_BITS
+        self.route = arm == "e-route"
+        self.static = torch.from_numpy(tab.static["e" if self.route else arm].astype(np.float32))
+        self.n_in = self.static.shape[1] + CODE_BITS + (6 if self.route else 0)
+        self.n_out = 6 if self.route else 15
 
-    def __call__(self, geo, s, d):
+    def __call__(self, geo, s, d, entry):
         n = len(geo)
         g = torch.from_numpy(geo)
         sv = torch.from_numpy(s)
@@ -74,18 +84,29 @@ class Encoder:
         x = torch.cat([self.static[g], self.class_bits[sv], dig], 1)
         t, rot, mb = geo // 12, (geo // 2) % 6, geo % 2
         dt = d[np.arange(n), t]
-        bits = self.tab.lut_local[s, t, dt] if self.arm == "e" else self.tab.lut_bits[s, t, dt, rot, mb]
-        y = torch.from_numpy(((bits[:, None].astype(np.int64) >> np.arange(15)) & 1).astype(np.float32))
-        return x, y
+        local = self.arm in ("e", "e-route")
+        bits = self.tab.lut_local[s, t, dt] if local else self.tab.lut_bits[s, t, dt, rot, mb]
+        planes = (bits[:, None].astype(np.int64) >> np.arange(15)) & 1
+        if not self.route:
+            return x, torch.from_numpy(planes.astype(np.float32))
+        y = np.zeros((n, 6), np.float32)  # the entry and its partner, if a chord uses the entry
+        for p, (a, b) in enumerate(PAIRS):
+            hit = (planes[:, p] == 1) & ((entry == a) | (entry == b))
+            y[hit, a] = y[hit, b] = 1
+        return torch.cat([x, torch.eye(6)[torch.from_numpy(entry)]], 1), torch.from_numpy(y)
 
 
-def run_arm(tab, arm, samples, batch, hidden, lr, seed, every, test, test_train):
+def run_arm(tab, arm, samples, batch, hidden, lr, seed, every, test, test_train, depth=1):
     torch.manual_seed(seed)
     rng = np.random.default_rng(seed)
     enc = Encoder(tab, arm)
     xt, yt = enc(*test)
     xr, yr = enc(*test_train)
-    net = nn.Sequential(nn.Linear(enc.n_in, hidden), nn.ReLU(), nn.Linear(hidden, 15))
+    layers, width = [], enc.n_in
+    for _ in range(depth):
+        layers += [nn.Linear(width, hidden), nn.ReLU()]
+        width = hidden
+    net = nn.Sequential(*layers, nn.Linear(hidden, enc.n_out))
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     lossf = nn.BCEWithLogitsLoss()
     curve, t_train, seen, reach = [], 0.0, 0, {}
@@ -120,7 +141,8 @@ def run_arm(tab, arm, samples, batch, hidden, lr, seed, every, test, test_train)
         ok = (net(xt) > 0) == (yt > 0.5)
     cell = ok.all(1).numpy()
     by_sub = {tab.keys[k]: round(float(cell[test[1] == k].mean()), 4) for k in range(tab.n_sub)}
-    return {"arm": arm, "hidden": hidden, "inputs": enc.n_in, "params": sum(q.numel() for q in net.parameters()),
+    return {"arm": arm, "hidden": hidden, "depth": depth, "inputs": enc.n_in,
+            "params": sum(q.numel() for q in net.parameters()),
             "final": curve[-1], "reach": reach, "bySubset": by_sub, "curve": curve}
 
 
@@ -130,13 +152,14 @@ def main(argv=None):
     ap.add_argument("--samples", type=int, default=1_900_000)
     ap.add_argument("--batch", type=int, default=2048)
     ap.add_argument("--hidden", type=int, nargs="+", default=[128])
+    ap.add_argument("--depth", type=int, nargs="+", default=[1], help="hidden layers (each value a run)")
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--every", type=int, default=20, help="held-out check every this many batches")
     ap.add_argument("--test", type=int, default=20000)
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--arms", nargs="+", default=["a", "c", "d", "d-cs", "d-fourier", "e"],
-                    choices=["a", "c", "d", "d-cs", "d-fourier", "e"])
+                    choices=["a", "c", "d", "d-cs", "d-fourier", "e", "e-route"])
     ap.add_argument("--out", default=None, help="write the results as JSON here")
     args = ap.parse_args(argv)
     torch.set_num_threads(args.threads)
@@ -144,13 +167,14 @@ def main(argv=None):
     test = draws(tab, np.random.default_rng(12345), args.test, "heldout")
     test_train = draws(tab, np.random.default_rng(54321), args.test, "train")
     res = []
-    for hidden in args.hidden:
+    for depth, hidden in ((dp, h) for dp in args.depth for h in args.hidden):
         for arm in args.arms:
-            r = run_arm(tab, arm, args.samples, args.batch, hidden, args.lr, args.seed, args.every, test, test_train)
+            r = run_arm(tab, arm, args.samples, args.batch, hidden, args.lr, args.seed, args.every, test, test_train,
+                        depth)
             f = r["final"]
-            print(f"{arm} h{hidden}: {r['inputs']} inputs, {r['params']} params; held-out after {f['samples']:,} samples "
-                  f"({f['sec']} s): bit {f['bit']:.5f}, cell-exact {f['cellExact']:.5f} (train rules "
-                  f"{f['trainExact']:.5f}); reached "
+            print(f"{arm} h{hidden} d{depth}: {r['inputs']} inputs, {r['params']} params; held-out after "
+                  f"{f['samples']:,} samples ({f['sec']} s): bit {f['bit']:.5f}, cell-exact {f['cellExact']:.5f} "
+                  f"(train rules {f['trainExact']:.5f}); reached "
                   + ", ".join(f"{k} at {v['samples']:,} ({v['sec']} s)" for k, v in r["reach"].items())
                   + f"; cell-exact by subset {r['bySubset']}", flush=True)
             res.append(r)
