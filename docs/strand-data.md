@@ -174,3 +174,165 @@ distance): level 2 12, level 3 37, level 4 108, level-4 crops 16-40.
    in HELD-OUT. Changing `SPLIT_SALT` re-draws the split, if the owner wants FASS in TRAIN.
 6. **Layout.** The plan's single `nca/strands.py` is the `nca/strand/` package; the plan's 2,000-walk
    JSON fixture became the walkStrand walks stored for every tap (parity samples 2,000 of them).
+
+## v2: the whole kernel, the rule at the tap (2026-10-06)
+
+The data and trainer for launch 6 (`spectacle-nca-options.md` §6.3, launch-6 scope), under the owner's input
+rule: each cell gets only static board facts (on the board, which hex type, which way round) and, on the tapped
+cell only, the tap (the rule's code and the tapped chord). No chord is ever an input; the CA has to work out
+every tile's chords and carry the rule along the line itself, for rules it never saw.
+
+```bash
+npx tsx scripts/strand-export.ts --rule-table        # -> data/strand-v2 (git-ignored), ~30 s on an idle Pi
+python -m nca.strand.rules --split --parity --bench  # the split vs the exporter, rendering + walks vs walkStrand, speed
+python -m nca.strand.probe --hidden 128 1024         # the per-cell lookup probe (§3), A / C / D / D-cs / D-fourier / E
+python -m nca.strand.train2 --name c-l2 --inputs c --levels 2 --minutes 25
+python -m nca.strand.selftest2                       # a few minutes; the v1 selftest is unchanged
+```
+
+**Files** (`data/strand-v2`; `strand-v2.tgz` in the private bucket, `tar -C data -czf strand-v2.tgz strand-v2`):
+
+| file | what |
+|---|---|
+| `rules-hex.json` | per leaf type its six local edges' classes; per kernel subset (all 7, class 0 included) and type the non-crossing matchings in Spectacle's order (`nonCrossingForTile`) and each one's local chords (`localChords`); the split's definition, per-subset check values and 448 keyed sample rules; Spectacle's commit |
+| `boards.npz` | geometry only: per group `<g>_type/rot/tile` [B,H,W] (-1 off board), `<g>_mirror/root/orient/h/w/tiles`; groups `L2`, `L3` (the nine patches each), `L4` (2,048 training crops, box 42 x 38), `L4eval` (64 crops, seed 20261006), `L4full` (the Delta patch) |
+| `parity.npz` | 2,000 rule-boards (every rule of the six small subsets + 1,556 of the fully packed one, each on an L2 / L3 / L4 board in turn): Spectacle's own rendering as 15 bits per cell, its whole-board strand decomposition, and 16 taps per board walked by `walkStrand` both ways |
+
+**Rules.** A rule is `(s, digits)`: `s` one of the 7 subsets, `digits[t]` the position of type `t`'s matching
+among its non-crossing ones (0-4; 0 for a type with one choice or none). Its index is the digits in mixed radix,
+Delta most significant; its Spectacle `ruleKey` is `hex|<subset>|<matching indices>`. **Split v2**, stratified by
+subset (the owner's decision): in the v1 subsets `15`, `128`, `258` the held-out rules are exactly v1's 20 legacy
+held-out rules (so the legacy numbers stay comparable); in the four class-0 subsets, the round(0.2 n) rules with
+the smallest `(fmix32(FNV-1a("strand-split-v2|" + key)), index)`. (`rules-hex.json`'s per-subset check values are
+that hash ranking for all 7 subsets; `rules --split` checks it against the exporter.)
+
+| subset | `15` | `128` | `258` | `01346` | `03456` | `023468` | `01234568` |
+|---|---|---|---|---|---|---|---|
+| rules | 4 | 32 | 64 | 8 | 16 | 320 | 1,953,125 |
+| held out | 1 (legacy) | 6 (legacy) | 13 (legacy) | 2 | 3 | 64 | 390,625 |
+| train | 3 | 26 | 51 | 6 | 13 | 256 | 1,562,500 |
+
+Every held-out rule of the six small subsets uses only (type, digit) pairs some train rule of its subset has:
+a held-out rule is a new combination, never a new per-tile matching.
+
+Training draws the subset uniformly (1/7 each), then a train rule uniformly within it (rejection within the
+subset), then a board of the level and a uniformly random chord as the tap.
+
+**The code** (T1, 53 bits, on the tapped cell only, held): 8 bits "class m carries a line" for m in
+(0, 1, 2, 3, 4, 5, 6, 8), then per leaf type a one-hot of its digit (9 x 5). With it, the tapped chord's two
+edge directions (6). No owner slot (M1 is one player; owner's decision). Tap = 59 planes.
+
+**Static planes** (`rules.RuleTable.static`, from the cell's type, rotation `rot` = the direction local edge 0
+faces, and the mirror sign; theta = 2 pi rot / 6):
+
+| option | planes | what |
+|---|---|---|
+| A | 16 | type one-hot 9, rotation one-hot 6, mirror |
+| C | 55 | per direction the class (one-hot 8) of the edge facing it (6 x 8), the anchor (rotation one-hot 6), mirror |
+| D | 11 | type one-hot 9, rot / 6 as one number, mirror |
+| D-cs | 12 | type one-hot 9, cos theta, sin theta, mirror |
+| D-fourier | 15 | type one-hot 9, cos / sin k theta for k = 1, 2, 3 without sin 3 theta (0 at every 60 degrees), mirror: an invertible linear map of A's rotation one-hot (probe only) |
+| E | 9 | type one-hot only; the rotation and mirror are the cell's frame (nets.FrameNCA), not inputs |
+
+`train2 --inputs` takes a, c, c-bc (C plus the code broadcast to every cell: the diagnostic ceiling), d, d-cs
+and e. Consts = mask + static + tap: 76 / 115 / 168 / 71 / 72 / 69 (E: + the frame plane, which picks the
+weights and is never a feature).
+
+**Parity** (`rules --parity`): of 2,000 rule-boards over all 7 subsets, the table's rendering equals Spectacle's
+on every cell, all 32,000 taps walk identically (cells, entry / exit edges, order, signed index, closed), and
+every whole-board decomposition (270,430 strands) has the same lengths and closed flags. No walk stopped at a
+junction or a limit, class 0 included. The split's per-subset counts and checksums, and 448 keys and hashes,
+equal the exporter's; the v1 held-out set recomputed from salt v1 equals `data/strand/meta.json`'s, and every
+legacy rule's local chords equal the table's.
+
+**Throughput** (`rules --bench`, one Pi core, idle machine): a fresh training sample (rule + rendering + tap +
+walk) 1,471 / s at level 2, 842 / s at level 3, 1,041 / s on level-4 crops (mean strand 10 / 39 / 33 chords).
+A training iteration needs about batch / 8 + damage ~ 12 of them: ~10 ms.
+
+**The per-cell lookup probe** (`nca/strand/probe.py`, §3's cheap experiment, the owner's arms added): a
+1-hidden-layer MLP from one cell's static planes + the code to its 15 chord bits, fresh draws of (type,
+rotation, mirror) uniform over the 108 and TRAIN rules (subsets uniform), Adam 3e-3 (x0.3 at 60 %, x0.1 at 85 %),
+batch 512, 3 M samples per run; scored on 20,000 fixed draws with v2 HELD-OUT rules ("held-out") and 20,000
+with train rules ("train": is the lookup learned at all). E's arm is the local frame (type only -> the chords
+in the tile's own frame). Cell-exact = all 15 bits right. One Pi core each, under heavy load (wall times are
+only comparable within a width):
+
+| arm | width | held-out @ 1 M | held-out @ 3 M | train @ 3 M | bit | `15` | `01234568` | 0.9 reached | s |
+|---|---|---|---|---|---|---|---|---|---|
+| A | 128 | 0.384 | 0.556 | 0.679 | 0.9375 | 0.43 | 0.125 | - | 393 |
+| C | 128 | 0.615 | 0.727 | 0.825 | 0.9587 | 0.77 | 0.198 | - | 432 |
+| D | 128 | 0.040 | 0.116 | 0.148 | 0.8913 | 0.15 | 0.000 | - | 386 |
+| D-cs | 128 | 0.278 | 0.491 | 0.588 | 0.9258 | 0.54 | 0.011 | - | 386 |
+| D-fourier | 128 | 0.455 | 0.558 | 0.678 | 0.9364 | 0.46 | 0.088 | - | 329 |
+| E (local) | 128 | 0.955 | 0.952 | 1.000 | 0.9938 | 0.67 | 0.997 | 0.8 M | 251 |
+| A | 1024 | 0.822 | 0.923 | 0.996 | 0.9913 | 0.54 | 0.968 | 1.8 M | 860 |
+| C | 1024 | 0.927 | 0.982 | 0.999 | 0.9957 | 0.88 | 0.996 | 1.0 M | 909 |
+| D | 1024 | 0.327 | 0.591 | 0.719 | 0.9447 | 0.45 | 0.044 | - | 501 |
+| D-cs | 1024 | 0.695 | 0.825 | 0.908 | 0.9746 | 0.71 | 0.423 | - | 443 |
+| D-fourier | 1024 | 0.864 | 0.939 | 0.998 | 0.9927 | 0.59 | 0.977 | 1.6 M | 464 |
+| E (local) | 1024 | 0.985 | 0.985 | 1.000 | 0.9959 | 0.89 | 1.000 | 0.2 M | 444 |
+
+Reading it: E's local frame is near-trivial (the doc expected so); of the grid-frame inputs C learns fastest
+and most exactly at both widths, A catches up only when wide, and D (rot / 6 as one number) is far behind --
+8x the width lifts it from 0.12 to 0.59 held-out but does not close the gap (cos / sin closes part of it).
+D-fourier tracks A at both widths (0.558 / 0.556, 0.939 / 0.923; train 0.678 / 0.679, 0.998 / 0.996): it is an
+invertible linear map of A's one-hot, as expected, so it needs no trainer arm. What every arm misses on
+held-out rules is mostly subset `15` (measured with the first split, where its held-out rule needed a digit
+no `15` train rule had: departure 1 below); the fully packed subset is where narrow grid-frame nets fail.
+
+**Trainer** (`nca/strand/train2.py`; its docstring has every detail): the v1 trainer's pool, ages, damage, light
+cones, truncated backprop, schedule, collapse guard, resume and log, with the v2 inputs; `--channels 96 --hidden
+128` by default, `--depth` hidden layers in the per-cell update (`nets.StrandNCA`; 1 = HexNCA), and `--inputs e`
+on `nets.FrameNCA`. Damage "edit" re-types 1-3 cells with chords (never the tapped one); "move" moves the tap.
+**M1b** keeps the tap and adds six planes, "the chord through edge d is on a circuit", for the tapped strand:
+a circuit's edge must say 1 once drawn; a tail's edge must say 0 once the open news could have got there (the
+front reaches an end at its distance from the tap, the news comes back a chord a step: chord i of n with the
+tap at p by min(p + i, 2(n-1) - p - i)), don't-care before; after an edit the new strand's closed planes are
+don't-care until its settle time. **Quick check**: the legacy set (train.py's very taps on the 20 v1 held-out
+rules, inputs built from those boards' types and rotations) and the wide set (v2 held-out rules, up to 40 a
+subset, every subset; 120 taps a level stratified by length, round-robin over the subsets), `bySet`,
+`bySubset` (7), the score = length-balanced exact averaged over (set, level); and the **code-fidelity probe**
+`q.code`: a ridge probe from drawn strand cells' hidden channels to the 53 code bits, fitted on the training
+pools, scored on the quick check's held-out read-outs, overall and by distance from the tap.
+
+**Departures from `spectacle-nca-options.md`** (what the build chose where the doc was open or the owner changed it):
+
+1. The split is rank-based per subset (exactly round(0.2 n) held out in each), not `hash < 0.2`, which could
+   hold out none of `15`'s four rules; and in `15`, `128`, `258` it is the legacy rules alone (owner's decision).
+   A first version held out a v2 20 % there on top of the legacy rules: `15` kept 2 train rules, both with Pi's
+   digit 1, so its held-out rules needed a (type, digit) never trained in that subset. The probe table above was
+   measured with that version (its `15` column).
+2. No owner slot (the owner's decision for launch 6): the tap is 59 planes, not 63.
+3. The rule table is `data/strand-v2/rules-hex.json`, with the boards' geometry and the parity sample beside
+   it, not `data/strand/rules-hex.json`; the legacy data stays `data/strand` (launch 5's `strand.tgz`).
+4. The wide set holds every held-out rule of a small subset (1 / 6 / 13 / 2 / 3), not "all 4 of `15`".
+5. M1b's light cone with a tap, and its eval (exact = the edge planes and the closed planes both right;
+   `q.parts` gives each), are this build's definitions.
+6. Added at the owner's request: options D and D-cs (and D-fourier in the probe), `--depth`, option E in the
+   trainer with an equivariance test. The perception is the 7 taps only (no `taps+pool`).
+7. `--ckpt-pool half` (float16 pool states in ckpt.pt; plan 6 uses it) and pool.npz's state limited to 32
+   channels, for the bucket and the dashboard.
+
+**CPU smoke** (`train2`, level 2, real width 96 / 128, batch 4, pool 64, steps U[12, 24], backprop 12, eval at
+level 2 with 30 taps a set; one thread each, the Pi at load 10-25). Loss per 50 iterations; edge IoU on held-out
+taps at the checks (exact stays 0 this early); code bits = the fidelity probe's per-bit accuracy at the last check:
+
+| arm | consts | params | loss, every 50 iterations | IoU at 0 / 150 / 300 | code bits | s / iteration |
+|---|---|---|---|---|---|---|
+| a | 76 | 210,656 | 0.0435 0.0444 0.0349 0.0336 0.0332 0.0325 | 0 / 0.21 / 0.25 | 0.76 | 3.7 |
+| c | 115 | 255,584 | 0.0442 0.0454 0.0425 0.0362 0.0360 0.0425 | 0 / 0.20 / 0.23 | 0.82 | 4.7 |
+| d | 71 | 204,896 | 0.0436 0.0417 0.0371 0.0309 0.0283 0.0304 | 0 / 0.21 / 0.25 | 0.73 | 3.6 |
+| c-bc | 168 | 316,640 | 0.0425 0.0440 0.0417 0.0345 0.0347 0.0335 | 0 / 0.16 / 0.27 | 0.84 | 5.4 |
+| e | 69 | 160,352 | 0.0433 0.0509 0.0357 0.0336 (200 iterations) | 0 / 0.18 / - | 0.81 | 11.1 |
+| big (c, 128 / 256 / depth 2) | 115 | 658,816 | 0.0441 0.0347 0.0388 (150 iterations) | 0 / 0.17 / - | 0.81 | 6.8 |
+
+**CPU cost per iteration** (one process, the nets interleaved, best of 3; level 3, batch 8, 24 steps without
+gradient + 12 with), relative to the default C at 96 / 128 / depth 1: A 0.86, D 0.78, E 2.21 (its per-frame
+weight selection and the recomputed 7-tap rows; not measured on a GPU), big (C at 128 / 256 / depth 2) 2.35, for
+2.6x the parameters.
+
+**Memory per arm** (`python -m nca.strand.memprobe`: a fresh process's peak RSS over one gradient window on
+level-4 crops, S 42, at two window lengths): per backprop step at batch 8, E 19.4 MB (+325 MB transient, its
+checkpointed 7-tap recompute), C 35.6 MB (+43), big 75.9 MB (+33); autograd's saved tensors are ~70 % of that.
+At the trainer's window of 48 and batch 16: E 2.5 GB, C 3.5 GB, big 7.35 GB. `nca/cloud/plan-7.txt` sizes its
+batches from these (all three arms at 16, ~15.6 GB with pools and CUDA contexts).

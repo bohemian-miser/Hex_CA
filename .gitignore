@@ -4,3 +4,4 @@ runs/
 __pycache__/
 nca/cloud/ledger.tsv
 data/strand/
+data/strand-v2/
