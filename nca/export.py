@@ -139,11 +139,20 @@ def self_check(weights_path, fixture_path):
     return float(np.abs(got - np.array(fix["state"], dtype=np.float32)).max())
 
 
-def load_checkpoint(path, note="", label=None):
+def is_strand_checkpoint(ck) -> bool:
+    """A strand run's checkpoint (nca/strand/train.py, train2.py: config task m1a / m1b), not a flood model's."""
+    cfg = ck.get("config") if isinstance(ck, dict) else None
+    return isinstance(cfg, dict) and cfg.get("task") in ("m1a", "m1b")
+
+
+def load_checkpoint(path, note="", label=None, ck=None):
     """(model, meta) of a training checkpoint (ckpt.pt or best.pt): the model rebuilt from its config, and
     the meta the web page shows (the default note names the file as `label`, else its path). Reads the
-    file, writes nothing."""
-    ck = torch.load(path, map_location="cpu", weights_only=False)  # a checkpoint from a GPU loads here too
+    file (unless given it already loaded, `ck`), writes nothing."""
+    if ck is None:
+        ck = torch.load(path, map_location="cpu", weights_only=False)  # a checkpoint from a GPU loads here too
+    if is_strand_checkpoint(ck):
+        raise ValueError(f"{path} is a strand checkpoint: python -m nca.strand.export {path}")
     cfg = ck["config"]
     model = HexNCA(cfg["channels"], cfg["hidden"], cfg["clamp"], cfg["fireRate"], cfg.get("nConsts", 1),
                    cfg.get("perception", "taps"))  # checkpoints from before v4 have no pool
@@ -164,8 +173,14 @@ def load_checkpoint(path, note="", label=None):
 
 def checkpoint_json(path, note="", label=None):
     """A checkpoint's weights in the web format (weights_json), in memory: what nca.dashboard serves to the
-    play page for a run (/weights?run=NAME, --static's <run>/weights.json). Writes nothing."""
-    return weights_json(*load_checkpoint(path, note, label))
+    play page for a run (/weights?run=NAME, --static's <run>/weights.json). A strand run's checkpoint goes
+    to nca/strand/export.py instead (the strand page's format, "hexca-strand"; held-out numbers from the
+    run's log.jsonl beside it). Writes nothing."""
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if is_strand_checkpoint(ck):
+        from .strand.export import checkpoint_json as strand_checkpoint_json
+        return strand_checkpoint_json(path, label=label, note=note, ck=ck)
+    return weights_json(*load_checkpoint(path, note, label, ck=ck))
 
 
 def main():

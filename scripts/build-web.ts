@@ -3,8 +3,10 @@
 //   dist/hex-ca.html  the hand-written CA's page body alone (the artifact host wraps it in its own document)
 //   dist/index.html   the hand-written CA as a whole document, for GitHub Pages
 //   dist/nca.html     the trained NCA (web/nca.ts, weights bundled in) as a whole document
+//   dist/strand.html  the trained strand NCA (web/strand.ts, the boards and rule table bundled in), and
+//   dist/strand-weights.json  its default weights (web/strand-weights.json), fetched by the page
 import { build } from 'esbuild';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
 const ICON =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">' +
@@ -53,6 +55,11 @@ const nca = await bundle('web/nca.html', 'web/nca.ts');
 writeFileSync('dist/nca.html', documentOf(nca,
   'A neural cellular automaton on a hexagon field, trained to fill every region the drawn walls enclose and the smaller side of every wall from edge to edge.'));
 
-for (const f of ['dist/hex-ca.html', 'dist/index.html', 'dist/nca.html']) {
+const strand = await bundle('web/strand.html', 'web/strand.ts');
+writeFileSync('dist/strand.html', documentOf(strand,
+  'A neural cellular automaton on Spectacle\'s hex fields, trained to draw the strand of a tapped tile under a rule it is told only at the tap.'));
+copyFileSync('web/strand-weights.json', 'dist/strand-weights.json');
+
+for (const f of ['dist/hex-ca.html', 'dist/index.html', 'dist/nca.html', 'dist/strand.html', 'dist/strand-weights.json']) {
   console.log(`${f} ${(readFileSync(f).length / 1024).toFixed(1)} KB`);
 }

@@ -16,4 +16,6 @@ train2    -- `python -m nca.strand.train2`: the trainer (--inputs a | c | c-bc |
 probe     -- `python -m nca.strand.probe`: the per-cell lookup probe (static planes + code -> chords, an MLP)
 memprobe  -- `python -m nca.strand.memprobe`: training memory per arm (peak RSS of a gradient window), to size batches
 selftest2 -- `python -m nca.strand.selftest2`: data, inputs, targets, oracles, E's equivariance, runs, resume
+export    -- `python -m nca.strand.export CKPT`: a strand checkpoint (v1 or v2) as the strand play page's weights
+             (web/strand.html); --board-data, --fixtures: the page's rule table and boards, the TS parity fixtures
 """

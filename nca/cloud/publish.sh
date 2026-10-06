@@ -1,7 +1,7 @@
 #!/bin/bash
 # publish.sh [--source pi|vm] [--every SEC] RUN...: the static dashboard of these runs (runs/RUN) to
 # $BUCKET/dash/, the public page https://storage.googleapis.com/<bucket>/dash/index.html.
-# publish.sh --weights-only [--keep-page] [--every SEC] RUN...: only the play page and these runs' weights.
+# publish.sh --weights-only [--keep-page] [--every SEC] RUN...: only the play pages and these runs' weights.
 #
 #   nca/cloud/publish.sh pure-a                  # once, from this Pi (source pi)
 #   nca/cloud/publish.sh --every 60 pure-a       # in a loop (Ctrl-C to stop)
@@ -12,8 +12,10 @@
 # (no-clobber), so the page doesn't 404. Objects go up with Cache-Control "no-cache, max-age=0" (public
 # objects are otherwise cached for an hour, which would freeze the page), gzip-encoded, with their content
 # types. From the Pi (not --source vm: the VM's CPU is for training, and it has no build of the play page)
-# it also uploads play.html (dist/nca.html: npm run build) and <run>/weights.json for each run with a
-# checkpoint, which the page's Play link opens. --weights-only uploads just those two kinds of file, for
+# it also uploads play.html (dist/nca.html: npm run build), strand.html (dist/strand.html) and <run>/weights.json
+# for each run with a checkpoint, which the page's Play link opens (a strand run's weights in the strand page's
+# format, nca/strand/export.py; play.html sends them on to strand.html, so even an older index.html's Play
+# link works for a strand run). --weights-only uploads just those kinds of file, for
 # runs whose logs the VM publishes: never runs-*.json or a run's log/pool JSON, and index.html only with
 # --keep-page; a loop sends a file again only once it has changed. --keep-page: a VM on its own code
 # uploads its own dash/index.html every minute, which may differ from this checkout's (an older page, or
@@ -72,8 +74,9 @@ publish_once() {
     mkdir -p "$BUCKET/dash" && cp -r "${items[@]}" "$BUCKET/dash/" || return 1
     for s in $SOURCES; do [ -e "$BUCKET/dash/runs-$s.json" ] || echo '[]' >"$BUCKET/dash/runs-$s.json"; done
   fi
-  # the play page before the index whose Play links open it
+  # the play pages before the index whose Play links open them
   if [ -f "$out/play.html" ]; then put "$out/play.html" play.html "text/html; charset=utf-8" || return 1; fi
+  if [ -f "$out/strand.html" ]; then put "$out/strand.html" strand.html "text/html; charset=utf-8" || return 1; fi
   put "$out/index.html" index.html "text/html; charset=utf-8" || return 1
   echo "$(date +%T) published $* to $BUCKET/dash/ (runs-$source.json)"
 }
@@ -84,17 +87,17 @@ weights_once() {
   (cd "$ROOT" && "$PY" -m nca.dashboard --static "$out" --runs "$RUNS" --weights-only --only "$@") || return 1
   [ -f "$out/play.html" ] || { echo "$(date +%T) no play page (npm run build in $ROOT)" >&2; return 1; }
   local f rel h n=0 names=()
-  for f in "$out"/*/weights.json "$out/play.html"; do  # the weights before the page that fetches them
+  for f in "$out"/*/weights.json "$out/strand.html" "$out/play.html"; do  # the weights before the pages
     [ -f "$f" ] || continue
     rel=${f#"$out"/}
     h=$(sha256sum <"$f")
-    [ "$rel" = play.html ] || names+=("${rel%/weights.json}")
+    [[ $rel == *.html ]] || names+=("${rel%/weights.json}")
     [ "${sent[$rel]:-}" = "$h" ] && continue
-    if [ "$rel" = play.html ]; then put "$f" "$rel" "text/html; charset=utf-8" || return 1
+    if [[ $rel == *.html ]]; then put "$f" "$rel" "text/html; charset=utf-8" || return 1
     else put "$f" "$rel" application/json || return 1; fi
     sent[$rel]=$h n=$((n + 1))
   done
-  echo "$(date +%T) weights of ${names[*]:-no run} and play.html in $BUCKET/dash/: $n file(s) sent, the rest unchanged"
+  echo "$(date +%T) weights of ${names[*]:-no run}, play.html and strand.html in $BUCKET/dash/: $n file(s) sent, the rest unchanged"
 }
 
 # --keep-page: when the served index.html is a new upload (its generation) that isn't byte-identical to

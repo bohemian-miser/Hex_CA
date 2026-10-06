@@ -3,6 +3,7 @@
 // The weights are bundled in. With ?weights=<url>&name=<label> (the training
 // dashboard's Play) the page loads a run's weights instead, falling back to the
 // bundled ones, and can reload them while the run trains, keeping the walls.
+// A strand run's weights (format "hexca-strand") send the page on to strand.html.
 
 import weightsJson from './nca-weights.json';
 import { HexNCA, cellCoords, cellIndex, fieldMask, hexDist, loadWeights, randomBridge, side, targets, type NCAWeights } from '../src/nca.js';
@@ -734,11 +735,20 @@ let autoTimer = 0;
 const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const clock = (d: Date) => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
+/** A strand run's weights (nca/strand/export.py) belong on the strand page: the dashboard's Play opens this
+ * page for every run, so a strand run's weights land here first and go on, with the same query. */
+const STRAND_PAGE = 'strand.html';
+
 async function fetchWeights(url: string): Promise<{ text: string; w: NCAWeights }> {
   const res = await fetch(new URL(url, location.href), { cache: 'no-store' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const text = await res.text();
-  return { text, w: loadWeights(JSON.parse(text)) };
+  const json = JSON.parse(text) as { format?: unknown };
+  if (json && json.format === 'hexca-strand') {
+    location.replace(new URL(STRAND_PAGE + location.search, location.href).href);
+    throw new Error('strand weights: opening the strand page');
+  }
+  return { text, w: loadWeights(json) };
 }
 
 /** `w` becomes the weights the page uses: what follows from them (names, colour range) too. */
