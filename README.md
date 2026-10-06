@@ -193,7 +193,10 @@ src/fill.ts     the rule: channels, update, paint/bump/scramble, stateOf
 src/oracle.ts   the reference predicate and settleBound
 src/lines.ts    random pictures for tests and the demo (loops, bridges, scribbles, walls)
 tests/          vitest: oracle, fill, fuzz, overshoot, engine, field, garbage, rotate
-web/            the demo page (page.html + main.ts) and the trained NCA's page (nca.html + nca.ts), bundled by scripts/build-web.ts
+src/strand.ts   Spectacle's strand rules on its hex fields: rule table, split, rendering, walker
+src/strand-nca.ts  the trained strand NCAs (FrameNCA, StrandNCA, v1) in TypeScript
+web/            the demo page (page.html + main.ts), the trained NCA's page (nca.html + nca.ts) and the strand
+                page (strand.html + strand.ts), bundled by scripts/build-web.ts
 scripts/bench.ts  settle steps / ms / µs-per-update at three field sizes
 .github/        CI on pull requests; build and deploy to Pages from main
 ```
@@ -374,6 +377,34 @@ https://storage.googleapis.com/recipe-lanes-staging-hexca-runs/dash/index.html
 The hybrid's code paths (`--floods`, `--aux`, `--teach`, pooled-max/min
 perception) still exist behind flags — `nca/train.py`'s docstring has the
 exact v4/v5/v6 recipes — but nothing shipped uses them now.
+
+## Strand NCA: Spectacle's lines, grown by a network
+
+**Play:** https://bohemian-miser.github.io/Hex_CA/strand.html (e.g.
+[`?rule=128·010100000`](https://bohemian-miser.github.io/Hex_CA/strand.html?rule=128%C2%B7010100000&map=l3),
+the infinite-line rule). Pick one of Spectacle's hex fields (levels 2, 3, 4)
+and a rule — a random held-out one (never seen in training), a random
+training one, one typed in `describeRule` form, or a preset — and tap tiles.
+A strand NCA from `nca/strand/train2.py` grows the strand of every tap from
+the tapped chord; the true strand (Spectacle's rule and walker, in
+`src/strand.ts`) is drawn thinly underneath, with an "exact ✓" badge per tap.
+Taps share one board by default, so strands of different rules can run into
+each other — never trained, just shown. Each tap's input is training's: the
+rule's 53-bit code and the tapped chord's two edges on the tapped tile, held
+every step.
+
+`python -m nca.strand.export CKPT` writes a strand checkpoint (FrameNCA at any
+depth, the plain-conv StrandNCA, v1) as `web/strand-weights.json`'s format
+(float32, exact; the run's held-out numbers from its `log.jsonl`); `--board-data`
+writes `web/strand-data.json` (the rule table and the three Delta patches,
+from `data/strand-v2`), `--fixtures` the parity fixtures. `src/strand-nca.ts`
+matches PyTorch to ~2e-6 over 8 steps (`tests/strand.test.ts`: option E at
+depth 1 and 2, E-bc, C, A, v1, two and three taps on one board). The page's
+default weights are `tap-e2-l3`'s best (option E, depth 2; held-out exact
+0.31). The dashboard's ▶ Play opens a strand run on this page with its own
+weights. A step runs the network on every tile on the main thread:
+`npx tsx scripts/strand-bench.ts` — on a Raspberry Pi 5, ~8 ms at level 2,
+~60 ms at level 3, ~460 ms at level 4 (3,905 tiles), so level 4 grows slowly.
 
 ### Licence
 

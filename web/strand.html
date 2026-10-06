@@ -1,0 +1,196 @@
+<title>Strand NCA</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* The trained NCA page's bench (web/nca.html): board left, controls right. */
+:root {
+  --bg: #eef1ee;
+  --panel: #f8faf8;
+  --fg: #1d2421;
+  --muted: #5d6a64;
+  --hair: #cdd6d1;
+  --accent: #0f7a66;
+  --cell: #ffffff;
+  --cell-edge: #c3cdc7;
+  --good: #1f8a4c;
+  --bad: #b8402f;
+  --stray: #2a302d;
+  --halo: #ffffff;
+  /* How much of Spectacle's tile colour a tile shows (the rest is --cell). */
+  --type-mix: 0.4;
+  /* Each tap's colour, in the order taps are made. */
+  --tap0: #d1356b; --tap1: #1f6fb2; --tap2: #e07a10; --tap3: #7a3fc4;
+  --tap4: #0f8a7a; --tap5: #a23c1e; --tap6: #4b5bd6; --tap7: #6a7d12;
+  --display: "Bricolage Grotesque", "Avenir Next", system-ui, sans-serif;
+  --body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #131816; --panel: #1a201d; --fg: #e3ebe6; --muted: #93a39b; --hair: #2c3631;
+    --accent: #4fd1b0; --cell: #222a26; --cell-edge: #3a4741; --good: #5cc98a; --bad: #ef7a64;
+    --stray: #e3ebe6; --halo: #131816; --type-mix: 0.3;
+    --tap0: #ff6f9c; --tap1: #5aa9ff; --tap2: #ffab4a; --tap3: #b88cff;
+    --tap4: #4fe0c6; --tap5: #ff8a65; --tap6: #8f9bff; --tap7: #c6dd4f;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #131816; --panel: #1a201d; --fg: #e3ebe6; --muted: #93a39b; --hair: #2c3631;
+  --accent: #4fd1b0; --cell: #222a26; --cell-edge: #3a4741; --good: #5cc98a; --bad: #ef7a64;
+  --stray: #e3ebe6; --halo: #131816; --type-mix: 0.3;
+  --tap0: #ff6f9c; --tap1: #5aa9ff; --tap2: #ffab4a; --tap3: #b88cff;
+  --tap4: #4fe0c6; --tap5: #ff8a65; --tap6: #8f9bff; --tap7: #c6dd4f;
+  color-scheme: dark;
+}
+html, body { background: var(--bg); color: var(--fg); }
+body { margin: 0; font: 15px/1.5 var(--body); padding-inline: 16px; padding-block: 20px 40px; }
+.wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 20px; }
+header { display: grid; gap: 6px; }
+h1 { font: 700 clamp(26px, 4vw, 38px)/1.05 var(--display); letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
+header p { margin: 0; color: var(--muted); max-width: 75ch; }
+header p.model { color: var(--fg); font: 13px/1.5 var(--mono); overflow-wrap: anywhere; }
+header p.model .err { color: var(--bad); display: block; }
+a { color: var(--accent); }
+.bench { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
+@media (max-width: 860px) { .bench { grid-template-columns: minmax(0, 1fr); } }
+.stage-col { display: grid; gap: 8px; min-width: 0; }
+.status { font: 500 14px/1.4 var(--body); min-height: 2.8em; }
+.status b { color: var(--accent); font-weight: 500; }
+.status .warn { color: var(--bad); }
+.stage { position: relative; background: var(--panel); border: 1px solid var(--hair); border-radius: 6px; aspect-ratio: 1 / 0.92; max-width: 100%; min-width: 0; overflow: hidden; }
+.stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: crosshair; }
+.stage canvas.panning { cursor: grabbing; }
+.zoom { position: absolute; right: 8px; top: 8px; display: flex; gap: 4px; }
+.zoom button { padding: 4px 9px; font: 500 14px/1 var(--mono); }
+.side { display: grid; gap: 16px; min-width: 0; }
+.group { display: grid; gap: 9px; min-width: 0; }
+.group[hidden] { display: none; }
+.label { font: 500 11px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.09em; color: var(--muted); }
+.buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+button, select, input[type=text] { font: 500 14px/1 var(--body); color: var(--fg); background: var(--panel); border: 1px solid var(--hair); border-radius: 4px; padding: 9px 12px; }
+button, select { cursor: pointer; }
+input[type=text] { font: 400 14px/1 var(--mono); min-width: 0; flex: 1; }
+button:hover, select:hover, input[type=text]:hover { border-color: var(--accent); }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.row select { flex: 1; min-width: 0; }
+.check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.check input:disabled + span { opacity: 0.5; }
+.slider { display: grid; grid-template-columns: 70px minmax(0, 1fr) 42px; align-items: center; gap: 8px; font-size: 13px; }
+.slider output { font: 400 13px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+input[type=range] { width: 100%; accent-color: var(--accent); }
+.note { margin: 0; font: 12px/1.45 var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.note.err { color: var(--bad); }
+.ruleNow { font: 13px/1.4 var(--mono); }
+.tag { display: inline-block; padding: 1px 6px; border-radius: 999px; font: 500 11px var(--mono); border: 1px solid currentColor; margin-left: 4px; }
+.tag.held { color: var(--accent); }
+.tag.train { color: var(--muted); }
+.swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; flex: none; }
+ol.taps { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+ol.taps li { display: grid; grid-template-columns: 12px minmax(0, 1fr) auto; gap: 8px; align-items: start; font: 12px/1.4 var(--mono); padding: 6px 8px; border: 1px solid var(--hair); border-radius: 4px; background: var(--panel); }
+ol.taps li .swatch { margin-top: 2px; }
+ol.taps li .what { min-width: 0; overflow-wrap: anywhere; }
+ol.taps li .what button { all: unset; cursor: pointer; text-decoration: underline dotted; }
+ol.taps li .what button:focus-visible { outline: 2px solid var(--accent); }
+ol.taps li .sub { color: var(--muted); }
+ol.taps li .x { padding: 2px 7px; font-size: 13px; }
+.badge { font-weight: 500; }
+.badge.ok { color: var(--good); }
+.badge.no { color: var(--bad); }
+.empty { font: 12px var(--mono); color: var(--muted); margin: 0; }
+dl.readout { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; font: 400 13px/1.35 var(--mono); font-variant-numeric: tabular-nums; border-top: 1px solid var(--hair); padding-top: 12px; }
+dl.readout dt { color: var(--muted); }
+dl.readout dd { margin: 0; text-align: right; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; color: var(--muted); }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { display: inline-block; width: 18px; height: 0; border-top: 3px solid var(--fg); }
+.legend i.thin { border-top-width: 1px; opacity: 0.6; }
+.legend i.dash { border-top-style: dashed; border-top-color: var(--stray); }
+kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair); border-radius: 3px; padding: 0 4px; }
+</style>
+<div class="wrap">
+  <header>
+    <h1>Strands, as a trained neural CA</h1>
+    <p>Spectacle's game draws a line from a tapped tile along the player's rule, tile to tile. Here a small neural network runs on every hexagon, step after step, and has to draw that line itself: each tile sees only its own type and which way round it is, and the tapped tile alone is told the rule and the tapped chord. Tap tiles to start strands, each with its rule, and compare what the network draws with the true strand underneath. <a href="nca.html">Fill NCA</a> · <a href="index.html">Hand-written CA</a> · <a href="https://github.com/bohemian-miser/Hex_CA">Source on GitHub</a></p>
+    <p class="model" id="model" aria-live="polite">Loading weights…</p>
+  </header>
+
+  <div class="bench">
+    <div class="stage-col">
+      <div class="status" id="status" aria-live="polite"></div>
+      <div class="stage">
+        <canvas id="board" aria-label="The board: tap a tile to start a strand there with the current rule"></canvas>
+        <div class="zoom">
+          <button id="zoomIn" title="Zoom in (or scroll on the board)">+</button>
+          <button id="zoomOut" title="Zoom out">−</button>
+          <button id="zoomFit" title="Fit the board">fit</button>
+        </div>
+      </div>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="side">
+      <div class="group">
+        <div class="label">Weights</div>
+        <p class="note" id="source"></p>
+        <div class="buttons">
+          <button id="reloadWeights" title="Fetch the weights again and swap them in: the taps stay, the state starts over">Reload weights</button>
+        </div>
+      </div>
+      <div class="group">
+        <div class="label">Board</div>
+        <div class="row">
+          <select id="map" title="Which of Spectacle's hex fields (the Delta patch of each level)"></select>
+        </div>
+        <p class="note" id="mapInfo"></p>
+      </div>
+      <div class="group">
+        <div class="label">Rule for the next tap</div>
+        <div class="row">
+          <input type="text" id="ruleText" spellcheck="false" autocomplete="off" aria-label="Rule, in Spectacle's describeRule form" placeholder="128·010100000">
+          <button id="ruleUse">Use</button>
+        </div>
+        <div class="buttons">
+          <button id="ruleHeld" title="A rule the network never saw in training (the v2 split's held-out set)">Random held-out</button>
+          <button id="ruleTrain" title="A rule from the training set">Random training</button>
+        </div>
+        <div class="row">
+          <select id="preset" title="Named rules">
+            <option value="">Presets…</option>
+            <option value="15·000000000">Default: 15·000000000</option>
+            <option value="128·010100000">Infinite line: 128·010100000</option>
+          </select>
+        </div>
+        <p class="ruleNow" id="ruleNow"></p>
+        <p class="note" id="ruleErr" aria-live="polite"></p>
+      </div>
+      <div class="group">
+        <div class="label">Taps</div>
+        <ol class="taps" id="taps"></ol>
+        <p class="empty" id="tapsEmpty">No taps yet: tap a tile on the board.</p>
+        <label class="check"><input type="checkbox" id="shared" checked><span>One board for all taps (strands meet)</span></label>
+        <p class="note" id="sharedNote"></p>
+        <div class="buttons">
+          <button id="clearTaps">Clear taps</button>
+        </div>
+      </div>
+      <div class="group">
+        <div class="label">Run</div>
+        <div class="buttons">
+          <button id="play" class="primary">Pause</button>
+          <button id="step">Step</button>
+          <button id="reset" title="Every model back to the fresh state, the taps held from step 0">Reset state</button>
+        </div>
+        <label class="slider" for="speed">Steps/s <input type="range" id="speed" min="1" max="120" value="30"><output id="speedOut">30</output></label>
+        <label class="check"><input type="checkbox" id="truth" checked><span>True strands underneath <kbd>T</kbd></span></label>
+        <label class="check"><input type="checkbox" id="types" checked><span>Tile types and rotation</span></label>
+      </div>
+      <dl class="readout" id="readout"></dl>
+      <p class="note" id="meta"></p>
+    </div>
+  </div>
+</div>
+<script>/*APP*/</script>

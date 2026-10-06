@@ -27,8 +27,11 @@ Endpoints:
                           contract), or an empty one (200, levels: []) if there isn't one yet
     GET /play             the interactive board, dist/nca.html (npm run build); also /play.html. The page's
                           Play link opens it as /play?weights=<url of the run's weights>&name=<run>
+    GET /strand           the strand board, dist/strand.html (also /strand.html; /strand-weights.json its default
+                          weights): a strand run's Play opens it the same way (and play.html sends strand weights on)
     GET /weights?run=N    the run's best.pt (else ckpt.pt) as the play page's weights JSON, converted by
-                          nca/export.py (torch, imported on first use only); also /N/weights.json. 404 JSON
+                          nca/export.py (a strand run's by nca/strand/export.py; torch, imported on first use
+                          only); also /N/weights.json. 404 JSON
                           without a checkpoint. Cached by the checkpoint's mtime, in memory and under the
                           system temp dir (WEIGHTS_CACHE) -- never in the run directory.
 
@@ -40,11 +43,13 @@ return). Opened from there the page
 fetches those relative files instead of /api/*: it merges runs-pi.json and runs-vm.json (a fixed list,
 so two publishers never write the same file and nothing is ever listed), polls every 15 s and shows
 the data's own time. nca/cloud/publish.sh uploads such a copy to the bucket. Unless --no-weights, it also
-writes play.html (dist/nca.html) and <name>/weights.json for each run with a checkpoint here (the list's
-hasWeights); the page's Play link opens play.html?weights=<name>/weights.json&name=<name>, and for a run
-whose list says no weights (the VM's) it looks for <name>/weights.json first. --weights-only writes just
-play.html, those weights.json and index.html (the page alone, no data): what publish.sh --weights-only
-uploads for the cloud runs from the Pi (index.html only with --keep-page).
+writes play.html (dist/nca.html), strand.html (dist/strand.html) and <name>/weights.json for each run with a
+checkpoint here (the list's hasWeights); the page's Play link opens play.html?weights=<name>/weights.json&name=
+<name> (a strand run's: strand.html?..., once its log says it is one; play.html sends strand weights on to
+strand.html anyway), and for a run whose list says no weights (the VM's) it looks for <name>/weights.json
+first. --weights-only writes just play.html, strand.html, those weights.json and index.html (the page alone,
+no data): what publish.sh --weights-only uploads for the cloud runs from the Pi (index.html only with
+--keep-page).
 
 Stdlib + numpy only (torch only for a run's weights, imported when first asked for). Single process,
 single thread per request (ThreadingHTTPServer), no subprocesses, no writes anywhere but the weights
@@ -320,6 +325,8 @@ def sanitize(obj):
 # ── the play page and a run's weights ──────────────────────────────────────────────────────────
 
 PLAY_HTML = Path(__file__).resolve().parent.parent / "dist" / "nca.html"  # npm run build (scripts/build-web.ts)
+STRAND_HTML = PLAY_HTML.with_name("strand.html")  # the strand board (web/strand.ts)
+STRAND_WEIGHTS = PLAY_HTML.with_name("strand-weights.json")  # its default weights
 CHECKPOINTS = ("best.pt", "ckpt.pt")  # a run's weights: its best model, else its latest
 WEIGHTS_CACHE = Path(tempfile.gettempdir()) / "hexca-play-weights"
 _weights_lock = threading.Lock()
@@ -372,10 +379,10 @@ def run_weights(run_dir: Path):
 
 
 def export_play(out_dir: Path, runs_root: Path, names) -> set:
-    """play.html (a copy of dist/nca.html) and <name>/weights.json for each of `names` with a checkpoint,
-    into out_dir. Returns the names whose weights.json it wrote. Without a built play page it writes
-    nothing (weights alone can't be played). A run whose checkpoint can't be converted is skipped, said
-    on stderr."""
+    """play.html (a copy of dist/nca.html), strand.html (dist/strand.html, when built) and <name>/weights.json
+    for each of `names` with a checkpoint (a strand run's in the strand page's format), into out_dir. Returns
+    the names whose weights.json it wrote. Without a built play page it writes nothing (weights alone can't be
+    played). A run whose checkpoint can't be converted is skipped, said on stderr."""
     try:
         play = PLAY_HTML.read_bytes()
     except OSError:
@@ -400,6 +407,14 @@ def export_play(out_dir: Path, runs_root: Path, names) -> set:
     tmp = out_dir / "play.html.tmp"
     tmp.write_bytes(play)
     tmp.replace(out_dir / "play.html")
+    try:
+        strand = STRAND_HTML.read_bytes()
+    except OSError:
+        print(f"no {STRAND_HTML} (npm run build): no strand page written", file=sys.stderr)
+    else:
+        tmp = out_dir / "strand.html.tmp"
+        tmp.write_bytes(strand)
+        tmp.replace(out_dir / "strand.html")
     return done
 
 
@@ -690,6 +705,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._html(f"<!doctype html><meta charset=utf-8><title>Play page not built</title>"
                                f"<p>The play page isn't built: no <code>{PLAY_HTML}</code>. Run <code>npm run "
                                f"build</code> in <code>{PLAY_HTML.parent.parent}</code>, then reload.</p>", 404)
+            elif path in ("/strand", "/strand.html", "/strand-weights.json"):
+                f = STRAND_WEIGHTS if path.endswith(".json") else STRAND_HTML
+                try:
+                    self._bytes(f.read_bytes(), "application/json; charset=utf-8" if path.endswith(".json")
+                                else "text/html; charset=utf-8")
+                except OSError:
+                    self._json({"error": f"no {f} (npm run build)"}, 404)
             elif path == "/weights":
                 self._weights((qs.get("run") or [""])[0], runs_root)
             elif re.fullmatch(r"/[^/]+/weights\.json", path):
@@ -788,7 +810,7 @@ def main() -> None:
         names = sorted(n for n in (args.only or []) if n in valid_run_names(runs_root))
         done = export_play(Path(args.static), runs_root, names)
         write_static_page(Path(args.static))
-        print(f"wrote {args.static}: play.html, index.html and weights.json of {sorted(done)}"
+        print(f"wrote {args.static}: play.html, strand.html, index.html and weights.json of {sorted(done)}"
               + (f"; none for {sorted(set(args.only or []) - done)}" if set(args.only or []) - done else ""),
               file=sys.stderr)
         return
@@ -2131,9 +2153,13 @@ document.getElementById("runSelect").addEventListener("change", function (e) {
 // publish.sh --weights-only) is looked for with a HEAD of its weights.json, at most once a minute.
 var weightsProbe = Object.create(null);   // run name -> {ok, at, pending}
 function weightsURL(name) { return STATIC ? encodeURIComponent(name) + "/weights.json" : "/weights?run=" + encodeURIComponent(name); }
+// A strand run (its log's config says so, once loaded) plays on the strand page; play.html sends strand
+// weights there too, so a run whose log isn't in yet still lands in the right place.
+function isStrandRun(name) { return state.configRun === name && isStrandConfig(state.config); }
 function playURL(name) {
   var q = function (v) { return encodeURIComponent(v).replace(/%2F/g, "/"); };  // a "/" may stay as it is in a query
-  return (STATIC ? "play.html" : "/play") + "?weights=" + q(weightsURL(name)) + "&name=" + q(name);
+  var page = isStrandRun(name) ? (STATIC ? "strand.html" : "/strand") : (STATIC ? "play.html" : "/play");
+  return page + "?weights=" + q(weightsURL(name)) + "&name=" + q(name);
 }
 function setPlay(name, ok, why) {
   var a = document.getElementById("playLink");
@@ -2141,7 +2167,9 @@ function setPlay(name, ok, why) {
   if (ok) {
     a.href = playURL(name);
     a.removeAttribute("aria-disabled");
-    a.title = "Open the board with " + name + "'s best weights in a new tab: paint walls, watch it fill";
+    a.title = isStrandRun(name)
+      ? "Open the strand board with " + name + "'s best weights in a new tab: tap tiles, watch the strands grow"
+      : "Open the board with " + name + "'s best weights in a new tab: paint walls, watch it fill";
   } else {
     a.removeAttribute("href");
     a.setAttribute("aria-disabled", "true");
@@ -2193,7 +2221,9 @@ function poll() {
     }
     getJSON(logURL(active)).then(function (log) {
       state.config = log.config || {};
+      state.configRun = active;
       state.records = log.records || [];
+      updatePlay(active);  // a strand run's Play opens the strand page
       updateHeader(runMeta, state.config, state.records, runs);
       updateCharts(state.records);
       // the pool fetch below runs in parallel and may have drawn first, before state.config (and

@@ -201,8 +201,8 @@ check "publish.sh --source pi: runs-pi.json lists the Pi's run (hasWeights); run
   test "$(j "$B/dash/runs-pi.json" '[(r["name"], r["hasWeights"]) for r in d]')|$(j "$B/dash/runs-vm.json" 'len(d)')|$(ls "$B/dash/seed" | tr '\n' ' ')|$(j "$B/dash/seed/weights.json" 'd["meta"]["iterations"] >= 0')|$(grep -c '<canvas id="board"' "$B/dash/play.html")" = "[('seed', True)]|4|gallery.json log.json pool.json weights.json |True|1"
 WB=$WORK/wb-weights && rm -rf "$WB"
 BUCKET=$WB RUNS=$WORK/seed/runs bash "$HERE/publish.sh" --weights-only seed nosuchrun >/dev/null 2>&1
-check "publish.sh --weights-only: play.html and seed/weights.json, nothing else" \
-  test "$(cd "$WB/dash" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" = "./play.html ./seed/weights.json "
+check "publish.sh --weights-only: play.html, strand.html and seed/weights.json, nothing else" \
+  test "$(cd "$WB/dash" && find . -type f | LC_ALL=C sort | tr '\n' ' ')" = "./play.html ./seed/weights.json ./strand.html "
 
 echo
 if [ "$fails" -eq 0 ]; then echo "cloud selftest: ALL OK ($WORK)"; else echo "cloud selftest: $fails FAILED ($WORK)"; fi
