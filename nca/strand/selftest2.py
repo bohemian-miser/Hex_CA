@@ -8,7 +8,7 @@
      sampled train rules are never held out
   2. inputs, per --inputs arm: shapes; the static planes at a cell are its (type, rot, mirror) row and do not
      depend on the rule; the tap planes are on the tapped cell only and decode back to the rule and the chord;
-     c-bc's broadcast code is on every board cell; nothing else in the consts changes with the rule
+     c-bc's / e-bc's broadcast code is on every board cell; nothing else in the consts changes with the rule
   3. targets: a slot's m1a target = the exported walkStrand strand (parity taps); m1b's open-news times
      (ends at their own distance, circuits = the draw time); edit damage re-types 1-3 cells, never the tap's
   4. the legacy set = train.py's quick-check taps (same boards, taps, targets), and its chords rendered from
@@ -16,9 +16,11 @@
   5. the quick check: the oracle state scores exact 1.0 (steps ratio 1, excess 0) for m1a and m1b, one step
      late excess 1, an extra edge exact < 0.5; the code probe reads an injected code back exactly and a
      random state at chance
-  6. option E (nets.FrameNCA): a rotated and a mirrored board, inputs and tap, give the same per-cell outputs in
-     local frames (float64); zeroing the frames, or a plain conv on the D inputs, breaks it
-  7. training, every arm (a, c, c-bc, d, d-cs, e; two at --depth 2): the loss is finite and iteration 0's check
+  6. option E (nets.FrameNCA): the per-cell gather gives the first, per-frame-weights version's outputs and
+     gradients (float64, random frames, depth 1 and 2: frame_reference_step below); a rotated and a mirrored
+     board, inputs and tap, give the same per-cell outputs in local frames (float64, e and e-bc); zeroing the
+     frames, or a plain conv on the D inputs, breaks it
+  7. training, every arm (a, c, c-bc, d, d-cs, e, e-bc; three at --depth 2): the loss is finite and iteration 0's check
      runs; a forced collapse rolls back; --resume is bit-exact (3 + 3 = 6) and --ckpt-pool half resumes;
      m1b runs from an m1a checkpoint; pool.npz reads through nca.dashboard.pool_to_json
 """
@@ -137,9 +139,9 @@ def input_checks(tab, bd):
         x2 = pl(geo[None], codes([[s2, *d2]]), [tap])[0].numpy()
         n_static = T.STATIC[T.static_of(inputs)]
         st = slice(1, 1 + n_static)
-        n_planes = T.n_inputs(inputs) + (inputs == "e")  # E: + the frame plane (not an input feature)
+        n_planes = T.n_inputs(inputs) + T.framed(inputs)  # E: + the frame plane (not an input feature)
         ok = x1.shape == (n_planes, 37, 37) and np.array_equal(x1[0], (geo >= 0).astype(np.float32))
-        if inputs == "e":
+        if T.framed(inputs):
             ok &= np.array_equal(x1[-1], np.where(geo >= 0, geo % 12, 0).astype(np.float32))
         r, c = np.nonzero(geo >= 0)
         k = len(r) // 2
@@ -152,7 +154,7 @@ def input_checks(tab, bd):
         cls, dig = tab.decode(tp[:CODE_BITS, tap[0], tap[1]])
         ok &= np.array_equal(cls, tab.code(s1, d1)[:8] > 0) and np.array_equal(dig, d1)
         ok &= set(np.nonzero(tp[CODE_BITS:, tap[0], tap[1]])[0].tolist()) == {tap[2], tap[3]}
-        if inputs == "c-bc":
+        if inputs in T.BROADCAST:
             bc = x1[1 + n_static:pl.tap_at]
             ok &= np.array_equal(bc[:, r, c], np.repeat(tab.code(s1, d1)[:, None], len(r), 1)) and \
                 not bc[:, geo < 0].any()
@@ -162,7 +164,8 @@ def input_checks(tab, bd):
             same[pl.tap_at:pl.tap_at + CODE_BITS] = False
             ok &= np.array_equal(x1[same], x2[same])  # only the tap's code planes change with the rule
         check(f"inputs {inputs}: {x1.shape[0]} consts (mask, {n_static} static"
-              + (", 53 broadcast" if inputs == "c-bc" else "") + ", tap 59" + (", frame" if inputs == "e" else "")
+              + (", 53 broadcast" if inputs in T.BROADCAST else "") + ", tap 59"
+              + (", frame" if T.framed(inputs) else "")
               + "); static planes = the cell's "
               "(type, rot, mirror) row and blind to the rule; the tap planes on the tapped cell only, decoding to "
               "the rule and the chord", ok)
@@ -308,6 +311,79 @@ def transform_board(geo, M):
     return new, (rr, qq), dmap
 
 
+def frame_reference_step(model, state, walls, consts):
+    """nets.FrameNCA's step as first written (launch 7): the shared weights permuted to the board frame for each of
+    the 12 frames (W1_f, W2_f, b2_f), the cells grouped by frame in a loop. The parity reference for the per-cell
+    gather (an independent route: weights permuted per frame, not features per cell)."""
+    from .nets import DCOL, DROW, N_FRAMES
+    import torch.nn.functional as F
+    B = state.shape[0]
+    frame = consts[:, -1].round().long().expand(B, -1, -1)
+    cin = consts[:, :-1]
+    x = torch.cat([state, cin.expand(B, -1, -1, -1)], 1)
+    _, Cx, S, _ = x.shape
+    H = model.hidden
+    W1 = model.w1[:, model.tap_local]  # [H, 12, 7, Cx]: board tap t -> local tap
+    W1 = W1.gather(3, model.chan_x[None, :, None, :].expand(H, N_FRAMES, 7, Cx))  # board channel -> local
+    W1 = W1.permute(1, 2, 3, 0).reshape(N_FRAMES, 7 * Cx, H)
+    W2, b2 = model.w2[model.chan_out], model.b2[model.chan_out]
+    xp = F.pad(x, (1, 1, 1, 1))
+    taps = [x] + [xp[:, :, 1 + DROW[d]:1 + DROW[d] + S, 1 + DCOL[d]:1 + DCOL[d] + S] for d in range(6)]
+    rows = torch.stack(taps, 1).permute(0, 3, 4, 1, 2).reshape(B * S * S, 7 * Cx)
+    fr = frame.reshape(-1)
+    out = x.new_zeros(B * S * S, model.channels)
+    for f in range(N_FRAMES):
+        idx = (fr == f).nonzero(as_tuple=True)[0]
+        if not len(idx):
+            continue
+        h = torch.relu(rows[idx] @ W1[f] + model.b1)
+        for m in model.mids:
+            h = torch.relu(m(h))
+        out = out.index_copy(0, idx, h @ W2[f].T + b2[f])
+    state = state + out.view(B, S, S, model.channels).permute(0, 3, 1, 2)
+    if model.clamp is not None:
+        state = state.clamp(model.clamp[0], model.clamp[1])
+    state = torch.cat([walls.expand(B, -1, -1, -1), state[:, 1:]], 1)
+    return state * cin[:, :1]
+
+
+def frame_parity():
+    """nets.FrameNCA (one per-cell gather) = frame_reference_step (per-frame weights): outputs after 4 steps and
+    the gradients (state and every parameter), float64, every frame present, random weights and inputs."""
+    worst = 0.0
+    ok = True
+    for C, H, depth, inputs, B, S in ((35, 24, 2, "e", 3, 9), (96, 128, 1, "e", 2, 12), (40, 32, 2, "e-bc", 2, 7)):
+        torch.manual_seed(2)
+        n_in = T.n_inputs(inputs)
+        model = T.make_model(C, H, [-2.0, 2.0], n_in, depth, inputs, 2 if C < 96 else None).double()
+        with torch.no_grad():
+            model.w2.normal_(0, 0.3)
+            model.b2.normal_(0, 0.1)
+            model.b1.normal_(0, 0.1)
+        g = torch.Generator().manual_seed(3)
+        mask = (torch.rand(B, 1, S, S, generator=g) > 0.2).double()
+        cs = torch.randn(B, n_in + 1, S, S, generator=g, dtype=torch.float64) * mask
+        cs[:, 0:1] = mask
+        cs[:, -1:] = torch.randint(0, 12, (B, 1, S, S), generator=g).double() * mask
+        st0 = (torch.randn(B, C, S, S, generator=g, dtype=torch.float64) * mask).requires_grad_()
+        wts = torch.rand(C, dtype=torch.float64).view(1, -1, 1, 1)
+        got = []
+        for fn in (model.step, lambda st, w, c: frame_reference_step(model, st, w, c)):
+            model.zero_grad()
+            st = st0
+            for _ in range(4):
+                st = fn(st, mask, cs)
+            loss = (st ** 2 * wts).sum()
+            gs, = torch.autograd.grad(loss, st0, retain_graph=True)
+            loss.backward()
+            got.append([st.detach(), gs] + [q.grad.clone() for q in model.parameters()])
+        diffs = [float((a - b).abs().max() / max(1.0, float(b.abs().max()))) for a, b in zip(*got)]
+        worst = max(worst, max(diffs))
+        ok &= max(diffs) < 1e-10 and float(got[0][0][:, 1:].abs().max()) > 0.1 and float(got[0][2].abs().max()) > 0
+    check(f"option E: the per-cell gather = the per-frame-weights reference, outputs after 4 steps and every "
+          f"gradient (float64, all 12 frames, depth 1 / 2, e and e-bc; worst relative |diff| {worst:.1e})", ok)
+
+
 def frame_checks(tab, bd):
     """Option E: rotating or mirroring a whole board (inputs, tap) gives the same per-cell outputs in local
     frames -- the board-frame state at the moved cell, its directional channels moved with the directions."""
@@ -343,14 +419,15 @@ def frame_checks(tab, bd):
         new, (rr, qq), dmap = transform_board(geo, M)
         k = list(zip(rows.tolist(), cols.tolist())).index((tap[0], tap[1]))
         tap2 = (int(rr[k]), int(qq[k]), dmap[tap[2]], dmap[tap[3]])
-        for inputs, pert in (("e", False), ("e", True), ("d", False)):
+        for inputs, pert in (("e", False), ("e-bc", False), ("e", True), ("d", False)):
             a, b = run(inputs, geo, tap, pert), run(inputs, new, tap2, pert)
             want = a[:, rows, cols]
             got = b[:, rr, qq].copy()
             for g in groups:  # board channel g + d of the old cell is g + dmap[d] of the new one
                 got[g:g + 6] = got[[g + dmap[d] for d in range(6)]]
             results[(name, inputs, pert)] = (float(np.abs(want - got).max()), float(np.abs(want).max()))
-    e_ok = all(results[(n, "e", False)][0] < 1e-9 and results[(n, "e", False)][1] > 0.1 for n in ("rotation", "mirror"))
+    e_ok = all(results[(n, i, False)][0] < 1e-9 and results[(n, i, False)][1] > 0.1 for n in ("rotation", "mirror")
+               for i in ("e", "e-bc"))
     neg = all(results[(n, i, p)][0] > 1e-3 for n in ("rotation", "mirror") for i, p in (("e", True), ("d", False)))
     fmt = ", ".join(f"{n} {i}{' frames off' if p else ''}: {d:.1e}" for (n, i, p), (d, _) in results.items())
     check(f"option E: a rotated / mirrored board gives the same outputs in local frames after {steps} steps "
@@ -368,7 +445,8 @@ def log_of(name):
 
 
 def runs():
-    for inputs, extra in (("a", []), ("c", []), ("c-bc", []), ("d", []), ("d-cs", ["--depth", "2"]), ("e", ["--depth", "2"])):
+    for inputs, extra in (("a", []), ("c", []), ("c-bc", []), ("d", []), ("d-cs", ["--depth", "2"]),
+                          ("e", ["--depth", "2"]), ("e-bc", ["--depth", "2"])):
         name = f"arm-{inputs}"
         T.main(["--name", name, "--inputs", inputs, *TINY, *extra, "--iters", "3", "--eval-every", "50"])
         lg = log_of(name)
@@ -429,6 +507,7 @@ def main():
     target_checks(tab, bd)
     legacy_checks(tab)
     oracle_checks(tab, bd)
+    frame_parity()
     frame_checks(tab, bd)
     here = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:

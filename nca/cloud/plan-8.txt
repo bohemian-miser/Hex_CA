@@ -1,0 +1,50 @@
+# Launch 8: three arms of option E (local-frame perception, nets.FrameNCA) on the rule at the tap
+# (nca/strand/train2.py), each its own process on the one L4. Launch it once plan-7 has ended and no other hexca VM
+# is up (plan-6, the spiral fine-tune, is its own launch; the GPU quota is 1).
+# Why: after l3, plan-7's C (28k iterations) and big-C (15k) hold out at exact ~0.14 (short strands ~0.25, medium
+# and long 0), and the code-fidelity probe reads the code back off the line at or below chance (classes 0.21-0.35,
+# digits 0.06 against 0.11): the line does not carry the rule, and at hidden 128 C's per-cell lookup is weak too
+# (the per-cell probe: C 0.73 held-out at width 128, E's local frame 0.95; at width 1024 0.98 / 0.985).
+#   tap-e-base  E as plan-7's tap-e (96 / 128 / depth 1, type one-hot only): the same four stages, minutes and flags.
+#               A new run name because plan-7's tap-e-l2 (the slow first FrameNCA, stopped at ~200 iterations: no
+#               stop line, no ckpt.pt) is in the bucket, and startup.sh would take a stage of that name for a
+#               cut-off one: start it with only the minutes left and append to its log.
+#   tap-e-bc    the diagnostic: E with the rule's 53-bit code on every board cell (--inputs e-bc, as c-bc is for C;
+#               122 consts). High here and low in tap-e-base = E computes the chords but the line can't carry the
+#               code; low in both = the per-cell computation itself.
+#   tap-e-wide  E at --hidden 512 (channels 96): width lifted every arm of the per-cell probe. Checks and checkpoints
+#               every 500 iterations (1500 in l2), as plan-7's big-C: ~2x C's CPU time per iteration, as big-C's 2.35x.
+# Stages per arm (plan-7's chain, --init from the previous stage's best.pt; later stages at lr 2e-4):
+#   l2 25 min (level 2), l3 240 (2 + 3), l4 150 (3 + level-4 crops), m1b 60 (2 + 3 + 4)
+# = 475 min a run + SETUP_MIN 25 = 500 min = ~8.3 VM-hours (MAX_HOURS 12), ~$3.4 at ~$0.41/h. The three arms
+# share the GPU, so the cost is the longest run's.
+# Speed: E is now one per-cell gather into the shared per-cell MLP (nets.FrameNCA; parity-tested in selftest2
+# against the first, per-frame version to 5e-15 in float64, equivariance exact): 51 ops per gradient step and no
+# host syncs, where the first version had ~320 ops and 23 syncs (C: 27). On the Pi's CPU at these settings (level 2,
+# batch 16, 8 + 48 steps, forward + backward + Adam), per iteration relative to C: E 0.66 (was 1.9-2.4), E-bc
+# 0.84, E-wide 1.98; at level 3 E 0.67 (was 1.92). Not measured on the L4: expect E near C's 0.09 s / iteration at
+# l2 (some more small ops per step) and at or under C's time at l3 / l4; E-wide about twice C's. Watch secPerIter.
+# Memory (python -m nca.strand.memprobe: CPU peak RSS over a gradient window on level-4 crops, S 42, batch 8,
+# windows 4 / 20): per backprop step E 50 MB, E-bc 52, E-wide 64.5 (autograd's saved tensors 28 / 31 / 50; C 39 /
+# 24.5 the same day). At window 48 and batch 16: E 4.9 GB, E-bc 5.2, E-wide 6.4 = 16.5 GB, + the pools (256 slots
+# x levels 2-4 at m1b, float32: 0.32 GB each) + ~0.4 GB of CUDA context each = ~18.7 GB, ~20.5 GB with 10% allocator
+# slack, of the L4's ~22.5 usable (by the saved tensors alone ~12.5 GB). So batch 16 for all three: equal across
+# the arms and with plan-7's C and big-C, so E vs C is the nets alone; batch 24 would be ~27 GB before slack. The
+# quick check's read-out (eval batch 64, no gradient, after the window is freed) peaks at 0.6 / 0.9 / 0.8 GB.
+# Quick checks and gates as plan-7: held-out rules only (legacy + wide sets, 120 taps per set and level at levels 3
+# and 4, the code probe q.code); score = length-balanced exact. Read against plan-7's C (~0.14 after l3); at +90 min
+# into l3, held-out exact >= 0.6 and rising is alive. tap-e-bc well above tap-e-base, with tap-e-base's
+# q.code.byDist weak away from the tap, says the line is the bottleneck.
+# Data: plan-7's, unchanged (the private bucket's strand-v2.tgz and launch 5's strand.tgz).
+tap-e-base | l2  | 25  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 2 --eval-levels 3 4 --channels 96 --hidden 128 --batch 16 --pool-size 256 --iters 1000000 --eval-every 3000 --ckpt-every 1000 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-base | l3  | 240 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 2 3 --eval-levels 3 4 --channels 96 --hidden 128 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 1000 --ckpt-every 1000 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-base | l4  | 150 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 3 4 --eval-levels 3 4 --channels 96 --hidden 128 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 1000 --ckpt-every 1000 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-base | m1b | 60  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1b --levels 2 3 4 --eval-levels 3 4 --channels 96 --hidden 128 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 1000 --ckpt-every 1000 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-bc   | l2  | 25  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e-bc --task m1a --levels 2 --eval-levels 3 4 --channels 96 --hidden 128 --batch 16 --pool-size 256 --iters 1000000 --eval-every 3000 --ckpt-every 1000 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-bc   | l3  | 240 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e-bc --task m1a --levels 2 3 --eval-levels 3 4 --channels 96 --hidden 128 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 1000 --ckpt-every 1000 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-bc   | l4  | 150 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e-bc --task m1a --levels 3 4 --eval-levels 3 4 --channels 96 --hidden 128 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 1000 --ckpt-every 1000 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-bc   | m1b | 60  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e-bc --task m1b --levels 2 3 4 --eval-levels 3 4 --channels 96 --hidden 128 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 1000 --ckpt-every 1000 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-wide | l2  | 25  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 2 --eval-levels 3 4 --channels 96 --hidden 512 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-wide | l3  | 240 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 2 3 --eval-levels 3 4 --channels 96 --hidden 512 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-wide | l4  | 150 | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1a --levels 3 4 --eval-levels 3 4 --channels 96 --hidden 512 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-e-wide | m1b | 60  | --module nca.strand.train2 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --inputs e --task m1b --levels 2 3 4 --eval-levels 3 4 --channels 96 --hidden 512 --batch 16 --pool-size 256 --iters 1000000 --lr 2e-4 --eval-every 500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
