@@ -489,6 +489,18 @@ def evaluate(stepper, planes, ev, channels, device, batch, codes, probe=False):
     return out_d
 
 
+@torch.no_grad()
+def gallery_rollout(stepper, planes, ev, channels, device, codes):
+    """Roll every tap of a (small) EvalSet from the fresh state for ev.H steps; bool [n,6,S,S] predicted edge
+    planes at the end -- the dashboard gallery panel's "what the model drew"."""
+    cs = planes(ev.geo, codes(ev.rule), ev.tap)
+    walls = cs[:, :1]
+    state = fresh(walls, channels)
+    for t in range(1, ev.H + 1):
+        state = stepper(state, walls, cs, t, slice(0, len(ev.geo)))
+    return ((state[:, 1:7] > 0.5) & (walls > 0)).cpu().numpy()
+
+
 def summarise(task, evs, results, tab):
     """The log's "q" dict from per-(set, level) results (see the module docstring)."""
     rnd = lambda x: None if x is None or not np.isfinite(x) else round(float(x), 4)  # noqa: E731
@@ -850,23 +862,39 @@ def main(argv=None):
                                sched_frac())
 
     side = {L: int(bd.hw[GROUP[L]].max()) for L in levels}
-    evs = []
+    legacy_dir = ensure_dir(cfg.get("legacy"), "strand", "meta.json")  # the gallery needs it even without
+    evs = []                                                           # --eval-sets legacy
     for name in cfg["evalSets"]:
         for L in cfg["evalLevels"]:
             if name == "legacy":
-                legacy_dir = ensure_dir(cfg.get("legacy"), "strand", "meta.json")
                 evs.append(legacy_set(task, tab, legacy_dir, L, eval_n, cfg["evalMult"], cfg["evalCap"]))
             else:
                 evs.append(wide_set(task, tab, bd, L, eval_n, cfg["evalMult"], cfg["evalCap"]))
     stepper = lambda st, w, cs, t, sl: model.step(st, w, cs)  # noqa: E731
+    gallery_evs = {L: legacy_set("m1a", tab, legacy_dir, L, V1.GALLERY_PER_LEVEL, 8, 2000) for L in V1.GALLERY_LEVELS}
+    gallery_path = os.path.join(run_dir, "gallery.npz")
 
-    def check():
+    def write_gallery_now(it):
+        groups = {}
+        for L, ev in gallery_evs.items():
+            pred = gallery_rollout(stepper, planes, ev, C, device, codes)
+            rot = np.where(ev.geo >= 0, (ev.geo % 12) // 2, -1).astype(np.int8)
+            rule = [f"{s}/{'-'.join(str(int(d)) for d in r[1:])}" for s, r in zip(ev.items["subset"], ev.rule)]
+            groups[L] = {"mask": ev.geo >= 0, "rot": rot, "tap": ev.tap, "tgt": ev.a < INF, "pred": pred,
+                         "rule": rule, "length": ev.items["length"], "ideal": ev.items["ideal"]}
+        V1.write_gallery(gallery_path, it, groups)
+
+    def check(it=0):
         res = [evaluate(stepper, planes, ev, C, device, args.eval_batch, codes, probe=cfg["probe"]) for ev in evs]
         q = summarise(task, evs, res, tab)
         if cfg["probe"]:
             W, mean = probe_fit(pools, codes, seed=cfg["seed"])
             cells = {k: np.concatenate([r["cells"][k] for r in res]) for k in ("x", "y", "dist")}
             q["code"] = probe_score(W, mean, cells)
+        try:
+            write_gallery_now(it)
+        except Exception:  # noqa: BLE001 -- a gallery is a nice-to-have, never worth a training run
+            pass
         return {"q": q, "exact": q["exact"], "score": q["balanced"], "evalN": int(sum(len(ev.geo) for ev in evs))}
 
     log = open(os.path.join(run_dir, "log.jsonl"), "a")
@@ -1054,7 +1082,7 @@ def main(argv=None):
                                      cfg["collapseLossX"])
             if it % args.eval_every == 0 or it == cfg["iters"]:
                 t_eval = time.time()
-                rec.update(check())
+                rec.update(check(it))
                 eval_sec = rec["evalSec"] = round(time.time() - t_eval, 1)
                 n_checks[0] += 1
                 if args.force_collapse and n_checks[0] == args.force_collapse:

@@ -32,7 +32,7 @@
 #   HEXCA_TEST=1 W=dir BUCKET=dir PLAN_FILE=file SRC=hex_ca-checkout PY=python bash startup.sh main
 set -uo pipefail
 export PATH=$PATH:/snap/bin   # gcloud on Ubuntu's GCE images; systemd units don't have it on PATH
-WHITELIST="log.jsonl pool.npz ckpt.pt best.pt stdout.log"   # the only run files that ever leave the VM
+WHITELIST="log.jsonl pool.npz gallery.npz ckpt.pt best.pt stdout.log"   # the only run files that ever leave the VM
 
 md() { curl -sf -H 'Metadata-Flavor: Google' "http://metadata.google.internal/computeMetadata/v1/$1"; }
 on_gce() { grep -qs 'Google Compute Engine' /sys/class/dmi/id/product_name; }
