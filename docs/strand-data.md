@@ -245,6 +245,37 @@ legacy rule's local chords equal the table's.
 walk) 1,471 / s at level 2, 842 / s at level 3, 1,041 / s on level-4 crops (mean strand 10 / 39 / 33 chords).
 A training iteration needs about batch / 8 + damage ~ 12 of them: ~10 ms.
 
+**The per-cell lookup probe** (`nca/strand/probe.py`, §3's cheap experiment, the owner's arms added): a
+1-hidden-layer MLP from one cell's static planes + the code to its 15 chord bits, fresh draws of (type,
+rotation, mirror) uniform over the 108 and TRAIN rules (subsets uniform), Adam 3e-3 (x0.3 at 60 %, x0.1 at 85 %),
+batch 512, 3 M samples per run; scored on 20,000 fixed draws with v2 HELD-OUT rules ("held-out") and 20,000
+with train rules ("train": is the lookup learned at all). E's arm is the local frame (type only -> the chords
+in the tile's own frame). Cell-exact = all 15 bits right. One Pi core each, under heavy load (wall times are
+only comparable within a width):
+
+| arm | width | held-out @ 1 M | held-out @ 3 M | train @ 3 M | bit | `15` | `01234568` | 0.9 reached | s |
+|---|---|---|---|---|---|---|---|---|---|
+| A | 128 | 0.384 | 0.556 | 0.679 | 0.9375 | 0.43 | 0.125 | - | 393 |
+| C | 128 | 0.615 | 0.727 | 0.825 | 0.9587 | 0.77 | 0.198 | - | 432 |
+| D | 128 | 0.040 | 0.116 | 0.148 | 0.8913 | 0.15 | 0.000 | - | 386 |
+| D-cs | 128 | 0.278 | 0.491 | 0.588 | 0.9258 | 0.54 | 0.011 | - | 386 |
+| D-fourier | 128 | 0.455 | 0.558 | 0.678 | 0.9364 | 0.46 | 0.088 | - | 329 |
+| E (local) | 128 | 0.955 | 0.952 | 1.000 | 0.9938 | 0.67 | 0.997 | 0.8 M | 251 |
+| A | 1024 | 0.822 | 0.923 | 0.996 | 0.9913 | 0.54 | 0.968 | 1.8 M | 860 |
+| C | 1024 | 0.927 | 0.982 | 0.999 | 0.9957 | 0.88 | 0.996 | 1.0 M | 909 |
+| D | 1024 | 0.327 | 0.591 | 0.719 | 0.9447 | 0.45 | 0.044 | - | 501 |
+| D-cs | 1024 | 0.695 | 0.825 | 0.908 | 0.9746 | 0.71 | 0.423 | - | 443 |
+| D-fourier | 1024 | 0.864 | 0.939 | 0.998 | 0.9927 | 0.59 | 0.977 | 1.6 M | 464 |
+| E (local) | 1024 | 0.985 | 0.985 | 1.000 | 0.9959 | 0.89 | 1.000 | 0.2 M | 444 |
+
+Reading it: E's local frame is near-trivial (the doc expected so); of the grid-frame inputs C learns fastest
+and most exactly at both widths, A catches up only when wide, and D (rot / 6 as one number) is far behind --
+8x the width lifts it from 0.12 to 0.59 held-out but does not close the gap (cos / sin closes part of it).
+D-fourier tracks A at both widths (0.558 / 0.556, 0.939 / 0.923; train 0.678 / 0.679, 0.998 / 0.996): it is an
+invertible linear map of A's one-hot, as expected, so it needs no trainer arm. What every arm misses on
+held-out rules is mostly subset `15` (see departure 1 below: its held-out rule needs a digit no `15` train
+rule has); the fully packed subset is where narrow grid-frame nets fail.
+
 **Trainer** (`nca/strand/train2.py`; its docstring has every detail): the v1 trainer's pool, ages, damage, light
 cones, truncated backprop, schedule, collapse guard, resume and log, with the v2 inputs; `--channels 96 --hidden
 128` by default, `--depth` hidden layers in the per-cell update (`nets.StrandNCA`; 1 = HexNCA), and `--inputs e`
@@ -277,3 +308,21 @@ pools, scored on the quick check's held-out read-outs, overall and by distance f
    trainer with an equivariance test. The perception is the 7 taps only (no `taps+pool`).
 7. `--ckpt-pool half` (float16 pool states in ckpt.pt; plan 6 uses it) and pool.npz's state limited to 32
    channels, for the bucket and the dashboard.
+
+**CPU smoke** (`train2`, level 2, real width 96 / 128, batch 4, pool 64, steps U[12, 24], backprop 12, eval at
+level 2 with 30 taps a set; one thread each, the Pi at load 10-25). Loss per 50 iterations; edge IoU on held-out
+taps at the checks (exact stays 0 this early); code bits = the fidelity probe's per-bit accuracy at the last check:
+
+| arm | consts | params | loss, every 50 iterations | IoU at 0 / 150 / 300 | code bits | s / iteration |
+|---|---|---|---|---|---|---|
+| a | 76 | 210,656 | 0.0435 0.0444 0.0349 0.0336 0.0332 0.0325 | 0 / 0.21 / 0.25 | 0.76 | 3.7 |
+| c | 115 | 255,584 | 0.0442 0.0454 0.0425 0.0362 0.0360 0.0425 | 0 / 0.20 / 0.23 | 0.82 | 4.7 |
+| d | 71 | 204,896 | 0.0436 0.0417 0.0371 0.0309 0.0283 0.0304 | 0 / 0.21 / 0.25 | 0.73 | 3.6 |
+| c-bc | 168 | 316,640 | 0.0425 0.0440 0.0417 0.0345 0.0347 0.0335 | 0 / 0.16 / 0.27 | 0.84 | 5.4 |
+| e | 69 | 160,352 | 0.0433 0.0509 0.0357 0.0336 (200 iterations) | 0 / 0.18 / - | 0.81 | 11.1 |
+| big (c, 128 / 256 / depth 2) | 115 | 658,816 | 0.0441 0.0347 0.0388 (150 iterations) | 0 / 0.17 / - | 0.81 | 6.8 |
+
+**CPU cost per iteration** (one process, the nets interleaved, best of 3; level 3, batch 8, 24 steps without
+gradient + 12 with), relative to the default C at 96 / 128 / depth 1: A 0.86, D 0.78, E 2.21 (its per-frame
+weight selection and the recomputed 7-tap rows; not measured on a GPU), big (C at 128 / 256 / depth 2) 2.35, for
+2.6x the parameters.

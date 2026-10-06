@@ -6,10 +6,13 @@
 #   tap-a    A  type one-hot + rotation one-hot + mirror (16 static planes)
 #   tap-c    C  per-direction edge classes + anchor + mirror (55)
 #   tap-d    D  type one-hot + rot / 6 as one number + mirror (11)
-#   tap-big  C at channels 128, hidden 256, depth 2, batch 16 (2.65x the FLOPs of an arm above per cell-step; 2.5x the
-#          CPU time per iteration on the Pi) -- C because the probe ranks C over A at width 128 and A only catches up at 1024
+#   tap-big  C at channels 128, hidden 256, depth 2, batch 16 (2.65x the FLOPs of an arm above per cell-step; 2.35x
+#            the CPU time per iteration on the Pi) -- C because the per-cell probe ranks C first of the grid-frame
+#            inputs at both widths (held-out cell-exact 0.73 / 0.98 at width 128 / 1024; A 0.56 / 0.92; D 0.12 / 0.59;
+#            docs/strand-data.md "v2")
 #   optional, commented out: tap-cbc (C with the code broadcast to every cell: the diagnostic ceiling) and tap-e (option E,
-#   local-frame perception, nets.FrameNCA: the probe's E-local learns the lookup fastest; parity-tested equivariant)
+#   local-frame perception, nets.FrameNCA: the probe's E-local learns the lookup fastest, 0.95 / 0.985; parity-tested
+#   equivariant; 2.2x C's CPU time per iteration on the Pi, unmeasured on the GPU)
 # Stages per arm (the doc's chain, --init from the previous stage's best.pt; later stages at lr 2e-4, not 5e-4):
 #   l2   M1a on level-2 patches                            25 min
 #   l3   M1a on levels 2 + 3                              240 min
@@ -19,7 +22,7 @@
 # arms (they share the GPU). The VM adds --schedule time (lr steps at 60% / 85% of each stage's minutes).
 # Throughput (estimated, not measured on the L4): an arm above is ~3.2x the per-cell-step FLOPs of plan 5's m128 (96
 # channels and 76-115 consts vs 32 and 22), big ~10x; four arms sharing the GPU get roughly 2 s / iteration each (big
-# ~6 s) against plan 5's 0.36 -- an l3 stage is then ~7k iterations an arm (big ~2.4k), not ~25k. Fewer arms, or
+# ~3 s at batch 16) against plan 5's 0.36 -- an l3 stage is then ~7k iterations an arm (big ~4.8k at batch 16), not ~25k. Fewer arms, or
 # --batch 16, buy iterations back.
 # GPU memory (estimated: the backprop window keeps ~(state + consts + hidden) floats per cell for each of the 48 steps):
 # ~4.7 GB an arm above at batch 32 on level-4 crops, big ~9.5 GB at batch 32 -- hence big at --batch 16 (~4.8 GB), so
