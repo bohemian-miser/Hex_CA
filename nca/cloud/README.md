@@ -17,7 +17,7 @@ checkpoints, logs and the VM's log tail under it are public. What goes there:
 
 | Path | Written by | What |
 |---|---|---|
-| `runs/<run>-<stage>/{log.jsonl,pool.npz,ckpt.pt,best.pt,stdout.log}` | the VM, every 60 s | only these whitelisted names |
+| `runs/<run>-<stage>/{log.jsonl,pool.npz,gallery.npz,ckpt.pt,best.pt,stdout.log}` | the VM, every 60 s | only these whitelisted names |
 | `status.json` | the VM, every 60 s | the heartbeat: phase, GPU use, load, each run's stage and verdict |
 | `startup.log` | the VM, every 60 s | the last 300 lines of its boot script's log |
 | `DONE` | the VM, at the end | `{launch, time, ok, reason, runs}` |

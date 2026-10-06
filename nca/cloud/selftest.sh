@@ -55,7 +55,7 @@ check "a-s1 ends {stopped: done} at its --iters 3" test "$(lastline "$B/runs/a-s
 check "a-s2 started --init from a-s1's best.pt (not its ckpt.pt)" test "$(head -n 1 "$B/runs/a-s2/log.jsonl" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["config"]["init"])')" = "runs/a-s1/best.pt"
 check "b-s1 started --init from the bucket's init/tiny.pt and ended by its time box" \
   test "$(head -n 1 "$B/runs/b-s1/log.jsonl" | "$PY" -c 'import json,sys; print(json.load(sys.stdin)["config"]["init"])')|$(lastline "$B/runs/b-s1/log.jsonl" 'd["stopped"]')" = "$WORK/vm1/bucket/init/tiny.pt|time"
-bad=$(find "$B/runs" -type f | grep -vE '/(log\.jsonl|pool\.npz|ckpt\.pt|best\.pt|stdout\.log)$')
+bad=$(find "$B/runs" -type f | grep -vE '/(log\.jsonl|pool\.npz|gallery\.npz|ckpt\.pt|best\.pt|stdout\.log)$')
 check "only whitelisted files under the bucket's runs/ ${bad:+(not: $bad)}" test -z "$bad"
 check "status.json: phase done, both runs, launch vm1" test "$(j "$B/status.json" '(d["phase"], sorted(d["runs"]), d["launch"])')" = "('done', ['a', 'b'], 'vm1')"
 check "the dashboard: dash/index.html (static), runs-vm.json with the 3 stage dirs, runs-pi.json an empty placeholder" \

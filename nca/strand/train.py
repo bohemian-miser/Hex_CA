@@ -357,7 +357,8 @@ class EvalLevel:
         self.task, self.level, self.S = task, bd.level, bd.S
         rng = np.random.default_rng(EVAL_SEED + bd.level)
         allowed = set(bd.boards)
-        cons, aa, sids, items = [], [], [], {k: [] for k in ("bucket", "subset", "w", "ideal", "length")}
+        cons, aa, sids = [], [], []
+        items = {k: [] for k in ("bucket", "subset", "w", "ideal", "length", "tap", "ruleId")}
         if task == "m1a":
             cands = [(k, i, int(ln[i])) for k, f in enumerate(bd.files)
                      for ln, tb in [(np.diff(f["tap_ptr"]), f["tap_board"])]
@@ -377,7 +378,8 @@ class EvalLevel:
                     cons.append(consts_of(mask, ch, (row, col, d0, d1)))
                     aa.append(dist_planes(s, (bd.S, bd.S)))
                     for key, v in (("bucket", j), ("subset", bd.subset_of[f.rule_id]), ("w", share[j] / m),
-                                   ("ideal", s.grow_steps() + 1), ("length", len(s))):
+                                   ("ideal", s.grow_steps() + 1), ("length", len(s)),
+                                   ("tap", (row, col, d0, d1)), ("ruleId", f.rule_id)):
                         items[key].append(v)
         else:
             off = 0
@@ -603,6 +605,60 @@ def ensure_data(arg):
     return dest
 
 
+# ---------------------------------------------------------------- the gallery: a FIXED set of held-out taps
+# (the dashboard's gallery panel, nca/dashboard.py), watched run to run and architecture to architecture.
+
+GALLERY_LEVELS = (3, 4)
+GALLERY_PER_LEVEL = 6  # 2 short + 2 medium + 2 long (EvalLevel's n // 3 split), fixed regardless of --eval-n
+
+
+def gallery_sets(data_dir, subset_of):
+    """One EvalLevel("m1a", ...) per GALLERY_LEVELS, each GALLERY_PER_LEVEL items (2 short + 2 medium + 2
+    long): the SAME EVAL_SEED-seeded, bucket-stratified draw as the live quick-check (EvalLevel) and
+    train2.legacy_set both use, just always at n = GALLERY_PER_LEVEL -- so the SAME physical taps come up
+    every run, every architecture (train.py and train2.py alike), a fair side-by-side gallery."""
+    return {L: EvalLevel("m1a", Boards(data_dir, "eval", L, subset_of), GALLERY_PER_LEVEL, 8, 2000)
+            for L in GALLERY_LEVELS}
+
+
+@torch.no_grad()
+def gallery_rollout(stepper, ev, channels, device):
+    """Roll every item of a (small) EvalLevel from the fresh state for ev.H steps; bool [n,6,S,S] predicted
+    edge planes at the end -- "what the model drew" for the gallery."""
+    cs = torch.from_numpy(ev.consts).to(device).float()
+    walls = cs[:, :1]
+    state = fresh(cs, channels)
+    for t in range(1, ev.H + 1):
+        state = stepper(state, walls, cs, t, slice(0, len(ev.consts)))
+    return ((state[:, 1:7] > 0.5) & (walls > 0)).cpu().numpy()
+
+
+def write_gallery(path, it, groups):
+    """gallery.npz (the dashboard's gallery panel): iteration, levels, and per level L in `groups` (a dict:
+    mask [n,S,S] bool/uint8, rot [n,S,S] int (-1 off board or unavailable -- an architecture with no per-cell
+    type/rotation, e.g. this module's, leaves it all -1), tap [n,4] (row, col, d0, d1), tgt [n,6,S,S] bool
+    (target edge planes, direction d at index d), pred [n,6,S,S] bool (the model's, after the quick check's
+    rollout), rule [n] str (a short id/description), length [n] int, ideal [n] int):
+        mask_L uint8, rot_L int8, tap_L int16, tgt_edges_L uint8, pred_edges_L uint8 (packed; the dashboard
+        shows it as a hard yes/no, unlike pool.npz's continuous pred_edges_R), rule_L '<U32', length_L int32,
+        ideal_L int32. Atomic (a temp file, then os.replace); the caller must never let this raise past it --
+        a gallery is a nice-to-have, not worth a training run."""
+    out = {"iteration": np.int64(it), "levels": np.array(sorted(groups), np.int64)}
+    for L, g in groups.items():
+        out[f"mask_{L}"] = np.asarray(g["mask"]).astype(np.uint8)
+        out[f"rot_{L}"] = np.asarray(g["rot"]).astype(np.int8)
+        out[f"tap_{L}"] = np.asarray(g["tap"]).astype(np.int16)
+        out[f"tgt_edges_{L}"] = np.asarray(g["tgt"]).astype(np.uint8)
+        out[f"pred_edges_{L}"] = np.asarray(g["pred"]).astype(np.uint8)
+        out[f"rule_{L}"] = np.array(list(g["rule"]), dtype="<U32")
+        out[f"length_{L}"] = np.asarray(g["length"]).astype(np.int32)
+        out[f"ideal_{L}"] = np.asarray(g["ideal"]).astype(np.int32)
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        np.savez_compressed(f, **out)
+    os.replace(tmp, path)
+
+
 def write_snapshot(path, it, pools, task, last_level, last_idx):
     """pool.npz in nca.train's snapshot contract; each level's S x S boards sit in a hexagon of radius R = S-1
     (rows 0..S-1, cols S-1..2S-2 of a (2S-1)^2 array: q in 0..S-1, r in -(S-1)..0, so |q+r| <= S-1). Also, for
@@ -770,10 +826,27 @@ def main(argv=None):
     evs = [EvalLevel(task, Boards(data_dir, "eval", L, subset_of), eval_n, cfg["evalMult"], cfg["evalCap"])
            for L in cfg["evalLevels"]]
     stepper = lambda st, w, cs, t, sl: model.step(st, w, cs)  # noqa: E731
+    gallery_evs = gallery_sets(data_dir, subset_of)
+    gallery_path = os.path.join(run_dir, "gallery.npz")
 
-    def check():
+    def write_gallery_now(it):
+        groups = {}
+        for L, ev in gallery_evs.items():
+            pred = gallery_rollout(stepper, ev, C, device)
+            mask = ev.consts[:, 0] > 0
+            groups[L] = {"mask": mask, "rot": np.full(mask.shape, -1, np.int8), "tap": ev.items["tap"],
+                         "tgt": ev.a < INF, "pred": pred,
+                         "rule": [f"{s}#{r}" for s, r in zip(ev.items["subset"], ev.items["ruleId"])],
+                         "length": ev.items["length"], "ideal": ev.items["ideal"]}
+        write_gallery(gallery_path, it, groups)
+
+    def check(it=0):
         res = [evaluate(stepper, ev, C, device, args.eval_batch) for ev in evs]
         q = summarise(task, evs, res)
+        try:
+            write_gallery_now(it)
+        except Exception:  # noqa: BLE001 -- a gallery is a nice-to-have, never worth a training run
+            pass
         return {"q": q, "exact": q["exact"], "score": q["balanced"], "evalN": eval_n * len(evs)}
 
     log = open(os.path.join(run_dir, "log.jsonl"), "a")
@@ -953,7 +1026,7 @@ def main(argv=None):
                                   cfg["collapseLossX"])
             if it % args.eval_every == 0 or it == cfg["iters"]:
                 t_eval = time.time()
-                rec.update(check())
+                rec.update(check(it))
                 eval_sec = rec["evalSec"] = round(time.time() - t_eval, 1)
                 n_checks[0] += 1
                 if args.force_collapse and n_checks[0] == args.force_collapse:

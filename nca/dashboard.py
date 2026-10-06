@@ -19,10 +19,12 @@ Run:
 
 Endpoints:
     GET /                 the page (inline CSS + JS, no external resources)
-    GET /api/runs         [{name, mtime, lastIteration, hasPool, hasWeights}, ...] newest log.jsonl first
+    GET /api/runs         [{name, mtime, lastIteration, hasPool, hasGallery, hasWeights}, ...] newest log.jsonl first
     GET /api/log?run=N    {config, records} -- the parsed log.jsonl, compactly
     GET /api/pool?run=N   the pool snapshot as JSON (see pool_to_json below), or an empty one
                           (200, radii: []) if there isn't one yet / it's unreadable right now
+    GET /api/gallery?run=N the gallery snapshot as JSON (see gallery_to_json below, train.write_gallery's
+                          contract), or an empty one (200, levels: []) if there isn't one yet
     GET /play             the interactive board, dist/nca.html (npm run build); also /play.html. The page's
                           Play link opens it as /play?weights=<url of the run's weights>&name=<run>
     GET /weights?run=N    the run's best.pt (else ckpt.pt) as the play page's weights JSON, converted by
@@ -33,7 +35,8 @@ Endpoints:
 Static copy (no server): python -m nca.dashboard --static OUT_DIR [--runs runs] [--only NAME ...]
 [--source pi|vm] writes OUT_DIR/index.html (the same page, with a flag baked in), runs-<source>.json
 (what /api/runs returns, each entry also carrying source and exported = unix seconds) and per run
-<name>/log.json and <name>/pool.json (what /api/log and /api/pool return). Opened from there the page
+<name>/log.json, <name>/pool.json and <name>/gallery.json (what /api/log, /api/pool and /api/gallery
+return). Opened from there the page
 fetches those relative files instead of /api/*: it merges runs-pi.json and runs-vm.json (a fixed list,
 so two publishers never write the same file and nothing is ever listed), polls every 15 s and shows
 the data's own time. nca/cloud/publish.sh uploads such a copy to the bucket. Unless --no-weights, it also
@@ -181,6 +184,7 @@ def api_runs(runs_root: Path) -> list:
             "mtime": mtime,
             "lastIteration": (last or {}).get("iteration"),
             "hasPool": (p / "pool.npz").is_file(),
+            "hasGallery": (p / "gallery.npz").is_file(),
             "hasWeights": run_checkpoint(p) is not None,
         })
     out.sort(key=lambda r: r["mtime"], reverse=True)
@@ -254,6 +258,51 @@ def pool_to_json(pool_path: Path) -> dict:
             }
 
         return {"iteration": iteration, "radii": radii, "last_R": last_R, "last_idx": last_idx, "by_radius": by_radius}
+
+
+# ── gallery.npz -> JSON (nca/strand/train.py's write_gallery contract) ────────────────────────
+
+
+EMPTY_GALLERY = {"iteration": None, "levels": [], "by_level": {}}
+
+
+def gallery_to_json(gallery_path: Path) -> dict:
+    """A FIXED set of held-out taps (train.GALLERY_LEVELS x GALLERY_PER_LEVEL), watched over training: per
+    level, each item's own S x S board (no radius-hex embedding -- unlike pool.npz, every item here already
+    is its own tightly-cropped board), flat per field, as pool_to_json."""
+    with np.load(gallery_path) as z:
+        keys = set(z.files)
+        iteration = int(z["iteration"]) if "iteration" in keys else None
+        levels = [int(x) for x in np.atleast_1d(z["levels"]).tolist()] if "levels" in keys else []
+
+        by_level: dict = {}
+        for L in levels:
+            def get(name):
+                k = f"{name}_{L}"
+                return z[k] if k in keys else None
+
+            mask = get("mask")
+            if mask is None:
+                continue
+            n, S, _S2 = mask.shape
+            rot, tap = get("rot"), get("tap")
+            tgt, pred = get("tgt_edges"), get("pred_edges")
+            rule, length, ideal = get("rule"), get("length"), get("ideal")
+
+            by_level[str(L)] = {
+                "S": int(S),
+                "n": int(n),
+                "mask": mask.astype(np.int16).reshape(-1).tolist(),
+                "rot": rot.astype(np.int16).reshape(-1).tolist() if rot is not None else [],
+                "tap": tap.astype(np.int64).reshape(-1).tolist() if tap is not None else [],
+                "tgtEdges": tgt.astype(np.int16).reshape(-1).tolist() if tgt is not None else [],
+                "predEdges": pred.astype(np.int16).reshape(-1).tolist() if pred is not None else [],
+                "rule": [str(x) for x in rule.tolist()] if rule is not None else [""] * n,
+                "length": length.astype(np.int64).reshape(-1).tolist() if length is not None else [0] * n,
+                "ideal": ideal.astype(np.int64).reshape(-1).tolist() if ideal is not None else [0] * n,
+            }
+
+        return {"iteration": iteration, "levels": levels, "by_level": by_level}
 
 
 def sanitize(obj):
@@ -563,6 +612,12 @@ def export_static(out_dir: Path, runs_root: Path, only=None, source: str = "pi",
         except Exception:  # caught mid-replace or unreadable: an empty one, as the API does
             pool = EMPTY_POOL
         _write_json(d / "pool.json", pool)
+        gallery_path = runs_root / r["name"] / "gallery.npz"
+        try:
+            gallery = gallery_to_json(gallery_path) if gallery_path.is_file() else EMPTY_GALLERY
+        except Exception:  # caught mid-replace or unreadable: an empty one, as the API does
+            gallery = EMPTY_GALLERY
+        _write_json(d / "gallery.json", gallery)
     _write_json(out_dir / f"runs-{source}.json", runs)  # after the runs' files, so it never names a missing one
     write_static_page(out_dir)
     return runs
@@ -674,6 +729,21 @@ class Handler(BaseHTTPRequestHandler):
                     # half-written (caught mid os.replace) or otherwise unreadable: never crash,
                     # just say so -- the writer will replace it with a good one shortly.
                     self._json(EMPTY_POOL)
+                    return
+                self._json(data)
+            elif path == "/api/gallery":
+                name = (qs.get("run") or [""])[0]
+                if name not in valid_run_names(runs_root):
+                    self._json({"error": "unknown run"}, 404)
+                    return
+                gallery_path = runs_root / name / "gallery.npz"
+                if not gallery_path.is_file():
+                    self._json(EMPTY_GALLERY)  # no gallery yet (older run, or before the first quick check)
+                    return
+                try:
+                    data = gallery_to_json(gallery_path)
+                except Exception:
+                    self._json(EMPTY_GALLERY)  # half-written: the writer will replace it shortly
                     return
                 self._json(data)
             else:
@@ -797,6 +867,8 @@ details.cfg pre { font: 12px var(--mono); white-space: pre-wrap; word-break: bre
 .chart-box { background: var(--panel); border: 1px solid var(--hair); border-radius: 6px; padding: 8px 10px; min-width: 0; }
 .chart-box h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
   margin: 0 0 4px; font-weight: 600; }
+.chart-box h2 .showAll { float: right; text-transform: none; letter-spacing: normal; font-weight: 400;
+  font-size: 11px; cursor: pointer; }
 .chart-box canvas { display: block; width: 100%; height: 150px; }
 .legend { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 6px; font-size: 11px; }
 .legend .grp { width: 100%; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
@@ -824,6 +896,17 @@ details.cfg pre { font: 12px var(--mono); white-space: pre-wrap; word-break: bre
 .cap .dmg { padding: 0 4px; border-radius: 3px; background: var(--hair); color: var(--fg); }
 .cap .state-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); display: inline-block; }
 .empty-note { color: var(--muted); font-size: 12px; padding: 8px 0; }
+.gallery-section { margin-bottom: 20px; }
+.gallery-hdr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; margin-bottom: 6px; }
+.gallery-hdr h2 { font-size: 14px; margin: 0; }
+.gallery-note { font: 11px var(--mono); color: var(--muted); }
+.gallery-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; margin-bottom: 10px; }
+.gallery-tile { background: var(--panel); border: 1px solid var(--hair); border-radius: 6px; padding: 6px; }
+.gallery-tile canvas { display: block; width: 100%; height: 230px; background: var(--empty); border-radius: 4px; }
+.gallery-cap { font: 11px/1.4 var(--mono); color: var(--muted); margin-top: 4px; display: flex; justify-content: space-between; gap: 6px; }
+.gallery-cap .ok { color: var(--good); font-weight: 700; }
+.gallery-legend { font: 11px var(--mono); color: var(--muted); margin-bottom: 8px; }
+.gallery-legend .good { color: var(--good); } .gallery-legend .bad { color: var(--bad); }
 .overlay { position: fixed; inset: 0; background: #0008; display: flex; align-items: center; justify-content: center;
   z-index: 100; padding: 20px; }
 .overlay[hidden] { display: none; }
@@ -862,7 +945,7 @@ footer { color: var(--muted); font-size: 11px; margin-top: 20px; }
     <canvas id="lossChart"></canvas>
   </div>
   <div class="chart-box">
-    <h2>quick-check metrics (0..1)</h2>
+    <h2>quick-check metrics (0..1) <a href="#" id="metricShowAll" class="showAll">show all</a></h2>
     <canvas id="metricChart"></canvas>
     <div class="legend" id="metricLegend"></div>
   </div>
@@ -873,6 +956,7 @@ footer { color: var(--muted); font-size: 11px; margin-top: 20px; }
   </div>
 </div>
 
+<div id="gallerySection"></div>
 <div id="poolSection"></div>
 
 <div class="overlay" id="detailOverlay" hidden>
@@ -898,6 +982,7 @@ var SAFE_NAME = /^[A-Za-z0-9_][A-Za-z0-9._-]*$/;      // a run name used as a re
 var listTimes = {};                                  // runs-<source>.json -> its exported time (static)
 function logURL(name) { return STATIC ? encodeURIComponent(name) + "/log.json" : "/api/log?run=" + encodeURIComponent(name); }
 function poolURL(name) { return STATIC ? encodeURIComponent(name) + "/pool.json" : "/api/pool?run=" + encodeURIComponent(name); }
+function galleryURL(name) { return STATIC ? encodeURIComponent(name) + "/gallery.json" : "/api/gallery?run=" + encodeURIComponent(name); }
 // The runs, newest log first: /api/runs, or (static) the publishers' lists merged, the newer entry winning a
 // name both have.
 function fetchRuns() {
@@ -948,6 +1033,7 @@ var state = {
   config: {},
   records: [],
   pool: null,                // last successfully loaded pool JSON, or null
+  gallery: null,             // last successfully loaded gallery JSON, or null
   hiddenMetrics: Object.create(null),
   hiddenPoolStats: Object.create(null),
   sortMode: "pool",
@@ -1270,7 +1356,7 @@ LineChart.prototype.draw = function () {
   }
 };
 
-function buildLegend(container, series, hiddenSet, chart) {
+function buildLegend(container, series, hiddenSet, chart, onToggle) {
   container.innerHTML = "";
   var groups = {};
   Object.keys(series).sort().forEach(function (label) {
@@ -1290,9 +1376,43 @@ function buildLegend(container, series, hiddenSet, chart) {
         btn.className = hiddenSet[label] ? "off" : "";
         chart.hidden = hiddenSet;
         chart.draw();
+        if (onToggle) onToggle();
       });
       container.appendChild(btn);
     });
+  });
+}
+
+// ---- metric visibility: ~60 quick-check series in one tangle by default is not useful -- show a
+// sensible few (strand: exact/balanced/byLen; flood: each q<N> group's both/bridge/mix) and hide the
+// rest behind the legend's existing toggles (or "show all"), remembered per browser (localStorage,
+// best-effort: a private window or cleared storage just means it decides afresh every visit). Decided
+// PER LABEL, once, the first time it's seen -- so a metric that starts appearing later (e.g. q.code
+// once the probe kicks in) still gets a sensible default instead of silently popping in hidden or not.
+var METRIC_HIDDEN_KEY = "ncaDash.hiddenMetrics";
+var STRAND_METRIC_SHOW = ["q.exact", "q.balanced", "q.byLen.short.exact", "q.byLen.medium.exact",
+                          "q.byLen.long.exact", "q.code.exact"];
+function loadStoredHidden(key) {
+  try {
+    var p = JSON.parse(localStorage.getItem(key) || "null");
+    return (p && typeof p === "object" && !Array.isArray(p)) ? p : {};
+  } catch (e) { return {}; }
+}
+function saveStoredHidden(key, hiddenSet) {
+  try { localStorage.setItem(key, JSON.stringify(hiddenSet)); } catch (e) { /* best-effort: private mode, etc */ }
+}
+var metricHiddenStored = loadStoredHidden(METRIC_HIDDEN_KEY);
+var metricLabelsSeen = Object.create(null);
+function defaultVisibleMetric(label, isStrand) {
+  if (isStrand) return STRAND_METRIC_SHOW.indexOf(label) >= 0;
+  return /^q\d+\.(both|bridge|mix)$/.test(label);  // flood: q8 / q16's nearest analogues of exact/bridge/mix
+}
+function ensureMetricDefaults(labels, isStrand) {
+  labels.forEach(function (label) {
+    if (metricLabelsSeen[label]) return;
+    metricLabelsSeen[label] = true;
+    state.hiddenMetrics[label] = Object.prototype.hasOwnProperty.call(metricHiddenStored, label)
+      ? !!metricHiddenStored[label] : !defaultVisibleMetric(label, isStrand);
   });
 }
 
@@ -1307,10 +1427,12 @@ function updateCharts(records) {
   lossChart.draw();
 
   var metricSeries = collectSeries(records, "metrics");
+  ensureMetricDefaults(Object.keys(metricSeries), isStrandConfig(state.config));
   metricChart.setSeries(metricSeries);
   metricChart.hidden = state.hiddenMetrics;
   metricChart.draw();
-  buildLegend(document.getElementById("metricLegend"), metricSeries, state.hiddenMetrics, metricChart);
+  buildLegend(document.getElementById("metricLegend"), metricSeries, state.hiddenMetrics, metricChart,
+    function () { saveStoredHidden(METRIC_HIDDEN_KEY, state.hiddenMetrics); });
 
   var poolSeries = collectSeries(records, "pool");
   var box = document.getElementById("poolStatsBox");
@@ -1445,12 +1567,16 @@ function hexLayoutStrand(R, boxW, boxH) {
 // Worked out from DIRS' (dq, dr) against cx = sqrt(3)*(q + r/2), cy = 1.5*r: direction d sits at
 // -60*d degrees (d=0 -> due "east", then clockwise in screen coordinates as d increases).
 function edgeAngle(d) { return Math.PI / 180 * (-60 * d); }
-function drawSpoke(ctx, px, py, size, d, color, dashed) {
+function drawSpoke(ctx, px, py, size, d, color, dashed, widthFrac, alpha) {
+  // widthFrac (default 0.16) and alpha (default 1) let a caller draw the same chord thin/faint (a
+  // gallery tile's "missed" target line) or bold (its "correct" / "extra" prediction) without a
+  // separate code path -- the pool grid's calls omit them and look exactly as before.
   var ang = edgeAngle(d);
   ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
   ctx.setLineDash(dashed ? [Math.max(1, size * 0.22), Math.max(1, size * 0.16)] : []);
   ctx.strokeStyle = color;
-  ctx.lineWidth = Math.max(1, size * 0.16);
+  ctx.lineWidth = Math.max(1, size * (widthFrac == null ? 0.16 : widthFrac));
   ctx.lineCap = "round";
   ctx.beginPath();
   ctx.moveTo(px, py);
@@ -1542,6 +1668,165 @@ function strandSummaryLine(group) {
   return "n=" + group.n + (strandHasEdges(group)
     ? "  chord-level detail for every board"
     : "  cell-level only (older snapshot; chord detail needs a trainer restart on the fix)");
+}
+
+// ---- gallery panel: a FIXED set of held-out taps (train.write_gallery's contract: gallery.npz, read by
+// nca.dashboard.gallery_to_json), the target strand faint/thin and the model's prediction bold, as chords
+// -- what Spectacle's rule draws against what the model draws, watched over training. Shown above the pool
+// grid for ANY run that has a gallery.npz (in practice, only strand runs ever write one); independent of
+// isStrandConfig, which only gates the POOL grid's rendering mode.
+function hexLayoutGallery(mask, S, boxW, boxH) {
+  var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (var row = 0; row < S; row++) {
+    for (var col = 0; col < S; col++) {
+      if (!mask[row * S + col]) continue;
+      var cx = Math.sqrt(3) * (col + row / 2), cy = 1.5 * row;
+      for (var i = 0; i < 6; i++) {
+        var ang = Math.PI / 180 * (60 * i - 30);
+        var x = cx + Math.cos(ang), y = cy + Math.sin(ang);
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (!isFinite(minX)) { minX = maxX = minY = maxY = 0; }
+  var pad = 3;
+  var size = Math.max(0, Math.min((boxW - 2 * pad) / Math.max(1e-6, maxX - minX),
+                                   (boxH - 2 * pad) / Math.max(1e-6, maxY - minY)));
+  return { size: size, offsetX: boxW / 2 - size * (minX + maxX) / 2, offsetY: boxH / 2 - size * (minY + maxY) / 2 };
+}
+function galleryTileExact(group, idx) {
+  var S = group.S, n0 = S * S, maskOff = idx * n0, edgeOff = idx * 6 * n0;
+  for (var i = 0; i < n0; i++) {
+    if (!group.mask[maskOff + i]) continue;
+    for (var d = 0; d < 6; d++) {
+      var k = edgeOff + d * n0 + i;
+      if ((group.tgtEdges[k] === 1) !== (group.predEdges[k] === 1)) return false;
+    }
+  }
+  return true;
+}
+function drawGalleryTile(canvas, group, idx) {
+  var rect = canvas.getBoundingClientRect();
+  var w = Math.max(1, Math.round(rect.width)), h = Math.max(1, Math.round(rect.height || 220));
+  var dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  var ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  var S = group.S, n0 = S * S, maskOff = idx * n0, edgeOff = idx * 6 * n0;
+  var L = hexLayoutGallery(group.mask.slice(maskOff, maskOff + n0), S, w, h);
+  var empty = cssVar("--empty"), hair = cssVar("--hair"), accent = cssVar("--accent"),
+      good = cssVar("--good"), bad = cssVar("--bad");
+  for (var row = 0; row < S; row++) {
+    for (var col = 0; col < S; col++) {
+      var i = row * S + col;
+      if (!group.mask[maskOff + i]) continue;
+      var px = L.offsetX + L.size * Math.sqrt(3) * (col + row / 2), py = L.offsetY + L.size * 1.5 * row;
+      hexPath(ctx, px, py, L.size * 0.97);
+      ctx.fillStyle = empty;
+      ctx.fill();
+      ctx.strokeStyle = hair;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      for (var d = 0; d < 6; d++) {
+        var k = edgeOff + d * n0 + i;
+        var t = group.tgtEdges[k] === 1, p = group.predEdges[k] === 1;
+        if (t && p) {
+          drawSpoke(ctx, px, py, L.size, d, good, false, 0.22, 1);     // correct: bold, solid
+        } else if (t) {
+          drawSpoke(ctx, px, py, L.size, d, bad, false, 0.08, 0.55);   // missed: thin, faint
+        } else if (p) {
+          drawSpoke(ctx, px, py, L.size, d, bad, true, 0.17, 1);       // extra: bold, dashed
+        }
+      }
+    }
+  }
+  var tap = group.tap.slice(idx * 4, idx * 4 + 4);
+  if (tap[0] >= 0) {
+    var tpx = L.offsetX + L.size * Math.sqrt(3) * (tap[1] + tap[0] / 2), tpy = L.offsetY + L.size * 1.5 * tap[0];
+    ctx.beginPath();
+    ctx.arc(tpx, tpy, L.size * 0.4, 0, 7);
+    ctx.lineWidth = Math.max(1, L.size * 0.13);
+    ctx.strokeStyle = accent;
+    ctx.stroke();
+  }
+}
+
+var galleryDom = Object.create(null);   // "<level>:<idx>" -> {wrap, canvas, cap}
+var currentGalleryRun = null;
+var currentGalleryLevels = null;
+
+function ensureGalleryGrid(gallery) {
+  var levelsKey = gallery.levels.join(",");
+  if (currentGalleryRun === state.activeRun && currentGalleryLevels === levelsKey) return;
+  currentGalleryRun = state.activeRun;
+  currentGalleryLevels = levelsKey;
+  galleryDom = Object.create(null);
+  var section = document.getElementById("gallerySection");
+  section.innerHTML = "";
+  section.className = "gallery-section";
+  var hdr = document.createElement("div");
+  hdr.className = "gallery-hdr";
+  hdr.innerHTML = "<h2>gallery (held-out, watched over training)</h2><span class=\"gallery-note\" id=\"galleryIter\"></span>";
+  section.appendChild(hdr);
+  var legend = document.createElement("div");
+  legend.className = "gallery-legend";
+  legend.innerHTML = "target: faint line &middot; prediction: bold &middot; " +
+    "<span class=\"good\">green</span> = correct &middot; <span class=\"bad\">thin red</span> = missed &middot; " +
+    "<span class=\"bad\">dashed red</span> = extra &middot; ring = tap";
+  section.appendChild(legend);
+  gallery.levels.forEach(function (L) {
+    var group = gallery.by_level[String(L)];
+    if (!group) return;
+    var lvl = document.createElement("div");
+    var lh = document.createElement("div");
+    lh.className = "summary";
+    lh.textContent = "level " + L;
+    lvl.appendChild(lh);
+    var grid = document.createElement("div");
+    grid.className = "gallery-grid";
+    for (var i = 0; i < group.n; i++) {
+      var wrap = document.createElement("div");
+      wrap.className = "gallery-tile";
+      var canvas = document.createElement("canvas");
+      wrap.appendChild(canvas);
+      var cap = document.createElement("div");
+      cap.className = "gallery-cap";
+      wrap.appendChild(cap);
+      grid.appendChild(wrap);
+      galleryDom[L + ":" + i] = { wrap: wrap, canvas: canvas, cap: cap };
+    }
+    lvl.appendChild(grid);
+    section.appendChild(lvl);
+  });
+}
+
+function renderGallery(gallery) {
+  var section = document.getElementById("gallerySection");
+  if (!gallery || !gallery.levels || !gallery.levels.length) {
+    section.className = "";
+    section.innerHTML = "";
+    currentGalleryRun = null;
+    currentGalleryLevels = null;
+    return;
+  }
+  ensureGalleryGrid(gallery);
+  var iterEl = document.getElementById("galleryIter");
+  if (iterEl) iterEl.textContent = gallery.iteration != null ? "iteration " + gallery.iteration : "";
+  gallery.levels.forEach(function (L) {
+    var group = gallery.by_level[String(L)];
+    if (!group) return;
+    for (var i = 0; i < group.n; i++) {
+      var dom = galleryDom[L + ":" + i];
+      if (!dom) continue;
+      drawGalleryTile(dom.canvas, group, i);
+      var exact = galleryTileExact(group, i);
+      var rule = (group.rule[i] || "").toString();
+      dom.cap.innerHTML = "<span>" + rule + "</span><span>len " + group.length[i] +
+        (exact ? " <span class=\"ok\">&#10003;</span>" : "") + "</span>";
+    }
+  });
 }
 
 // ---- pool grid ---------------------------------------------------------------------------------
@@ -1769,6 +2054,16 @@ document.getElementById("detailClose").addEventListener("click", function () { d
 document.getElementById("detailOverlay").addEventListener("click", function (e) { if (e.target.id === "detailOverlay") e.currentTarget.hidden = true; });
 document.addEventListener("keydown", function (e) { if (e.key === "Escape") document.getElementById("detailOverlay").hidden = true; });
 
+document.getElementById("metricShowAll").addEventListener("click", function (e) {
+  e.preventDefault();
+  Object.keys(state.hiddenMetrics).forEach(function (label) { state.hiddenMetrics[label] = false; });
+  saveStoredHidden(METRIC_HIDDEN_KEY, state.hiddenMetrics);
+  metricChart.hidden = state.hiddenMetrics;
+  metricChart.draw();
+  buildLegend(document.getElementById("metricLegend"), metricChart.series, state.hiddenMetrics, metricChart,
+    function () { saveStoredHidden(METRIC_HIDDEN_KEY, state.hiddenMetrics); });
+});
+
 // ---- polling loop -------------------------------------------------------------------------------
 function populateRunSelect(runs) {
   var sel = document.getElementById("runSelect");
@@ -1876,6 +2171,10 @@ function poll() {
       state.pool = pool;
       renderPool(pool);
     }).catch(function () { /* transient: keep showing the last good data */ });
+    getJSON(galleryURL(active)).then(function (gallery) {
+      state.gallery = (gallery && gallery.levels && gallery.levels.length) ? gallery : null;
+      renderGallery(state.gallery);
+    }).catch(function () { /* transient: keep showing the last good data */ });
   }).catch(function () { /* server hiccup: try again next tick */ });
 }
 
@@ -1885,6 +2184,7 @@ setInterval(poll, POLL_MS);
 window.addEventListener("resize", function () {
   lossChart.draw(); metricChart.draw(); poolStatsChart.draw();
   if (state.pool) renderPool(state.pool);
+  if (state.gallery) renderGallery(state.gallery);
 });
 })();
 </script>
