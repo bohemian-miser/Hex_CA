@@ -196,7 +196,15 @@ EMPTY_POOL = {"iteration": None, "radii": [], "last_R": None, "last_idx": [], "b
 def pool_to_json(pool_path: Path) -> dict:
     """The snapshot contract (nR = len(radii) groups, n = min(poolSize,48) samples shown per
     radius, m = min(n,6) of those carrying a full state) turned into plain JSON, flat per field
-    (the client reshapes with S / C) so the payload has far fewer brackets than a nested list."""
+    (the client reshapes with S / C) so the payload has far fewer brackets than a nested list.
+
+    A strand run (nca/strand/train.py, train2.py) additionally writes, for every one of the n
+    samples: mask_R (the board's real shape -- the walls_R/target_R/fill_R arrays are a small
+    board embedded in one corner of a much bigger square, see those modules' write_snapshot),
+    tgt_edges_R uint8 [n,6,S,S] and pred_edges_R float16 [n,6,S,S] (the target / predicted edge
+    planes, direction d at ch[1+d] of the per-edge state) and tap_R int16 [n,4] (row, col, d0, d1
+    in the board's own, un-embedded coordinates; -1 where there is no tap). Older snapshots have
+    none of these; the client falls back to the cell-level walls/fill/target."""
     with np.load(pool_path) as z:
         keys = set(z.files)
         iteration = int(z["iteration"])
@@ -214,12 +222,14 @@ def pool_to_json(pool_path: Path) -> dict:
             if walls is None:
                 continue
             n, S, _S2 = walls.shape
+            mask = get("mask")
             ntargets = get("ntargets")
             loss = get("loss")
             age = get("age")
             edits = get("edits")
             damage = get("damage")
             state = get("state")
+            tgt_edges, pred_edges, tap = get("tgt_edges"), get("pred_edges"), get("tap")
             m = int(state.shape[0]) if state is not None else 0
             C = int(state.shape[1]) if state is not None else 0
 
@@ -229,6 +239,7 @@ def pool_to_json(pool_path: Path) -> dict:
                 "m": m,
                 "C": C,
                 "walls": walls.astype(np.int16).reshape(-1).tolist(),
+                "mask": mask.astype(np.int16).reshape(-1).tolist() if mask is not None else [],
                 "fill": np.round(fill.astype(np.float32), 2).reshape(-1).tolist() if fill is not None else [],
                 "target": target.astype(np.int16).reshape(-1).tolist() if target is not None else [],
                 "ntargets": ntargets.astype(np.int16).reshape(-1).tolist() if ntargets is not None else [1] * n,
@@ -237,6 +248,9 @@ def pool_to_json(pool_path: Path) -> dict:
                 "edits": edits.astype(np.int64).reshape(-1).tolist() if edits is not None else [0] * n,
                 "damage": damage.astype(np.int16).reshape(-1).tolist() if damage is not None else [-1] * n,
                 "state": np.round(state.astype(np.float32), 3).reshape(-1).tolist() if state is not None else [],
+                "tgtEdges": tgt_edges.astype(np.int16).reshape(-1).tolist() if tgt_edges is not None else [],
+                "predEdges": np.round(pred_edges.astype(np.float32), 3).reshape(-1).tolist() if pred_edges is not None else [],
+                "tap": tap.astype(np.int64).reshape(-1).tolist() if tap is not None else [],
             }
 
         return {"iteration": iteration, "radii": radii, "last_R": last_R, "last_idx": last_idx, "by_radius": by_radius}
@@ -998,6 +1012,17 @@ function configCandidates(cfg) {
   if (cfg && cfg.config && typeof cfg.config === "object" && !Array.isArray(cfg.config)) out.push(cfg.config);
   return out;
 }
+// A strand run (nca/strand/train.py, train2.py) is told apart from a flood run (nca/train.py) by its
+// config's "task" (m1a / m1b) -- never by the run's name, which is free text and may say anything.
+function strandTask(cfg) {
+  var candidates = configCandidates(cfg);
+  for (var c = 0; c < candidates.length; c++) {
+    var t = candidates[c].task;
+    if (t === "m1a" || t === "m1b") return t;
+  }
+  return null;
+}
+function isStrandConfig(cfg) { return !!strandTask(cfg); }
 function configNumber(cfg, keys) {
   var candidates = configCandidates(cfg);
   for (var c = 0; c < candidates.length; c++) {
@@ -1387,6 +1412,138 @@ function drawBoard(canvas, R, S, cellsWalls, cellsFill, cellsTarget, showTarget)
   }
 }
 
+// ---- strand boards: a line pattern, not a flood fill (nca/strand/train.py, train2.py) ------------
+// The trainer embeds its small S0 x S0 board (S0 = R + 1) in one corner of the R-hex's S x S array
+// (see write_snapshot in both trainers), at q = col - R in 0..R, r = row - R in -R..0 -- exactly a
+// sixth of the hex. Laying out just that sixth (instead of the whole hex, mostly empty padding) is
+// what makes a strand board legible instead of a speck in a sea of "empty".
+function hexLayoutStrand(R, boxW, boxH) {
+  var key = "s" + R + ":" + boxW + "x" + boxH;
+  if (layoutCache[key]) return layoutCache[key];
+  var minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (var q = 0; q <= R; q++) {
+    for (var r = -R; r <= 0; r++) {
+      var cx = Math.sqrt(3) * (q + r / 2), cy = 1.5 * r;
+      for (var i = 0; i < 6; i++) {
+        var ang = Math.PI / 180 * (60 * i - 30);
+        var x = cx + Math.cos(ang), y = cy + Math.sin(ang);
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (!isFinite(minX)) { minX = maxX = minY = maxY = 0; }
+  var pad = 2;
+  var size = Math.max(0, Math.min((boxW - 2 * pad) / Math.max(1e-6, maxX - minX),
+                                   (boxH - 2 * pad) / Math.max(1e-6, maxY - minY)));
+  var layout = { size: size, offsetX: boxW / 2 - size * (minX + maxX) / 2, offsetY: boxH / 2 - size * (minY + maxY) / 2 };
+  layoutCache[key] = layout;
+  return layout;
+}
+// Direction d (0..5, walker.py's PAIRS / DIRS = src/hex.ts DIRS): the pixel angle of its edge's
+// midpoint from the cell centre, in the same (pointy-top) layout as hexPath's vertices (60*i - 30).
+// Worked out from DIRS' (dq, dr) against cx = sqrt(3)*(q + r/2), cy = 1.5*r: direction d sits at
+// -60*d degrees (d=0 -> due "east", then clockwise in screen coordinates as d increases).
+function edgeAngle(d) { return Math.PI / 180 * (-60 * d); }
+function drawSpoke(ctx, px, py, size, d, color, dashed) {
+  var ang = edgeAngle(d);
+  ctx.save();
+  ctx.setLineDash(dashed ? [Math.max(1, size * 0.22), Math.max(1, size * 0.16)] : []);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(1, size * 0.16);
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(px, py);
+  ctx.lineTo(px + size * 0.82 * Math.cos(ang), py + size * 0.82 * Math.sin(ang));
+  ctx.stroke();
+  ctx.restore();
+}
+// Per-sample slices out of a strand pool group's flat arrays (see pool_to_json): cell-level fields
+// are n0 = S*S long per sample, edge-level fields (tgtEdges / predEdges) are 6 x n0.
+function strandHasEdges(group) {
+  return !!(group.tgtEdges && group.tgtEdges.length && group.predEdges && group.predEdges.length);
+}
+function strandTapOf(group, idx) {
+  if (!group.tap || group.tap.length < (idx + 1) * 4) return null;
+  var t = group.tap.slice(idx * 4, idx * 4 + 4);
+  return t[0] >= 0 ? t : null;
+}
+function drawStrandBoard(canvas, R, group, idx, showTarget) {
+  var rect = canvas.getBoundingClientRect();
+  var w = Math.max(1, Math.round(rect.width)), h = Math.max(1, Math.round(rect.height || 86));
+  var dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  var ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  var S = group.S, n0 = S * S;
+  var L = hexLayoutStrand(R, w, h);
+  var empty = cssVar("--empty"), hair = cssVar("--hair"), accent = cssVar("--accent"),
+      good = cssVar("--good"), bad = cssVar("--bad");
+  var maskOff = idx * n0, hasMask = group.mask && group.mask.length >= maskOff + n0;
+  var hasEdges = strandHasEdges(group), edgeOff = idx * 6 * n0;
+  var hasFill = group.fill && group.fill.length >= maskOff + n0;
+  var hasTarget = group.target && group.target.length >= maskOff + n0;
+  for (var q = 0; q <= R; q++) {
+    for (var r = -R; r <= 0; r++) {
+      var row = r + R, col = q + R, i = row * S + col;
+      if (hasMask && !group.mask[maskOff + i]) continue;
+      var px = L.offsetX + L.size * Math.sqrt(3) * (q + r / 2), py = L.offsetY + L.size * 1.5 * r;
+      hexPath(ctx, px, py, L.size * 0.96);
+      ctx.fillStyle = empty;
+      ctx.fill();
+      ctx.strokeStyle = hair;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      if (hasEdges) {
+        for (var d = 0; d < 6; d++) {
+          var k = edgeOff + d * n0 + i;
+          var t = group.tgtEdges[k] === 1, p = group.predEdges[k] > 0.5;
+          if (showTarget) {
+            if (t) drawSpoke(ctx, px, py, L.size, d, accent, false);
+          } else if (t && p) {
+            drawSpoke(ctx, px, py, L.size, d, good, false);
+          } else if (t && !p) {
+            drawSpoke(ctx, px, py, L.size, d, bad, false);
+          } else if (p) {
+            drawSpoke(ctx, px, py, L.size, d, bad, true);
+          }
+        }
+      } else {
+        // older snapshot, no per-edge planes: the cell-level fallback (still mask-cropped, no
+        // opaque "wall" blotting out the signal the way the flood renderer's walls do).
+        var fv = hasFill ? group.fill[maskOff + i] : 0;
+        var tv = hasTarget ? group.target[maskOff + i] : 0;
+        if (showTarget) {
+          if (tv) { ctx.fillStyle = accent; ctx.fill(); }
+        } else {
+          var pred = fv > 0.5 ? 1 : 0;
+          if (pred || tv) {
+            hexPath(ctx, px, py, L.size * 0.5);
+            ctx.fillStyle = pred === tv ? good : bad;
+            ctx.fill();
+          }
+        }
+      }
+    }
+  }
+  var tap = strandTapOf(group, idx);
+  if (tap) {
+    var tq = tap[1], tr = tap[0] - R;
+    var tpx = L.offsetX + L.size * Math.sqrt(3) * (tq + tr / 2), tpy = L.offsetY + L.size * 1.5 * tr;
+    ctx.beginPath();
+    ctx.arc(tpx, tpy, L.size * 0.42, 0, 7);
+    ctx.lineWidth = Math.max(1, L.size * 0.14);
+    ctx.strokeStyle = accent;
+    ctx.stroke();
+  }
+}
+function strandSummaryLine(group) {
+  return "n=" + group.n + (strandHasEdges(group)
+    ? "  chord-level detail for every board"
+    : "  cell-level only (older snapshot; chord detail needs a trainer restart on the fix)");
+}
+
 // ---- pool grid ---------------------------------------------------------------------------------
 function boardStats(group, idx) {
   var S = group.S, n0 = S * S;
@@ -1436,8 +1593,12 @@ function summaryLine(group) {
 }
 
 function ensureGrid(pool) {
+  var isStrand = isStrandConfig(state.config);
   var runChanged = currentGridRun !== state.activeRun;
-  var radiiKey = pool.radii.join(",");
+  // isStrand is folded into the cache key, not just radii: the pool and log fetches race (poll()),
+  // so the first grid built for a run may not yet know its config -- once it does (isStrand flips),
+  // this forces a rebuild (the legend, which boards are clickable), not just a redraw.
+  var radiiKey = pool.radii.join(",") + (isStrand ? ":s" : ":f");
   if (!runChanged && currentGridRadii === radiiKey) return;
   currentGridRun = state.activeRun;
   currentGridRadii = radiiKey;
@@ -1450,6 +1611,11 @@ function ensureGrid(pool) {
     '<label>sort <select id="sortMode"><option value="pool">pool order</option><option value="loss">loss, descending</option><option value="age">age, descending</option></select></label>' +
     '<label>size <select id="boardSizeSelect"><option value="s">S</option><option value="m">M</option><option value="l">L</option></select></label>' +
     '<label><input type="checkbox" id="showTargetToggle"> show target instead of fill</label>';
+  if (isStrand) {
+    top.innerHTML += '<span style="color:var(--muted)">chords: <span style="color:var(--good)">green</span> = ' +
+      'correct &middot; <span style="color:var(--bad)">red solid</span> = missed &middot; ' +
+      '<span style="color:var(--bad)">red dashed</span> = extra &middot; ring = tap</span>';
+  }
   section.appendChild(top);
   top.querySelector("#sortMode").value = state.sortMode;
   top.querySelector("#sortMode").addEventListener("change", function (e) { state.sortMode = e.target.value; renderPool(state.pool); });
@@ -1481,7 +1647,7 @@ function ensureGrid(pool) {
       wrap.appendChild(cap);
       grid.appendChild(wrap);
       boardDom[R + ":" + i] = { wrap: wrap, canvas: canvas, cap: cap };
-      if (i < group.m) {
+      if (isStrand || i < group.m) {
         wrap.classList.add("clickable");
         (function (R, i) { canvas.addEventListener("click", function () { openDetail(R, i); }); })(R, i);
       }
@@ -1494,6 +1660,7 @@ function ensureGrid(pool) {
 function renderPool(pool) {
   if (!pool) { return; }
   ensureGrid(pool);
+  var isStrand = isStrandConfig(state.config);
   var highlightSet = Object.create(null);
   if (pool.last_R != null) {
     (pool.last_idx || []).forEach(function (i) { highlightSet[i] = true; });
@@ -1501,7 +1668,7 @@ function renderPool(pool) {
   pool.radii.forEach(function (R) {
     var group = pool.by_radius[String(R)];
     if (!group) return;
-    document.getElementById("summary-" + R).textContent = summaryLine(group);
+    document.getElementById("summary-" + R).textContent = isStrand ? strandSummaryLine(group) : summaryLine(group);
     var order = sortedIdx(group, state.sortMode);
     var grid = document.getElementById("grid-" + R);
     order.forEach(function (idx, pos) {
@@ -1509,7 +1676,11 @@ function renderPool(pool) {
       if (!dom) return;
       if (grid.children[pos] !== dom.wrap) grid.insertBefore(dom.wrap, grid.children[pos] || null);
       var b = boardStats(group, idx);
-      drawBoard(dom.canvas, R, group.S, b.walls, b.fill, b.target, state.showTarget);
+      if (isStrand) {
+        drawStrandBoard(dom.canvas, R, group, idx, state.showTarget);
+      } else {
+        drawBoard(dom.canvas, R, group.S, b.walls, b.fill, b.target, state.showTarget);
+      }
       var isHighlighted = R === pool.last_R && highlightSet[idx];
       dom.wrap.classList.toggle("highlight", !!isHighlighted);
       var dmg = DAMAGE_LABELS[String(b.damage)] || "?";
@@ -1531,12 +1702,31 @@ function divergingColor(v) {
 }
 function openDetail(R, idx) {
   var group = state.pool && state.pool.by_radius[String(R)];
-  if (!group || !group.C) return;
-  var S = group.S, C = group.C, n0 = S * S;
-  var off = idx * C * n0;
-  document.getElementById("detailTitle").textContent = "R=" + R + "  board #" + idx + "  (" + C + " channels)";
+  if (!group) return;
+  var isStrand = isStrandConfig(state.config);
+  var hasChannels = !!group.C && idx < group.m;
+  if (!isStrand && !hasChannels) return;  // flood: unchanged -- the per-channel view only, first group.m boards
+  document.getElementById("detailTitle").textContent =
+    "R=" + R + "  board #" + idx + (group.C ? "  (" + group.C + " channels)" : "");
   var grid = document.getElementById("detailGrid");
   grid.innerHTML = "";
+  if (isStrand) {
+    var big = document.createElement("div");
+    big.className = "detail-cell";
+    var bigCanvas = document.createElement("canvas");
+    bigCanvas.style.height = "360px";
+    big.appendChild(bigCanvas);
+    var bigLbl = document.createElement("div");
+    bigLbl.className = "lbl";
+    bigLbl.textContent = strandHasEdges(group) ? "mask / tap / target / predicted, as chords"
+      : "mask / target / predicted (cell-level; no per-edge planes in this snapshot)";
+    big.appendChild(bigLbl);
+    grid.appendChild(big);
+    (function (bigCanvas) { requestAnimationFrame(function () { drawStrandBoard(bigCanvas, R, group, idx, false); }); })(bigCanvas);
+  }
+  if (!hasChannels) { document.getElementById("detailOverlay").hidden = false; return; }
+  var S = group.S, C = group.C, n0 = S * S;
+  var off = idx * C * n0;
   for (var c = 0; c < C; c++) {
     var chStart = off + c * n0;
     var maxAbs = 1e-6;
@@ -1669,6 +1859,9 @@ function poll() {
       state.records = log.records || [];
       updateHeader(runMeta, state.config, state.records, runs);
       updateCharts(state.records);
+      // the pool fetch below runs in parallel and may have drawn first, before state.config (and
+      // so isStrandConfig) was known -- redraw now that it is, rather than waiting a whole poll.
+      if (state.pool) renderPool(state.pool);
     }).catch(function () { /* transient: keep showing the last good data */ });
     getJSON(poolURL(active)).then(function (pool) {
       if (!pool || !pool.radii || !pool.radii.length) {
