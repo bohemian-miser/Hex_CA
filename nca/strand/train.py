@@ -605,7 +605,11 @@ def ensure_data(arg):
 
 def write_snapshot(path, it, pools, task, last_level, last_idx):
     """pool.npz in nca.train's snapshot contract; each level's S x S boards sit in a hexagon of radius R = S-1
-    (rows 0..S-1, cols S-1..2S-2 of a (2S-1)^2 array: q in 0..S-1, r in -(S-1)..0, so |q+r| <= S-1)."""
+    (rows 0..S-1, cols S-1..2S-2 of a (2S-1)^2 array: q in 0..S-1, r in -(S-1)..0, so |q+r| <= S-1). Also, for
+    the dashboard's chord-level strand view (nca/dashboard.py): tgt_edges_R uint8 / pred_edges_R float16
+    [n,6,S2,S2] (the target / predicted edge planes, direction d at ch[1+d]) and tap_R int16 [n,4] (row, col,
+    d0, d1 in the UN-embedded board coordinates; -1 where a slot has no tap, e.g. m1b). Cheap: these come
+    straight out of arrays write_snapshot already builds (P["a"], P["tap"], the state slice st)."""
     out = {"iteration": np.int64(it), "radii": np.array(sorted(P["consts"].shape[-1] - 1 for P in pools.values())),
            "last_R": np.int64(pools[last_level]["consts"].shape[-1] - 1), "last_idx": np.asarray(last_idx, np.int64)}
     for P in pools.values():
@@ -617,11 +621,14 @@ def write_snapshot(path, it, pools, task, last_level, last_idx):
             y[..., :S, S - 1:] = x
             return y
         st = P["state"][:n].cpu().numpy()
-        target = (P["a"][:n] < INF).any(1) if task == "m1a" else (P["a"][:n] > 0).any(1)
+        on = (P["a"][:n] < INF) if task == "m1a" else (P["a"][:n] > 0)
         out[f"walls_{R}"] = emb(P["consts"][:n, 1:16].any(1), np.uint8)
         out[f"mask_{R}"] = emb(P["consts"][:n, 0], np.uint8)
         out[f"fill_{R}"] = emb(st[:, OUT[task]].max(1), np.float16)
-        out[f"target_{R}"] = emb(target, np.uint8)
+        out[f"target_{R}"] = emb(on.any(1), np.uint8)
+        out[f"tgt_edges_{R}"] = emb(on, np.uint8)
+        out[f"pred_edges_{R}"] = emb(st[:, 1:7], np.float16)
+        out[f"tap_{R}"] = P["tap"][:n].astype(np.int16)
         out[f"ntargets_{R}"] = np.ones(n, np.uint8)
         out[f"loss_{R}"] = P["loss"][:n].astype(np.float32)
         out[f"age_{R}"] = (it - P["born"][:n]).astype(np.int32)

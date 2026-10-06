@@ -660,7 +660,9 @@ def save_ckpt(path, model, opt, it, cfg, rng, pools=None, best=-1.0, eval_sec=0.
 
 def write_snapshot(path, it, pools, task, tab, last_level, last_idx):
     """pool.npz in nca.train's snapshot contract (train.write_snapshot's layout): walls = cells with chords under
-    the slot's rule, fill = max of the task's planes, target = the strand's cells, state = channels 0..31."""
+    the slot's rule, fill = max of the task's planes, target = the strand's cells, state = channels 0..31. Also,
+    for the dashboard's chord-level strand view: tgt_edges_R uint8 / pred_edges_R float16 [n,6,S2,S2] (direction
+    d at ch[1+d]) and tap_R int16 [n,4] (row, col, d0, d1, un-embedded) -- see train.write_snapshot's docstring."""
     out = {"iteration": np.int64(it), "radii": np.array(sorted(P["geo"].shape[-1] - 1 for P in pools.values())),
            "last_R": np.int64(pools[last_level]["geo"].shape[-1] - 1), "last_idx": np.asarray(last_idx, np.int64)}
     for P in pools.values():
@@ -674,10 +676,14 @@ def write_snapshot(path, it, pools, task, tab, last_level, last_idx):
         st = P["state"][:n].float().cpu().numpy()
         walls = np.stack([tab.render_bits(int(P["rule"][i, 0]), P["rule"][i, 1:].astype(np.int64), P["geo"][i]) != 0
                           for i in range(n)])
+        on = P["a"][:n] < INF
         out[f"walls_{R}"] = emb(walls, np.uint8)
         out[f"mask_{R}"] = emb(P["geo"][:n] >= 0, np.uint8)
         out[f"fill_{R}"] = emb(st[:, OUT[task]].max(1), np.float16)
-        out[f"target_{R}"] = emb((P["a"][:n] < INF).any(1), np.uint8)
+        out[f"target_{R}"] = emb(on.any(1), np.uint8)
+        out[f"tgt_edges_{R}"] = emb(on, np.uint8)
+        out[f"pred_edges_{R}"] = emb(st[:, 1:7], np.float16)
+        out[f"tap_{R}"] = P["tap"][:n].astype(np.int16)
         out[f"ntargets_{R}"] = np.ones(n, np.uint8)
         out[f"loss_{R}"] = P["loss"][:n].astype(np.float32)
         out[f"age_{R}"] = (it - P["born"][:n]).astype(np.int32)
