@@ -200,16 +200,20 @@ python -m nca.strand.selftest2                       # a few minutes; the v1 sel
 
 **Rules.** A rule is `(s, digits)`: `s` one of the 7 subsets, `digits[t]` the position of type `t`'s matching
 among its non-crossing ones (0-4; 0 for a type with one choice or none). Its index is the digits in mixed radix,
-Delta most significant; its Spectacle `ruleKey` is `hex|<subset>|<matching indices>`. **Split v2**, stratified:
-per subset the round(0.2 n) rules with the smallest `(fmix32(FNV-1a("strand-split-v2|" + key)), index)` are
-held out. Training also never draws the 20 legacy held-out rules of v1, so the legacy numbers stay comparable:
+Delta most significant; its Spectacle `ruleKey` is `hex|<subset>|<matching indices>`. **Split v2**, stratified by
+subset (the owner's decision): in the v1 subsets `15`, `128`, `258` the held-out rules are exactly v1's 20 legacy
+held-out rules (so the legacy numbers stay comparable); in the four class-0 subsets, the round(0.2 n) rules with
+the smallest `(fmix32(FNV-1a("strand-split-v2|" + key)), index)`. (`rules-hex.json`'s per-subset check values are
+that hash ranking for all 7 subsets; `rules --split` checks it against the exporter.)
 
 | subset | `15` | `128` | `258` | `01346` | `03456` | `023468` | `01234568` |
 |---|---|---|---|---|---|---|---|
 | rules | 4 | 32 | 64 | 8 | 16 | 320 | 1,953,125 |
-| v2 held out | 1 | 6 | 13 | 2 | 3 | 64 | 390,625 |
-| legacy held out (1 / 3 also v2) | 1 | 6 | 13 | | | | |
-| **train** | **2** | **21** | **41** | 6 | 13 | 256 | 1,562,500 |
+| held out | 1 (legacy) | 6 (legacy) | 13 (legacy) | 2 | 3 | 64 | 390,625 |
+| train | 3 | 26 | 51 | 6 | 13 | 256 | 1,562,500 |
+
+Every held-out rule of the six small subsets uses only (type, digit) pairs some train rule of its subset has:
+a held-out rule is a new combination, never a new per-tile matching.
 
 Training draws the subset uniformly (1/7 each), then a train rule uniformly within it (rejection within the
 subset), then a board of the level and a uniformly random chord as the tap.
@@ -273,8 +277,8 @@ and most exactly at both widths, A catches up only when wide, and D (rot / 6 as 
 8x the width lifts it from 0.12 to 0.59 held-out but does not close the gap (cos / sin closes part of it).
 D-fourier tracks A at both widths (0.558 / 0.556, 0.939 / 0.923; train 0.678 / 0.679, 0.998 / 0.996): it is an
 invertible linear map of A's one-hot, as expected, so it needs no trainer arm. What every arm misses on
-held-out rules is mostly subset `15` (see departure 1 below: its held-out rule needs a digit no `15` train
-rule has); the fully packed subset is where narrow grid-frame nets fail.
+held-out rules is mostly subset `15` (measured with the first split, where its held-out rule needed a digit
+no `15` train rule had: departure 1 below); the fully packed subset is where narrow grid-frame nets fail.
 
 **Trainer** (`nca/strand/train2.py`; its docstring has every detail): the v1 trainer's pool, ages, damage, light
 cones, truncated backprop, schedule, collapse guard, resume and log, with the v2 inputs; `--channels 96 --hidden
@@ -294,10 +298,10 @@ pools, scored on the quick check's held-out read-outs, overall and by distance f
 **Departures from `spectacle-nca-options.md`** (what the build chose where the doc was open or the owner changed it):
 
 1. The split is rank-based per subset (exactly round(0.2 n) held out in each), not `hash < 0.2`, which could
-   hold out none of `15`'s four rules. Training also excludes the 20 legacy held-out rules. In `15` this leaves
-   2 train rules, both with Pi's digit 1, so the one v2 held-out rule (`15·000000010`) and the legacy one
-   (`15·000000000`) need a (type, digit) never trained in that subset: an extrapolation, not a composition. No
-   other subset has one. Holding out only the legacy rules in `15`, `128`, `258` would avoid it (owner's call).
+   hold out none of `15`'s four rules; and in `15`, `128`, `258` it is the legacy rules alone (owner's decision).
+   A first version held out a v2 20 % there on top of the legacy rules: `15` kept 2 train rules, both with Pi's
+   digit 1, so its held-out rules needed a (type, digit) never trained in that subset. The probe table above was
+   measured with that version (its `15` column).
 2. No owner slot (the owner's decision for launch 6): the tap is 59 planes, not 63.
 3. The rule table is `data/strand-v2/rules-hex.json`, with the boards' geometry and the parity sample beside
    it, not `data/strand/rules-hex.json`; the legacy data stays `data/strand` (launch 5's `strand.tgz`).
@@ -326,3 +330,9 @@ taps at the checks (exact stays 0 this early); code bits = the fidelity probe's 
 gradient + 12 with), relative to the default C at 96 / 128 / depth 1: A 0.86, D 0.78, E 2.21 (its per-frame
 weight selection and the recomputed 7-tap rows; not measured on a GPU), big (C at 128 / 256 / depth 2) 2.35, for
 2.6x the parameters.
+
+**Memory per arm** (`python -m nca.strand.memprobe`: a fresh process's peak RSS over one gradient window on
+level-4 crops, S 42, at two window lengths): per backprop step at batch 8, E 19.4 MB (+325 MB transient, its
+checkpointed 7-tap recompute), C 35.6 MB (+43), big 75.9 MB (+33); autograd's saved tensors are ~70 % of that.
+At the trainer's window of 48 and batch 16: E 2.5 GB, C 3.5 GB, big 7.35 GB. `nca/cloud/plan-7.txt` sizes its
+batches from these (all three arms at 16, ~15.6 GB with pools and CUDA contexts).

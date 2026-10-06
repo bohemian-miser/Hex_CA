@@ -13,10 +13,14 @@ non-crossing matchings in Spectacle's order (0..4; 0 for a type with one choice 
 subset is the digits in mixed radix, Delta most significant; 1,953,569 rules in all. Spectacle's matching
 index for type t is options[s][t][digits[t]], and its ruleKey is `hex|<subset>|<indices joined by .>`.
 
-SPLIT (v2): per subset, the round(0.2 n) rules with the smallest (fmix32(FNV-1a('strand-split-v2|' + key)),
-index) are held out -- stratified, so every subset has held-out rules (1 / 6 / 13 / 2 / 3 / 64 / 390,625).
-Training also never draws the 20 "legacy" held-out rules of the v1 split (the 100-rule set without class 0),
-so launch 6's legacy numbers stay comparable with the overnight runs.
+SPLIT (v2), stratified by subset (every subset has held-out rules; owner's decision 2026-10-06):
+  - the subsets of the v1 dataset (`15`, `128`, `258`, no class 0): exactly the v1 split's held-out rules, the
+    20 "legacy" rules (1 / 6 / 13), and nothing more -- so the legacy numbers stay comparable with the overnight
+    runs and these small subsets keep 80 % of their rules for training (holding out a v2 20 % on top left `15`
+    with 2 train rules that never had Pi's digit 0, which its held-out rules need);
+  - the four subsets with class 0: the round(0.2 n) rules with the smallest
+    (fmix32(FNV-1a('strand-split-v2|' + key)), index) (2 / 3 / 64 / 390,625). The exporter's per-subset check
+    values in rules-hex.json are this ranking for all 7 subsets (`ranked`; --split compares them).
 
 THE CODE (T1, 53 bits, the rule as the game states it): 8 bits "class m carries a line" for m in MAJORS =
 (0, 1, 2, 3, 4, 5, 6, 8), then per leaf type a one-hot of its digit (9 x 5).
@@ -198,16 +202,30 @@ class RuleTable:
                     h = np.where(live, nh, h)
             return _fmix(h)
 
+    def is_v1_subset(self, s: int) -> bool:
+        """One of the v1 dataset's subsets (no class 0): `15`, `128`, `258`."""
+        return 0 not in self.edges[s]
+
+    def ranked(self, s: int) -> np.ndarray:
+        """bool [count]: the round(0.2 n) rules of subset s with the smallest (v2 hash, index) -- the exporter's
+        check values; the held-out set of the class-0 subsets."""
+        n = int(self.count[s])
+        k = int(round(HELDOUT_SHARE * n))  # n * 0.2 never ends in .5 for these counts: no rounding ambiguity
+        order = np.lexsort((np.arange(n), self._hashes(s, SPLIT_SALT)))
+        held = np.zeros(n, bool)
+        held[order[:k]] = True
+        return held
+
     def held_out(self, s: int) -> np.ndarray:
-        """bool [count]: the v2 held-out rules of subset s."""
+        """bool [count]: the held-out rules of subset s (the legacy ones in a v1 subset, else the ranked 20 %)."""
         if self._held is None:
             self._held = [None] * self.n_sub
         if self._held[s] is None:
-            n = int(self.count[s])
-            k = int(round(HELDOUT_SHARE * n))  # n * 0.2 never ends in .5 for these counts: no rounding ambiguity
-            order = np.lexsort((np.arange(n), self._hashes(s, SPLIT_SALT)))
-            held = np.zeros(n, bool)
-            held[order[:k]] = True
+            if self.is_v1_subset(s):
+                held = np.zeros(int(self.count[s]), bool)
+                held[[i for k, i in self.legacy_heldout() if k == s]] = True
+            else:
+                held = self.ranked(s)
             self._held[s] = held
         return self._held[s]
 
@@ -226,8 +244,7 @@ class RuleTable:
         return self._legacy
 
     def allowed(self, split: str = "train") -> list[np.ndarray]:
-        """Per subset, bool [count]: the rules of `split` ('train': neither v2 held-out nor legacy held-out;
-        'heldout': v2 held-out)."""
+        """Per subset, bool [count]: the rules of `split` ('train' or 'heldout'; the legacy rules are held out)."""
         if split == "heldout":
             return [self.held_out(s) for s in range(self.n_sub)]
         if split != "train":
@@ -243,8 +260,8 @@ class RuleTable:
         return bool(self.allowed("train")[s][int(index)])
 
     def sample(self, rng: np.random.Generator, split: str = "train") -> tuple[int, np.ndarray]:
-        """(s, digits): the subset uniform over the 7, then the rule uniform within it, from `split` ('train':
-        neither v2 held-out nor legacy held-out; 'heldout': v2 held-out)."""
+        """(s, digits): the subset uniform over the 7, then the rule uniform within it, from `split` ('train' or
+        'heldout')."""
         ok = self.allowed(split)
         s = int(rng.integers(self.n_sub))  # the subset first: rejection only within it keeps the subsets uniform
         while True:
@@ -394,7 +411,7 @@ def check_split(data_dir=None, out=print) -> int:
     bad += not np.array_equal(h0, np.array(want, np.uint32))
     rows = []
     for s in range(tab.n_sub):
-        held = tab.held_out(s)
+        held = tab.ranked(s)
         idx = np.nonzero(held)[0]
         x = 0
         for v in idx.tolist():
@@ -405,9 +422,11 @@ def check_split(data_dir=None, out=print) -> int:
         bad += not ok
         rows.append(f"{tab.keys[s]} {mine['k']}/{mine['n']}{'' if ok else ' MISMATCH'}")
     legacy = tab.legacy_heldout()
+    held = [f"{tab.keys[s]} {int(tab.held_out(s).sum())}/{int(tab.allowed('train')[s].sum())}" for s in range(tab.n_sub)]
     out(f"split v2: {len(tab.meta['samples'])} keyed samples and 2,000 vectorised hashes "
-        f"{'match' if bad == 0 else 'MISMATCH'}; held out per subset {', '.join(rows)}; legacy held-out "
-        f"{len(legacy)} rules; {time.time() - t0:.1f} s")
+        f"{'match' if bad == 0 else 'MISMATCH'}; the hash ranking (20 % per subset) = the exporter's: {', '.join(rows)}; "
+        f"held out / train per subset (v1 subsets: the {len(legacy)} legacy rules only): {', '.join(held)}; "
+        f"{time.time() - t0:.1f} s")
     return bad
 
 

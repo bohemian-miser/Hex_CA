@@ -21,7 +21,7 @@ INPUTS (the consts, mask first; --inputs; the static planes are rules.py's):
   9 x 5 digit one-hot; rules.py) and the tapped chord's two edge directions (6). No owner slot (one player in
   M1). A chord is never an input.
 RULES: a new pool slot draws a TRAIN rule (rules.RuleTable.sample: the subset uniform over the 7, the rule
-uniform within it; never a v2 or a legacy held-out rule), a board of its level (L2 / L3: the nine patches; L4:
+uniform within it; never a held-out rule), a board of its level (L2 / L3: the nine patches; L4:
 the 2,048 training crops) and a uniformly random chord of it as the tap; the target strand is walked from the
 rule rendered by rules.py (= Spectacle's walkStrand, `python -m nca.strand.rules --parity`).
 TASKS
@@ -51,7 +51,8 @@ QUICK CHECK (held-out rules only; --eval-sets, at --eval-levels):
   legacy  the v1 split's 20 held-out rules on the v1 eval boards (level 4: the crops), the SAME taps as
           train.py's check (same EVAL_SEED and stratified draw), inputs built from those boards' types and
           rotations: comparable with the overnight runs
-  wide    the v2 held-out rules, 40 per subset (all of a subset with fewer: 1 / 6 / 13 / 2 / 3), fixed seed;
+  wide    the held-out rules, 40 per subset (all of a subset with fewer: 1 / 6 / 13 / 2 / 3 -- in 15 / 128 / 258
+          the legacy rules, on other boards and taps), fixed seed;
           L2 / L3 patches and the 64 L4 eval crops; --eval-n taps per level stratified by length bucket
           (short <= 10, medium 11-60, long > 60 chords), round-robin over the subsets within a bucket
   Read out after max(--eval-mult x S, the set's largest ideal + 8) steps (capped at --eval-cap), from the

@@ -2,9 +2,10 @@
 `python -m nca.strand.selftest2` (a few minutes on the Pi; needs data/strand-v2 from
 `npx tsx scripts/strand-export.ts --rule-table` and data/strand for the legacy set).
 
-  1. rules: 300 parity.npz rule-boards (all 7 subsets) render and walk exactly as walkStrand; flipping the
-     mirror sign or swapping two digits breaks it (negative controls); the split's held-out counts; sampled
-     train rules are never held out (v2 or legacy)
+  1. rules: ~190 parity.npz rule-boards (all 7 subsets) render and walk exactly as walkStrand; flipping the
+     mirror sign or changing a digit breaks it (negative controls); the split (held-out and train counts, the
+     legacy rules exactly in 15 / 128 / 258, no held-out rule of a small subset with an unseen (type, digit));
+     sampled train rules are never held out
   2. inputs, per --inputs arm: shapes; the static planes at a cell are its (type, rot, mirror) row and do not
      depend on the rule; the tap planes are on the tapped cell only and decode back to the rule and the chord;
      c-bc's broadcast code is on every board cell; nothing else in the consts changes with the rule
@@ -100,14 +101,24 @@ def rules_checks(tab, bd):
     check(f"rules: negative controls -- the mirror bit flipped breaks {flip}/{n_on} renderings, the most common "
           f"type's digit changed breaks {swapped}/{n_sw}", flip == n_on and swapped == n_sw)
     held = [int(tab.held_out(s).sum()) for s in range(tab.n_sub)]
-    check(f"split: held out per subset {held}", held == [1, 6, 13, 2, 3, 64, 390625])
-    rng = np.random.default_rng(3)
+    train = [int(tab.allowed("train")[s].sum()) for s in range(tab.n_sub)]
     legacy = set(tab.legacy_heldout())
+    v1_held = {(s, int(i)) for s in range(tab.n_sub) if tab.is_v1_subset(s) for i in np.nonzero(tab.held_out(s))[0]}
+    unseen = 0  # held-out rules of the small subsets needing a (type, digit) no train rule of their subset has
+    for s in range(tab.n_sub - 1):
+        seen = {(t, int(d[t])) for i in np.nonzero(tab.allowed("train")[s])[0] for d in [tab.digits_of(s, i)]
+                for t in range(9)}
+        unseen += sum(any((t, int(d[t])) not in seen for t in range(9))
+                      for d in (tab.digits_of(s, i) for i in np.nonzero(tab.held_out(s))[0]))
+    check(f"split: held out {held}, train {train} per subset; in 15 / 128 / 258 the held-out rules are exactly the "
+          f"20 legacy ones; no held-out rule of a small subset needs an unseen (type, digit) ({unseen})",
+          held == [1, 6, 13, 2, 3, 64, 390625] and train == [3, 26, 51, 6, 13, 256, 1562500] and v1_held == legacy
+          and unseen == 0)
+    rng = np.random.default_rng(3)
     draws = [tab.sample(rng) for _ in range(3000)]
     bad = sum(tab.held_out(s)[tab.index_of(s, d)] or (s, tab.index_of(s, d)) in legacy for s, d in draws)
     per = np.bincount([s for s, _ in draws], minlength=7)
-    check(f"split: 3,000 sampled train rules, none held out (v2 or legacy); per subset {per.tolist()}",
-          bad == 0 and per.min() > 300)
+    check(f"split: 3,000 sampled train rules, none held out; per subset {per.tolist()}", bad == 0 and per.min() > 300)
 
 
 def input_checks(tab, bd):

@@ -827,8 +827,9 @@ const keyOfDigits = (sub: SubsetTable, digits: readonly number[]): string =>
   `hex|${sub.edges.join('')}|${digits.map((k, t) => sub.options[t][k]).join('.')}`;
 
 /**
- * The v2 split, stratified by subset: of each subset's n rules, the round(0.2 n) with the smallest
- * (splitHash(`strand-split-v2|` + ruleKey), index) are held out. Returns the check values rules.py must match.
+ * The v2 hash ranking, per subset: of its n rules, the round(0.2 n) with the smallest
+ * (splitHash(`strand-split-v2|` + ruleKey), index). Returns the check values rules.py must match. (rules.py holds
+ * these out in the four class-0 subsets; in `15`, `128`, `258` it holds out the v1 split's legacy rules instead.)
  */
 function splitV2(sub: SubsetTable): { n: number; k: number; thrHash: number; thrIndex: number; xor: number; sum: number } {
   const n = sub.count;
@@ -1021,7 +1022,7 @@ async function mainV2(args: Record<string, string>, root: string): Promise<void>
       tile_rot: 'board direction of local edge k = (board_mirror * k + tile_rot) mod 6 (as v1)',
       rule: 'a rule = (subset, digits): digit t = position of type t\'s matching among options[t]; index = digits in mixed radix, Delta most significant',
       key: 'Spectacle ruleKey: hex|<subset digits>|<matching indices joined by .>',
-      split: `per subset, the round(${HELDOUT_SHARE} * n) rules with the smallest (fmix32(FNV-1a('${SPLIT_SALT_V2}|' + key)), index) are held out`,
+      split: `subsets[].split = per subset the round(${HELDOUT_SHARE} * n) rules with the smallest (fmix32(FNV-1a('${SPLIT_SALT_V2}|' + key)), index): held out in the class-0 subsets; 15 / 128 / 258 hold out the v1 legacy rules instead (nca/strand/rules.py)`,
       boards: 'boards.npz: <group>_type/rot/tile [B,H,W] (-1 off board), <group>_mirror/root/orient/h/w/tiles [B]; groups L2, L3, L4 (training crops), L4eval (eval crops, seed evalSeed), L4full (the Delta patch)',
       parity: 'parity.npz: sample s = rule (sample_subset, sample_index) on board (sample_group 0 L2 / 1 L3 / 2 L4, sample_board); chord_bits bit p = PAIRS[p]; strands and taps as v1 (strand_board / tap_board = sample)',
     },
