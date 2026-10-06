@@ -1706,6 +1706,40 @@ function galleryTileExact(group, idx) {
   }
   return true;
 }
+// A cell's "on" directions paired up into chords (as Spectacle pairs a tile's edges into a matching):
+// the common case is exactly two -- one line, the strand passing straight through -- paired in order;
+// one left over (a tail end) pairs with -1, a stub to the centre; more than two (only ever the model's
+// prediction, never a clean walked target) still pairs up two at a time rather than drawing nothing.
+function pairDirs(dirs) {
+  var pairs = [];
+  for (var i = 0; i + 1 < dirs.length; i += 2) pairs.push([dirs[i], dirs[i + 1]]);
+  if (dirs.length % 2) pairs.push([dirs[dirs.length - 1], -1]);
+  return pairs;
+}
+function sameChord(a, b) {
+  return (a[0] === b[0] && a[1] === b[1]) || (a[0] === b[1] && a[1] === b[0]);
+}
+// A chord joins the midpoints of its two edges -- straight through (or, a tail end, to the centre) --
+// so a strand reads as one continuous line across cells, the way Spectacle draws it, not a spoked star.
+function drawChord(ctx, px, py, size, d0, d1, color, dashed, widthFrac, alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  ctx.setLineDash(dashed ? [Math.max(1, size * 0.22), Math.max(1, size * 0.16)] : []);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(1, size * (widthFrac == null ? 0.16 : widthFrac));
+  ctx.lineCap = "round";
+  var a0 = edgeAngle(d0);
+  ctx.beginPath();
+  ctx.moveTo(px + size * 0.92 * Math.cos(a0), py + size * 0.92 * Math.sin(a0));
+  if (d1 < 0) {
+    ctx.lineTo(px, py);
+  } else {
+    var a1 = edgeAngle(d1);
+    ctx.lineTo(px + size * 0.92 * Math.cos(a1), py + size * 0.92 * Math.sin(a1));
+  }
+  ctx.stroke();
+  ctx.restore();
+}
 function drawGalleryTile(canvas, group, idx) {
   var rect = canvas.getBoundingClientRect();
   var w = Math.max(1, Math.round(rect.width)), h = Math.max(1, Math.round(rect.height || 220));
@@ -1729,17 +1763,24 @@ function drawGalleryTile(canvas, group, idx) {
       ctx.strokeStyle = hair;
       ctx.lineWidth = 1;
       ctx.stroke();
+      var tgtDirs = [], predDirs = [];
       for (var d = 0; d < 6; d++) {
         var k = edgeOff + d * n0 + i;
-        var t = group.tgtEdges[k] === 1, p = group.predEdges[k] === 1;
-        if (t && p) {
-          drawSpoke(ctx, px, py, L.size, d, good, false, 0.22, 1);     // correct: bold, solid
-        } else if (t) {
-          drawSpoke(ctx, px, py, L.size, d, bad, false, 0.08, 0.55);   // missed: thin, faint
-        } else if (p) {
-          drawSpoke(ctx, px, py, L.size, d, bad, true, 0.17, 1);       // extra: bold, dashed
-        }
+        if (group.tgtEdges[k] === 1) tgtDirs.push(d);
+        if (group.predEdges[k] === 1) predDirs.push(d);
       }
+      var tgtChords = pairDirs(tgtDirs), predChords = pairDirs(predDirs);
+      // missed: a target chord with no matching prediction here -- thin, faint (no bold line to pair it
+      // with, so no point drawing both); correct / extra: the prediction, bold, on top of nothing else
+      tgtChords.forEach(function (c) {
+        if (!predChords.some(function (pc) { return sameChord(pc, c); })) {
+          drawChord(ctx, px, py, L.size, c[0], c[1], bad, false, 0.07, 0.45);
+        }
+      });
+      predChords.forEach(function (c) {
+        var ok = tgtChords.some(function (tc) { return sameChord(tc, c); });
+        drawChord(ctx, px, py, L.size, c[0], c[1], ok ? good : bad, !ok, ok ? 0.22 : 0.17, 1);
+      });
     }
   }
   var tap = group.tap.slice(idx * 4, idx * 4 + 4);
