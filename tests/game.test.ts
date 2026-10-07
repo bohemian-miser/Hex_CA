@@ -57,6 +57,27 @@ describe('the game host', () => {
     expect(g.holder(OTHER)).toBe(b);
   });
 
+  it('a rule change wipes that player\'s lines (leaving and rejoining) and leaves the others\' alone', () => {
+    const { g, a, b } = twoPlayers();
+    const [ca, a0, a1] = chords(g, a)[0];
+    const mine = strandTiles(LOOPS, ca, a0, a1);
+    const far = chords(g, b).find((ch) => ![...strandTiles(OTHER, ...ch)].some((c) => mine.has(c)))!;
+    expect(g.tapChord(a, ca, a0, a1)).toBeNull();
+    expect(g.tapChord(b, ...far)).toBeNull();
+    let t = run(g, 0, 1000);
+    const theirs = g.lines.lineTiles(b);
+    expect(g.lines.lineTiles(a)).toBeGreaterThan(0);
+    expect(g.setRule(a, rule('15·000000010'))).toBe(true);
+    expect(g.lines.lineTiles(a)).toBe(0);
+    expect(g.lines.lineTiles(b)).toBe(theirs);
+    expect(g.scores()[a]).toBe(0);
+    t = run(g, t, t + 500);
+    expect(g.lines.lineTiles(b)).toBe(theirs);
+    // and the new rule taps
+    const [cn, n0, n1] = chords(g, a).find(([c]) => !g.lines.ch.rule[c] && g.territory()[c] === 0)!;
+    expect(g.tapChord(a, cn, n0, n1)).toBeNull();
+  });
+
   it('taps the chord nearest the point, either end, and draws it', () => {
     const { g, a } = twoPlayers();
     const [cell, d0, d1] = chords(g, a).find(([c]) => g.chordsOf(a, c).length >= 2)!;

@@ -753,6 +753,7 @@ function renderPlayers(): void {
     chip.classList.toggle('wait', wait > 0);
   });
   $<HTMLButtonElement>('addPlayer').disabled = $<HTMLButtonElement>('addBot').disabled = seats.length >= MAX_SEATS;
+  ruleHint();
 }
 
 function describeRule(): void {
@@ -763,6 +764,15 @@ function describeRule(): void {
   $('ruleNow').innerHTML = `<span class="swatch" style="background:${colours.seats[selected]}"></span> <b></b><br>`
     + `<span class="note">edge classes ${sub.edges.join(', ')} carry lines; ${sub.count.toLocaleString()} rules in subset ${sub.key}</span>`;
   $('ruleNow').querySelector('b')!.textContent = table.describe(s.rule);
+  ruleHint();
+}
+
+/** Under the rule picker: what a change would cost the selected player. */
+function ruleHint(): void {
+  const n = game ? game.lines.lineTiles(ownerOf(selected)) : 0;
+  const text = n ? `A new rule wipes ${seats[selected].name}'s lines (${n} tile${n > 1 ? 's' : ''}): a rule change is leaving and rejoining.`
+    : 'A new rule applies to the next tap.';
+  if ($('ruleHint').textContent !== text) $('ruleHint').textContent = text;
 }
 
 let stepsDone = 0;
@@ -854,7 +864,7 @@ function removeSeat(i: number): void {
   notice = 'A player left: the board starts over.';
 }
 
-/** The selected seat's rule, if no other seat holds it. Lines already on the board keep the rule they grew with. */
+/** The selected seat's rule, if no other seat holds it: leaving and rejoining, so their lines are wiped. */
 function setSeatRule(r: Rule): void {
   const s = seats[selected];
   const holder = seats.findIndex((t, k) => k !== selected && table.describe(t.rule) === table.describe(r));
@@ -863,11 +873,13 @@ function setSeatRule(r: Rule): void {
     $('ruleErr').className = 'note err';
     return;
   }
+  if (table.describe(r) === table.describe(s.rule)) return;
+  const had = game.lines.lineTiles(ownerOf(selected));
   if (!game.setRule(ownerOf(selected), r)) return;
   s.rule = { s: r.s, digits: r.digits.slice() };
-  $('ruleErr').textContent = game.lines.lineTiles(ownerOf(selected))
-    ? 'The lines already drawn keep their old rule (another pattern of yours: your new lines collide with them).' : '';
+  $('ruleErr').textContent = '';
   $('ruleErr').className = 'note';
+  if (had) notice = `${s.name} changed rule: their ${had} line tile${had > 1 ? 's were' : ' was'} wiped, as if they had left and rejoined.`;
   describeRule();
   panelDirty = dirty = true;
   legend();

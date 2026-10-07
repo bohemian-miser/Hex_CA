@@ -139,17 +139,32 @@ export class Game {
     return 0;
   }
 
-  /** A player's next taps use `rule` (refused, false, if another player holds it). Their lines on the board keep
-   * the rule they were drawn with: to the line CA those are another pattern of theirs. */
+  /** A player's rule changes (refused, false, if another player holds it): leaving and rejoining, as Spectacle's
+   * setRule without its regrow — every line of theirs is wiped at once (to the line CA a new rule is a new rival
+   * index, so old and new lines would cut each other), and their next taps use the new rule. */
   setRule(owner: number, rule: Rule): boolean {
     const p = this.player(owner);
     const h = this.holder(rule);
     if (h > 0) return h === owner;
+    this.wipe(owner);
     const { ix, chords } = this.addRule(rule, owner);
     p.rule = { s: rule.s, digits: rule.digits.slice() };
     p.ruleIx = ix;
     p.chords = chords;
     return true;
+  }
+
+  /** Every line of a player's, gone at once (no waves, no hit: nobody's respawn is charged). */
+  private wipe(owner: number): void {
+    const { owner: own, D } = this.lines.ch;
+    const cells: number[] = [];
+    for (let c = 0; c < this.board.n; c++) if (own[c] === owner && D[c]) cells.push(c);
+    if (!cells.length) return;
+    const list = Int32Array.from(cells);
+    this.lines.convert(list, 0);
+    this.area.update(this.lines, list);
+    this.quiet = 0;
+    this.read();
   }
 
   player(owner: number): Player {
