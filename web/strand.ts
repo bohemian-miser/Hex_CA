@@ -12,6 +12,9 @@
 // tap), and taking a tap away, or Reset, starts the board over with the remaining taps fired at step 0.
 
 import dataJson from './strand-data.json';
+import {
+  css3, divLevel as sharedDivLevel, LEVELS, pixel, ramps as sharedRamps,
+} from '../src/ramp.js';
 import { Board, PAIRS, RuleTable, walk, type Rule, type Strand, type StrandData } from '../src/strand.js';
 import { StrandNCA, chordsAt, loadStrandWeights, type StrandWeights, type Tap } from '../src/strand-nca.js';
 
@@ -38,6 +41,12 @@ const TYPE_RGB: Record<string, [number, number, number]> = {
 };
 const MAP_LABELS: Record<string, string> = { l2: 'Level 2', l3: 'Level 3', l4: 'Level 4' };
 const N_COLOURS = 8;
+/** localStorage: the last rule picked (sticky across visits; ?rule= still wins). */
+const RULE_STORAGE_KEY = 'hexca.strand.rule';
+/** With its box ticked, the page refetches the weights this often and swaps in ones that changed (web/nca.ts). */
+const AUTO_RELOAD_MS = 120_000;
+/** The channel tiles and their mini boards redraw at most this often while running. */
+const GRID_MS = 100;
 
 const params = new URLSearchParams(location.search);
 const weightsUrl = params.get('weights');
@@ -90,9 +99,36 @@ let dirty = true;
 let tapsDirty = true;
 /** The tap owning each cell, for strays on a shared board: the nearest tap's strand (BFS over cells). */
 let owner = new Int16Array(0);
+/** The channel shown large on the board in place of the strands (web/nca.ts's `shown`), or null for the
+ * ordinary strand/truth view. */
+let shown: number | null = null;
+/** The channel tiles (one per state channel of the model being inspected) redraw at most this often. */
+let gridDirty = true;
+let lastGrid = 0;
 
 const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const fmt = (x: number | undefined | null, d = 2) => (typeof x === 'number' ? x.toFixed(d) : '–');
+
+/** The rule picked last, from localStorage (every access wrapped: a private window, or cleared/blocked site
+ * data, just means no sticky rule, never a crash). */
+function loadStoredRule(): Rule | null {
+  try {
+    const text = localStorage.getItem(RULE_STORAGE_KEY);
+    if (!text) return null;
+    const r = table.parse(text);
+    return typeof r === 'string' ? null : r;
+  } catch {
+    return null;
+  }
+}
+
+function storeRule(r: Rule): void {
+  try {
+    localStorage.setItem(RULE_STORAGE_KEY, table.describe(r));
+  } catch {
+    // private window, or site data cleared/blocked: the rule just isn't sticky across visits
+  }
+}
 
 function boardOf(id: string): Board {
   let b = boards.get(id);
@@ -133,7 +169,7 @@ function buildModels(): void {
   for (const t of taps) t.since = null;
   lastChange = 0;
   drawnKey = 0;
-  dirty = tapsDirty = true;
+  dirty = tapsDirty = gridDirty = true;
 }
 
 function makeTap(tap: Tap): PlayTap {
@@ -175,7 +211,7 @@ function tapsChanged(added: PlayTap | null): void {
   }
   computeOwners();
   lastChange = stepCount();
-  tapsDirty = dirty = true;
+  tapsDirty = dirty = gridDirty = true;
   if (taps.length && !playing) setPlaying(true);
 }
 
@@ -203,10 +239,14 @@ function computeOwners(): void {
   for (let i = 0; i < board.n; i++) if (owner[i] < 0) owner[i] = 0;
 }
 
-/** Why Spectacle would refuse a tap of the current rule on cell i (event weights on one board), or a free chord of
- * the tile to tap instead of (d0, d1): a rival's line (a tap of another rule whose strand the model draws on the
- * tile) owns the whole tile; on a tile of your own line, a chord it already runs on is taken (freeChord). */
-function legalTap(row: number, col: number, d0: number, d1: number): { why: string } | { d0: number; d1: number } {
+/** Why Spectacle would refuse a tap of the current rule on cell i (event weights on one board), or the nearest
+ * still-free chord of the tile to tap instead of `ranked[0]` (ranked: the tile's chords under the rule, nearest
+ * the click first — see rankChords): a rival's line (a tap of another rule whose strand the model draws on the
+ * tile) owns the whole tile; on a tile of your own line, a chord it already runs on is taken (freeChord). Trying
+ * `ranked` in order, rather than the chord table's own order, means a refused tap still lands on the chord
+ * nearest the click that is actually free, not an arbitrary one. */
+function legalTap(row: number, col: number, ranked: readonly [number, number][]): { why: string } | { d0: number; d1: number } {
+  const [d0, d1] = ranked[0];
   if (!sharedModel || !eventTaps()) return { d0, d1 };
   const i = board.cellOf[row * board.w + col];
   const P = drawnOf(sharedModel);
@@ -218,35 +258,52 @@ function legalTap(row: number, col: number, d0: number, d1: number): { why: stri
       return { why: `Refused: a line of ${table.describe(t.tap.rule)} is on that tile, and a rival's line owns its whole tile (Spectacle's rule).` };
     }
   }
-  const free = ([a, b]: [number, number]) => !P[i * 6 + a] && !P[i * 6 + b];
-  if (free([d0, d1])) return { d0, d1 };
-  const other = chordsAt(table, rule, board, row, col).find(free);
-  return other ? { d0: other[0], d1: other[1] } : { why: 'Refused: your line already runs on every chord of that tile.' };
+  const free = ([a, b]: readonly [number, number]) => !P[i * 6 + a] && !P[i * 6 + b];
+  for (const ch of ranked) if (free(ch)) return { d0: ch[0], d1: ch[1] };
+  return { why: 'Refused: your line already runs on every chord of that tile.' };
 }
 
-/** Add a tap of the current rule at cell (row, col), the chord (d0, d1); a tap already on that cell is replaced
- * (or, the same rule and chord again, taken away). Event weights: a tap is refused where Spectacle refuses it and is
- * otherwise a new tap, whatever is on the tile. */
-function addTap(row: number, col: number, d0: number, d1: number): void {
+/** Whether tap `t` is exactly this cell, chord (either way round) and the current rule. */
+function sameTap(t: PlayTap, row: number, col: number, d0: number, d1: number): boolean {
+  return t.tap.row === row && t.tap.col === col && table.describe(t.tap.rule) === table.describe(rule)
+    && ((t.tap.d0 === d0 && t.tap.d1 === d1) || (t.tap.d0 === d1 && t.tap.d1 === d0));
+}
+
+/** Add a tap of the current rule at cell (row, col): `ranked`, its chords under the rule nearest the click first
+ * (rankChords) — a tap takes `ranked[0]` unless that is refused (event weights), in which case it falls back to
+ * the next nearest still-free one. A tap already there of the same rule and the chord it would take is taken
+ * away instead, held or event weights alike (clicking the same spot again toggles it off; it never cycles
+ * through other chords on its own). Held weights otherwise replace whatever tap was on that cell; event weights
+ * are refused where Spectacle refuses them and are otherwise a new tap, whatever else is already on the tile. */
+function addTap(row: number, col: number, ranked: readonly [number, number][]): void {
+  let [d0, d1] = ranked[0];
   if (eventTaps()) {
-    const ok = legalTap(row, col, d0, d1);
+    const dup = taps.findIndex((t) => sameTap(t, row, col, d0, d1));
+    if (dup >= 0) {
+      taps.splice(dup, 1);
+      notice = 'Tap taken away (the same rule and chord again).';
+      tapsChanged(null);
+      return;
+    }
+    const ok = legalTap(row, col, ranked);
     if ('why' in ok) {
       notice = ok.why;
       readout();
       return;
     }
-    [d0, d1] = [ok.d0, ok.d1];
-  }
-  const at = eventTaps() ? -1 : taps.findIndex((t) => t.tap.row === row && t.tap.col === col);
-  if (at >= 0) {
-    const old = taps[at];
-    const same = table.describe(old.tap.rule) === table.describe(rule)
-      && ((old.tap.d0 === d0 && old.tap.d1 === d1) || (old.tap.d0 === d1 && old.tap.d1 === d0));
-    taps.splice(at, 1);
-    if (same) {
-      notice = 'Tap taken away (the same rule and chord again).';
-      tapsChanged(null);
-      return;
+    d0 = ok.d0;
+    d1 = ok.d1;
+  } else {
+    const at = taps.findIndex((t) => t.tap.row === row && t.tap.col === col);
+    if (at >= 0) {
+      const old = taps[at];
+      const same = sameTap(old, row, col, d0, d1);
+      taps.splice(at, 1);
+      if (same) {
+        notice = 'Tap taken away (the same rule and chord again).';
+        tapsChanged(null);
+        return;
+      }
     }
   }
   if (weights?.ruleEverywhere && taps.length >= 8) {
@@ -298,7 +355,7 @@ function centralChoice(r: Rule, lo = 8, hi = 80): { row: number; col: number; d0
 /** The first tap on a fresh board: the current rule near the centre. */
 function centralTap(): void {
   const c = centralChoice(rule);
-  if (c) addTap(c.row, c.col, c.d0, c.d1);
+  if (c) addTap(c.row, c.col, [[c.d0, c.d1]]);
 }
 
 /** With no ?rule=, a random held-out rule whose strand near the centre is a fair length (a few tries). */
@@ -444,10 +501,10 @@ function resize(): void {
   bgDirty = dirty = true;
 }
 
-/** The board position under a canvas point, or -1. */
-function posAt(x: number, y: number): number {
-  const fr = (y - geom.oy) / (1.5 * geom.size);
-  const fq = (x - geom.ox) / (SQ3 * geom.size) - fr / 2;
+/** The board position under a canvas point in geometry `g`, or -1. */
+function posAtGeom(g: Geom, x: number, y: number): number {
+  const fr = (y - g.oy) / (1.5 * g.size);
+  const fq = (x - g.ox) / (SQ3 * g.size) - fr / 2;
   const fs = -fq - fr;
   let q = Math.round(fq);
   let r = Math.round(fr);
@@ -460,6 +517,33 @@ function posAt(x: number, y: number): number {
   return board.on(r, q) ? r * board.w + q : -1;
 }
 
+/** The board position under a canvas point (the view's own geometry), or -1. */
+function posAt(x: number, y: number): number {
+  return posAtGeom(geom, x, y);
+}
+
+/** The on-board cell index (board.cellOf order, as the model's channels are indexed) under a point in
+ * geometry `g`, or -1 — a mini board's own fit, for the channel tiles (miniLayout). */
+function cellAtGeom(g: Geom, x: number, y: number): number {
+  const p = posAtGeom(g, x, y);
+  return p < 0 ? -1 : board.cellOf[p];
+}
+
+/** The largest hexagon-cell grid that fits a w×h box with `pad` to spare, centred on the board's own cells
+ * (fit()'s formula, parametrised for a small tile canvas rather than the main view). */
+function fitMini(w: number, h: number, pad: number): Geom {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let i = 0; i < board.n; i++) {
+    const [x, y] = unitCentre(board.pos[i]);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const size = Math.max(0.5, Math.min((w - pad) / (maxX - minX + SQ3), (h - pad) / (maxY - minY + 2)));
+  return { size, ox: w / 2 - (size * (minX + maxX)) / 2, oy: h / 2 - (size * (minY + maxY)) / 2 };
+}
+
 function zoomAt(x: number, y: number, f: number): void {
   const size = Math.min(fitSize * 16, Math.max(fitSize, geom.size * f));
   const k = size / geom.size;
@@ -469,14 +553,17 @@ function zoomAt(x: number, y: number, f: number): void {
 
 // ── Colours ────────────────────────────────────────────────────────────────
 
-interface Colours { cell: string; edge: string; fg: string; muted: string; stray: string; halo: string; good: string; bad: string; mix: number; taps: string[] }
+interface Colours {
+  cell: string; edge: string; fg: string; muted: string; stray: string; halo: string; good: string; bad: string;
+  neg: string; pos: string; mix: number; taps: string[];
+}
 let colours: Colours;
 function readColours(): void {
   const cs = getComputedStyle(document.documentElement);
   const v = (n: string) => cs.getPropertyValue(n).trim();
   colours = {
     cell: v('--cell'), edge: v('--cell-edge'), fg: v('--fg'), muted: v('--muted'), stray: v('--stray'), halo: v('--halo'),
-    good: v('--good'), bad: v('--bad'), mix: Number(v('--type-mix')) || 0.5,
+    good: v('--good'), bad: v('--bad'), neg: v('--neg'), pos: v('--pos'), mix: Number(v('--type-mix')) || 0.5,
     taps: Array.from({ length: N_COLOURS }, (_, k) => v(`--tap${k}`)),
   };
 }
@@ -603,6 +690,48 @@ function addModelChords(P: Uint8Array, own: PlayTap[], solid: Path2D[], stray: P
   }
 }
 
+/** The model being inspected by the channel tiles and the "state" view: the shared one, else the first tap's
+ * own (not shared, or no weights yet) — there is no single board to show once taps run on boards of their own. */
+function activeModel(): StrandNCA | null {
+  return sharedModel ?? taps.find((t) => t.model)?.model ?? null;
+}
+
+/** A channel's name (strand-nca.ts: channel 0 is the mask, 1–6 the edges drawn; the rest are hidden). */
+function channelName(c: number): string {
+  if (c === 0) return 'mask';
+  if (c >= 1 && c <= 6) return `edge ${c - 1}`;
+  return 'hidden';
+}
+
+/** The diverging view's range: the weights' own clamp, else symmetric round zero (web/nca.ts's LO/HI). */
+function clampRange(): [number, number] {
+  return weights?.clamp ?? [-1, 1];
+}
+
+/** Channel `c` of the model being inspected, large, one fill per quantised colour (web/nca.ts's channel view). */
+function drawChannel(c: number, s: number): void {
+  const model = activeModel();
+  if (!model) return;
+  const C = model.C;
+  if (c >= C) return;
+  const [lo, hi] = clampRange();
+  const rp = sharedRamps(colours.cell, colours.cell, colours.neg, colours.pos);
+  const groups = new Map<string, Path2D>();
+  const hs = s * 0.985;
+  for (let i = 0; i < board.n; i++) {
+    const v = model.state[i * model.C + c];
+    const col = css3(rp.div[sharedDivLevel(v, lo, hi) + LEVELS]);
+    let path = groups.get(col);
+    if (!path) groups.set(col, (path = new Path2D()));
+    const [x, y] = centre(board.pos[i]);
+    hexPath(path, x, y, hs);
+  }
+  for (const [col, path] of groups) {
+    ctx.fillStyle = col;
+    ctx.fill(path);
+  }
+}
+
 function draw(): void {
   dirty = false;
   if (bgDirty || !bg) drawBackground();
@@ -614,46 +743,52 @@ function draw(): void {
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   const s = geom.size;
-  // the true strands, thin, underneath
-  if (showTruth) {
-    ctx.lineWidth = Math.max(1.2, s * 0.11);
-    ctx.globalAlpha = 0.8;
-    for (const t of taps) {
-      const path = new Path2D();
-      const st = t.strand;
-      for (let k = 0; k < st.rows.length; k++) {
-        const [x, y] = centre(st.rows[k] * board.w + st.cols[k]);
-        path.moveTo(...edgeMid(x, y, st.ins[k]));
-        path.lineTo(...edgeMid(x, y, st.outs[k]));
+  if (shown !== null) {
+    // the "state" view: one channel of the model being inspected, large, in place of the strands (legend()
+    // carries the matching "spectrum" — the diverging scale's low/0/high swatches).
+    drawChannel(shown, s);
+  } else {
+    // the true strands, thin, underneath
+    if (showTruth) {
+      ctx.lineWidth = Math.max(1.2, s * 0.11);
+      ctx.globalAlpha = 0.8;
+      for (const t of taps) {
+        const path = new Path2D();
+        const st = t.strand;
+        for (let k = 0; k < st.rows.length; k++) {
+          const [x, y] = centre(st.rows[k] * board.w + st.cols[k]);
+          path.moveTo(...edgeMid(x, y, st.ins[k]));
+          path.lineTo(...edgeMid(x, y, st.outs[k]));
+        }
+        ctx.strokeStyle = colours.taps[t.colour];
+        ctx.stroke(path);
       }
-      ctx.strokeStyle = colours.taps[t.colour];
-      ctx.stroke(path);
+      ctx.globalAlpha = 1;
     }
-    ctx.globalAlpha = 1;
+    // what the model draws
+    const solid = taps.map(() => new Path2D());
+    const stray = new Path2D();
+    const strayOf = sharedModel ? null : taps.map(() => new Path2D());
+    if (sharedModel) addModelChords(drawnOf(sharedModel), taps, solid, stray, null);
+    else for (const t of taps) if (t.model) addModelChords(drawnOf(t.model), [t], solid, stray, strayOf);
+    const lw = Math.max(1.6, s * 0.26);
+    ctx.strokeStyle = colours.halo;
+    ctx.lineWidth = lw + Math.max(2, s * 0.14);
+    for (const p of solid) ctx.stroke(p);
+    ctx.stroke(stray);
+    if (strayOf) for (const p of strayOf) ctx.stroke(p);
+    ctx.lineWidth = lw;
+    taps.forEach((t, k) => {
+      ctx.strokeStyle = colours.taps[t.colour];
+      ctx.stroke(solid[k]);
+    });
+    ctx.setLineDash([Math.max(2, s * 0.3), Math.max(2, s * 0.25)]);
+    ctx.lineWidth = Math.max(1.2, s * 0.18);
+    ctx.strokeStyle = colours.stray;
+    ctx.stroke(stray);
+    if (strayOf) taps.forEach((t, k) => { ctx.strokeStyle = colours.taps[t.colour]; ctx.stroke(strayOf[k]); });
+    ctx.setLineDash([]);
   }
-  // what the model draws
-  const solid = taps.map(() => new Path2D());
-  const stray = new Path2D();
-  const strayOf = sharedModel ? null : taps.map(() => new Path2D());
-  if (sharedModel) addModelChords(drawnOf(sharedModel), taps, solid, stray, null);
-  else for (const t of taps) if (t.model) addModelChords(drawnOf(t.model), [t], solid, stray, strayOf);
-  const lw = Math.max(1.6, s * 0.26);
-  ctx.strokeStyle = colours.halo;
-  ctx.lineWidth = lw + Math.max(2, s * 0.14);
-  for (const p of solid) ctx.stroke(p);
-  ctx.stroke(stray);
-  if (strayOf) for (const p of strayOf) ctx.stroke(p);
-  ctx.lineWidth = lw;
-  taps.forEach((t, k) => {
-    ctx.strokeStyle = colours.taps[t.colour];
-    ctx.stroke(solid[k]);
-  });
-  ctx.setLineDash([Math.max(2, s * 0.3), Math.max(2, s * 0.25)]);
-  ctx.lineWidth = Math.max(1.2, s * 0.18);
-  ctx.strokeStyle = colours.stray;
-  ctx.stroke(stray);
-  if (strayOf) taps.forEach((t, k) => { ctx.strokeStyle = colours.taps[t.colour]; ctx.stroke(strayOf[k]); });
-  ctx.setLineDash([]);
   // the taps: a ring on the tapped tile
   for (const t of taps) {
     const [x, y] = centre(t.tap.row * board.w + t.tap.col);
@@ -697,6 +832,7 @@ function setRule(r: Rule, why = ''): void {
   const u = new URL(location.href);
   u.searchParams.set('rule', table.describe(rule));
   history.replaceState(null, '', u);
+  storeRule(rule);
 }
 
 const tapRows = new Map<number, { badge: HTMLElement; sub: HTMLElement }>();
@@ -842,11 +978,120 @@ function mapInfo(): void {
 }
 
 function legend(): void {
+  if (shown !== null) {
+    // The "spectrum": the diverging scale this channel is drawn on (web/nca.ts's channel legend).
+    const [lo, hi] = clampRange();
+    const sw = (colour: string) => `<i class="sw" style="background:${colour}"></i>`;
+    $('legend').innerHTML = [
+      `<span>Board: channel <b>${shown}</b> (${channelName(shown)})</span>`,
+      `<span>${sw(colours.neg)}${fmt(lo)}</span>`,
+      `<span>${sw(colours.cell)}0</span>`,
+      `<span>${sw(colours.pos)}${fmt(hi)}</span>`,
+    ].join('');
+    return;
+  }
   $('legend').innerHTML = [
     '<span><i></i>the network\'s strand (in its tap\'s colour)</span>',
     '<span><i class="thin"></i>the true strand</span>',
     '<span><i class="dash"></i>drawn, on no true strand</span>',
   ].join('');
+}
+
+/** Show channel `c` large on the board (the "state" view), or null back to the ordinary strand/truth view. */
+function show(c: number | null): void {
+  shown = c;
+  for (const t of tiles) t.el.setAttribute('aria-pressed', String(t.index === c));
+  $('showStrands').setAttribute('aria-pressed', String(c === null));
+  legend();
+  dirty = true;
+}
+
+// ── Channel tiles ────────────────────────────────────────────────────────────
+// One small board per state channel of the model being inspected (web/nca.ts's channel tiles): the "grid"
+// view. Click one to show it large on the board instead of the strands (show(), the "state" view).
+
+interface ChannelTile { index: number; el: HTMLButtonElement; cv: HTMLCanvasElement; ctx: CanvasRenderingContext2D; range: HTMLElement; text: string }
+const tiles: ChannelTile[] = [];
+/** Device pixel → on-board cell index (−1 for none), shared by every tile; rebuilt when the tile size or the
+ * board changes (web/nca.ts's `mini`). */
+let mini: { map: Int32Array; img: ImageData; px: Uint32Array; forBoard: Board; w: number; h: number } | null = null;
+
+/** Every channel of the model's weights as a clickable tile (rebuilt on a weights reload or a map change: the
+ * channel count or the board can both change). */
+function buildTiles(): void {
+  const box = $('tiles');
+  box.replaceChildren();
+  tiles.length = 0;
+  mini = null;
+  if (!weights) return;
+  for (let c = 0; c < weights.channels; c++) {
+    const el = document.createElement('button');
+    el.className = 'tile';
+    el.type = 'button';
+    el.title = `Show channel ${c} (${channelName(c)}) on the board`;
+    const cv = document.createElement('canvas');
+    const head = document.createElement('span');
+    head.innerHTML = `<b>${c}</b> <i>${channelName(c)}</i>`;
+    const range = document.createElement('i');
+    el.append(cv, head, range);
+    el.addEventListener('click', () => show(c));
+    box.append(el);
+    tiles.push({ index: c, el, cv, ctx: cv.getContext('2d')!, range, text: '' });
+  }
+  show(shown !== null && shown < weights.channels ? shown : null);
+  gridDirty = true;
+}
+
+function miniLayout(): NonNullable<typeof mini> | null {
+  if (!tiles.length) return null;
+  const rect = tiles[0].cv.getBoundingClientRect();
+  if (rect.width < 4) return null;
+  const dpr = window.devicePixelRatio || 1;
+  const w = Math.round(rect.width * dpr);
+  const h = Math.round(rect.height * dpr);
+  if (mini && mini.forBoard === board && mini.w === w && mini.h === h) return mini;
+  const g = fitMini(rect.width, rect.height, 4);
+  const map = new Int32Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) map[y * w + x] = cellAtGeom(g, (x + 0.5) / dpr, (y + 0.5) / dpr);
+  }
+  for (const t of tiles) {
+    t.cv.width = w;
+    t.cv.height = h;
+  }
+  const img = new ImageData(w, h);
+  return (mini = { map, img, px: new Uint32Array(img.data.buffer), forBoard: board, w, h });
+}
+
+/** Every tile's mini board, from the model being inspected (activeModel): no model yet (no taps, or taps each
+ * on a board of their own with none tapped) just leaves them blank. */
+function drawGrid(): void {
+  const g = miniLayout();
+  if (!g) return;
+  gridDirty = false;
+  const model = activeModel();
+  if (!model) return;
+  const [lo, hi] = clampRange();
+  const rp = sharedRamps(colours.cell, colours.cell, colours.neg, colours.pos);
+  const divLut = rp.div.map(pixel);
+  const tone = new Uint32Array(board.n);
+  const fmtRange = (v: number) => (Math.abs(v) < 0.005 ? '0' : v.toFixed(2));
+  for (const t of tiles) {
+    if (t.index >= model.C) continue;
+    let lo2 = Infinity;
+    let hi2 = -Infinity;
+    for (let i = 0; i < board.n; i++) {
+      const v = model.state[i * model.C + t.index];
+      if (v < lo2) lo2 = v;
+      if (v > hi2) hi2 = v;
+      tone[i] = divLut[sharedDivLevel(v, lo, hi) + LEVELS];
+    }
+    const { map, px } = g;
+    for (let p = 0; p < map.length; p++) px[p] = map[p] < 0 ? 0 : tone[map[p]];
+    t.ctx.putImageData(g.img, 0, 0);
+    const text = `${fmtRange(lo2)} … ${fmtRange(hi2)}`;
+    if (text !== t.text) t.range.textContent = t.text = text;
+  }
 }
 
 // ── Loop ───────────────────────────────────────────────────────────────────
@@ -881,7 +1126,7 @@ function frame(now: number): void {
     if (n) {
       stepsDone += n;
       stepMs += performance.now() - t0;
-      dirty = true;
+      dirty = gridDirty = true;
       if (stepCount() - lastChange >= SETTLE_STEPS) {
         setPlaying(false);
         notice = `Paused: nothing drawn has changed for ${SETTLE_STEPS} steps. Tap a tile, or Run, to carry on.`;
@@ -902,6 +1147,10 @@ function frame(now: number): void {
     else updateTapBadges();
     draw();
     readout();
+  }
+  if (gridDirty && now - lastGrid >= GRID_MS) {
+    drawGrid();
+    lastGrid = now;
   }
   requestAnimationFrame(frame);
 }
@@ -934,7 +1183,7 @@ function setMap(id: string): void {
   const u = new URL(location.href);
   u.searchParams.set('map', mapId);
   history.replaceState(null, '', u);
-  tapsDirty = dirty = true;
+  tapsDirty = dirty = gridDirty = true;
 }
 
 async function fetchWeights(url: string): Promise<{ text: string; w: StrandWeights }> {
@@ -964,25 +1213,32 @@ async function loadAnyWeights(): Promise<void> {
   weightsError = `Could not load any weights: ${errors.join('; ')}.`;
 }
 
-async function reloadWeights(): Promise<void> {
+/** Fetch the weights again and swap them in: the taps stay, every model starts over. `auto` (the "Reload
+ * every 2 minutes" box, web/nca.ts's auto-reload): quiet, and a no-op, when the file hasn't changed. */
+async function reloadWeights(auto = false): Promise<void> {
   const btn = $<HTMLButtonElement>('reloadWeights');
   btn.disabled = true;
   try {
     const { text, w } = await fetchWeights(weightsFrom || DEFAULT_WEIGHTS);
     const changed = text !== weightsText;
-    weights = w;
-    weightsText = text;
-    weightsError = '';
-    if (!canShare() && shared && taps.length > 1) notice = 'These weights take one tap per board: each tap now runs on its own.';
-    buildModels();
-    notice = notice || (changed ? 'New weights loaded: every model starts over.' : 'Weights reloaded (unchanged): every model starts over.');
+    if (!auto || changed) {
+      weights = w;
+      weightsText = text;
+      weightsError = '';
+      if (!canShare() && shared && taps.length > 1) notice = 'These weights take one tap per board: each tap now runs on its own.';
+      buildModels();
+      buildTiles();
+      notice = notice || (changed ? 'New weights loaded: every model starts over.' : 'Weights reloaded (unchanged): every model starts over.');
+      setPlaying(true);
+    }
   } catch (e) {
-    notice = `Could not reload ${weightsFrom}: ${why(e)}. Still the weights loaded before.`;
+    weightsError = `Could not reload ${weightsFrom}: ${why(e)}. Still the weights loaded before.`;
+    if (!auto) notice = weightsError;
   } finally {
     btn.disabled = false;
     modelLine();
     sharedNote();
-    setPlaying(true);
+    readout();
   }
 }
 
@@ -1019,34 +1275,38 @@ $('zoomIn').addEventListener('click', () => zoomAt(cssW / 2, cssH / 2, 1.5));
 $('zoomOut').addEventListener('click', () => zoomAt(cssW / 2, cssH / 2, 1 / 1.5));
 $('zoomFit').addEventListener('click', () => fit());
 
+/** The tile's chords under the current rule, nearest the canvas point (cx, cy) first (point-to-segment
+ * distance): the chord a tap there takes, and — if that one turns out to be blocked (event weights) — the
+ * next nearest to try instead, so a refused tap still lands as close to the click as it can, deterministically
+ * (not the chord table's own order, which cycled through chords on repeat taps near the same spot). */
+function rankChords(row: number, col: number, x: number, y: number): [number, number][] {
+  const p = row * board.w + col;
+  const chords = chordsAt(table, rule, board, row, col);
+  const [cx, cy] = centre(p);
+  const distOf = (ch: [number, number]): number => {
+    const [ax, ay] = edgeMid(cx, cy, ch[0]);
+    const [bx, by] = edgeMid(cx, cy, ch[1]);
+    const vx = bx - ax;
+    const vy = by - ay;
+    const t = Math.max(0, Math.min(1, ((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy)));
+    return (ax + vx * t - x) ** 2 + (ay + vy * t - y) ** 2;
+  };
+  return chords.slice().sort((a, b) => distOf(a) - distOf(b));
+}
+
 /** A tap at a canvas point: the current rule's chord nearest the point, on the tile under it. */
 function tapAtPoint(x: number, y: number): void {
   const p = posAt(x, y);
   if (p < 0) return;
   const row = Math.floor(p / board.w);
   const col = p % board.w;
-  const chords = chordsAt(table, rule, board, row, col);
-  if (!chords.length) {
+  const ranked = rankChords(row, col, x, y);
+  if (!ranked.length) {
     notice = `No chord of ${table.describe(rule)} on that tile (a ${table.leafOrder[board.type(p)]}): try another tile or rule.`;
     readout();
     return;
   }
-  const [cx, cy] = centre(p);
-  let best = chords[0];
-  let bestD = Infinity;
-  for (const ch of chords) {
-    const [ax, ay] = edgeMid(cx, cy, ch[0]);
-    const [bx, by] = edgeMid(cx, cy, ch[1]);
-    const vx = bx - ax;
-    const vy = by - ay;
-    const t = Math.max(0, Math.min(1, ((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy)));
-    const d = (ax + vx * t - x) ** 2 + (ay + vy * t - y) ** 2;
-    if (d < bestD) {
-      bestD = d;
-      best = ch;
-    }
-  }
-  addTap(row, col, best[0], best[1]);
+  addTap(row, col, ranked);
 }
 
 $('ruleUse').addEventListener('click', () => useRuleText());
@@ -1084,7 +1344,7 @@ $('play').addEventListener('click', () => setPlaying(!playing));
 $('step').addEventListener('click', () => {
   setPlaying(false);
   if (hasWork()) stepAll();
-  dirty = true;
+  dirty = gridDirty = true;
 });
 $('reset').addEventListener('click', () => {
   buildModels();
@@ -1106,7 +1366,13 @@ $<HTMLInputElement>('types').addEventListener('change', (ev) => {
   bgDirty = dirty = true;
 });
 $<HTMLSelectElement>('map').addEventListener('change', (ev) => setMap((ev.target as HTMLSelectElement).value));
+$('showStrands').addEventListener('click', () => show(null));
 $('reloadWeights').addEventListener('click', () => void reloadWeights());
+let autoTimer = 0;
+$<HTMLInputElement>('autoReload').addEventListener('change', (ev) => {
+  clearInterval(autoTimer);
+  if ((ev.target as HTMLInputElement).checked) autoTimer = window.setInterval(() => void reloadWeights(true), AUTO_RELOAD_MS);
+});
 document.addEventListener('keydown', (ev) => {
   if (ev.target instanceof HTMLInputElement && ev.target.type === 'text') return;
   if (ev.key === 't' || ev.key === 'T') {
@@ -1123,7 +1389,7 @@ document.addEventListener('keydown', (ev) => {
 new ResizeObserver(() => resize()).observe(canvas);
 const restyle = () => {
   readColours();
-  bgDirty = dirty = tapsDirty = true;
+  bgDirty = dirty = tapsDirty = gridDirty = true;
 };
 window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', restyle);
 new MutationObserver(restyle).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
@@ -1148,10 +1414,11 @@ Object.assign(window, {
       return taps.map((t) => ({ rule: table.describe(t.tap.rule), row: t.tap.row, col: t.tap.col, length: t.strand.rows.length,
         closed: t.strand.closed, drawn: t.drawn, missing: t.missing, stray: t.stray, exact: t.exact, since: t.since, at: t.at }));
     },
-    /** Tap (row, col) with the current rule, as a click would (its nearest chord: the first). */
+    /** Tap (row, col) with the current rule, its chord nearest the cell's own centre (so: its first, for a tile
+     * with no preferred side — a plain, click-free stand-in for tapAtPoint). */
     tap(row: number, col: number) {
       const ch = chordsAt(table, rule, board, row, col);
-      if (ch.length) addTap(row, col, ch[0][0], ch[0][1]);
+      if (ch.length) addTap(row, col, ch);
       return notice;
     },
     setRule(text: string) { const r = table.parse(text); if (typeof r !== 'string') setRule(r); return r; },
@@ -1166,6 +1433,8 @@ legend();
 $<HTMLSelectElement>('map').append(...Object.keys(data.boards).map((id) => new Option(
   `${MAP_LABELS[id] ?? id} (${data.boards[id].tiles.toLocaleString()} tiles)`, id)));
 const ruleParam = params.get('rule');
+/** The sticky selection (localStorage), when the URL does not override it. */
+const storedRule = ruleParam ? null : loadStoredRule();
 if (ruleParam) {
   const r = table.parse(ruleParam);
   if (typeof r === 'string') {
@@ -1173,17 +1442,22 @@ if (ruleParam) {
     $('ruleErr').textContent = `?rule=${ruleParam}: ${r}`;
     $('ruleErr').className = 'note err';
   } else setRule(r);
-} else describeRuleNow();
+} else if (storedRule) {
+  setRule(storedRule);
+} else {
+  describeRuleNow();
+}
 if (weightsName) document.title = `${weightsName} · ${document.title}`;
 void loadAnyWeights().then(() => {
   modelLine();
   const id = params.get('map') ?? 'l3';
-  if (!ruleParam) {
+  if (!ruleParam && !storedRule) {
     board = boardOf(data.boards[id] ? id : 'l3');
     setRule(startingRule());
   }
   setMap(id);
   sharedNote();
+  buildTiles();
   setPlaying(!!weights);
   requestAnimationFrame(frame);
 });

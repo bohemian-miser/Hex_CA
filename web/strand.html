@@ -17,6 +17,9 @@
   --bad: #b8402f;
   --stray: #2a302d;
   --halo: #ffffff;
+  /* The channel view's diverging scale (web/nca.html's --neg/--pos): a state channel's value either side of 0. */
+  --neg: #3d6fb3;
+  --pos: #c4572e;
   /* How much of Spectacle's tile colour a tile shows (the rest is --cell). */
   --type-mix: 0.4;
   /* Each tap's colour, in the order taps are made. */
@@ -30,7 +33,7 @@
   :root:not([data-theme="light"]) {
     --bg: #131816; --panel: #1a201d; --fg: #e3ebe6; --muted: #93a39b; --hair: #2c3631;
     --accent: #4fd1b0; --cell: #222a26; --cell-edge: #3a4741; --good: #5cc98a; --bad: #ef7a64;
-    --stray: #e3ebe6; --halo: #131816; --type-mix: 0.3;
+    --stray: #e3ebe6; --halo: #131816; --type-mix: 0.3; --neg: #6f9fe0; --pos: #ec8a5e;
     --tap0: #ff6f9c; --tap1: #5aa9ff; --tap2: #ffab4a; --tap3: #b88cff;
     --tap4: #4fe0c6; --tap5: #ff8a65; --tap6: #8f9bff; --tap7: #c6dd4f;
     color-scheme: dark;
@@ -39,7 +42,7 @@
 :root[data-theme="dark"] {
   --bg: #131816; --panel: #1a201d; --fg: #e3ebe6; --muted: #93a39b; --hair: #2c3631;
   --accent: #4fd1b0; --cell: #222a26; --cell-edge: #3a4741; --good: #5cc98a; --bad: #ef7a64;
-  --stray: #e3ebe6; --halo: #131816; --type-mix: 0.3;
+  --stray: #e3ebe6; --halo: #131816; --type-mix: 0.3; --neg: #6f9fe0; --pos: #ec8a5e;
   --tap0: #ff6f9c; --tap1: #5aa9ff; --tap2: #ffab4a; --tap3: #b88cff;
   --tap4: #4fe0c6; --tap5: #ff8a65; --tap6: #8f9bff; --tap7: #c6dd4f;
   color-scheme: dark;
@@ -53,9 +56,10 @@ header p { margin: 0; color: var(--muted); max-width: 75ch; }
 header p.model { color: var(--fg); font: 13px/1.5 var(--mono); overflow-wrap: anywhere; }
 header p.model .err { color: var(--bad); display: block; }
 a { color: var(--accent); }
-.bench { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; align-items: start; }
-@media (max-width: 860px) { .bench { grid-template-columns: minmax(0, 1fr); } }
-.stage-col { display: grid; gap: 8px; min-width: 0; }
+.bench { display: grid; grid-template-columns: minmax(0, 1fr) 320px; grid-template-areas: "stage side" "channels side"; gap: 20px; align-items: start; }
+@media (max-width: 860px) { .bench { grid-template-columns: minmax(0, 1fr); grid-template-areas: "stage" "side" "channels"; } }
+.stage-col { grid-area: stage; display: grid; gap: 8px; min-width: 0; }
+.channels { grid-area: channels; }
 .status { font: 500 14px/1.4 var(--body); min-height: 2.8em; }
 .status b { color: var(--accent); font-weight: 500; }
 .status .warn { color: var(--bad); }
@@ -64,7 +68,7 @@ a { color: var(--accent); }
 .stage canvas.panning { cursor: grabbing; }
 .zoom { position: absolute; right: 8px; top: 8px; display: flex; gap: 4px; }
 .zoom button { padding: 4px 9px; font: 500 14px/1 var(--mono); }
-.side { display: grid; gap: 16px; min-width: 0; }
+.side { grid-area: side; display: grid; gap: 16px; min-width: 0; }
 .group { display: grid; gap: 9px; min-width: 0; }
 .group[hidden] { display: none; }
 .label { font: 500 11px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.09em; color: var(--muted); }
@@ -74,6 +78,7 @@ button, select { cursor: pointer; }
 input[type=text] { font: 400 14px/1 var(--mono); min-width: 0; flex: 1; }
 button:hover, select:hover, input[type=text]:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: var(--bg); }
+button[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
 button:disabled { opacity: 0.4; cursor: not-allowed; }
 button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .row { display: flex; align-items: center; gap: 8px; min-width: 0; }
@@ -110,7 +115,15 @@ dl.readout dd { margin: 0; text-align: right; }
 .legend i { display: inline-block; width: 18px; height: 0; border-top: 3px solid var(--fg); }
 .legend i.thin { border-top-width: 1px; opacity: 0.6; }
 .legend i.dash { border-top-style: dashed; border-top-color: var(--stray); }
+.legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; border: 1px solid var(--hair); }
 kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair); border-radius: 3px; padding: 0 4px; }
+/* Channel tiles (web/nca.html's): one small board per state channel of the trained model being inspected,
+   click to show it large on the board in place of the strands (the "state" view). */
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; }
+.tile { display: grid; gap: 4px; padding: 5px; text-align: left; font: 12px/1.2 var(--mono); min-width: 0; }
+.tile canvas { display: block; width: 100%; aspect-ratio: 1 / 0.92; cursor: pointer; }
+.tile b { font-weight: 500; }
+.tile i { font-style: normal; color: var(--muted); }
 </style>
 <div class="wrap">
   <header>
@@ -139,6 +152,7 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
         <div class="buttons">
           <button id="reloadWeights" title="Fetch the weights again and swap them in: the taps stay, the state starts over">Reload weights</button>
         </div>
+        <label class="check"><input type="checkbox" id="autoReload"> Reload every 2 minutes (if they changed)</label>
       </div>
       <div class="group">
         <div class="label">Board</div>
@@ -188,8 +202,18 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
         <label class="check"><input type="checkbox" id="truth" checked><span>True strands underneath <kbd>T</kbd></span></label>
         <label class="check"><input type="checkbox" id="types" checked><span>Tile types and rotation</span></label>
       </div>
+      <div class="group">
+        <div class="label">Show</div>
+        <div class="buttons">
+          <button id="showStrands" aria-pressed="true">Strands</button>
+        </div>
+      </div>
       <dl class="readout" id="readout"></dl>
       <p class="note" id="meta"></p>
+    </div>
+    <div class="group channels">
+      <div class="label">Channels: click one to show its state on the board</div>
+      <div class="tiles" id="tiles"></div>
     </div>
   </div>
 </div>
