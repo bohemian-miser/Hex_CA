@@ -5,6 +5,7 @@
 //   dist/nca.html     the trained NCA (web/nca.ts, weights bundled in) as a whole document
 //   dist/strand.html  the trained strand NCA (web/strand.ts, the boards and rule table bundled in), and
 //   dist/strand-weights.json  its default weights (web/strand-weights.json), fetched by the page
+//   dist/game.html    the hybrid game (web/game.ts: the line CA, the flood's weights and the boards bundled in)
 import { build } from 'esbuild';
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 
@@ -60,6 +61,10 @@ writeFileSync('dist/strand.html', documentOf(strand,
   'A neural cellular automaton on Spectacle\'s hex fields, trained to draw the strand of a tapped tile under a rule it is told only at the tap.'));
 copyFileSync('web/strand-weights.json', 'dist/strand-weights.json');
 
-for (const f of ['dist/hex-ca.html', 'dist/index.html', 'dist/nca.html', 'dist/strand.html', 'dist/strand-weights.json']) {
+const game = await bundle('web/game.html', 'web/game.ts');
+writeFileSync('dist/game.html', documentOf(game,
+  'Spectacle as a cellular automaton: lines grown tile to tile by hand-written local rules, the area they close off filled by a trained neural flood fill.'));
+
+for (const f of ['dist/hex-ca.html', 'dist/index.html', 'dist/nca.html', 'dist/strand.html', 'dist/strand-weights.json', 'dist/game.html']) {
   console.log(`${f} ${(readFileSync(f).length / 1024).toFixed(1)} KB`);
 }

@@ -18,6 +18,10 @@ import {
 } from '../src/ramp.js';
 import { allStrands, Board, PAIRS, RuleTable, walk, type Rule, type Strand, type StrandData } from '../src/strand.js';
 import { StrandNCA, chordsAt, loadStrandWeights, type StrandWeights, type Tap } from '../src/strand-nca.js';
+import {
+  axialAt, bounds, cssRgb as rgbOf, drawTiles, edgeMid as sharedEdgeMid, fitGeom, hexPath, rankChords as sharedRankChords,
+  strandPaths, strokePattern, unitCentre as axialCentre, type Geom,
+} from '../src/draw.js';
 
 const data = dataJson as unknown as StrandData;
 const table = new RuleTable(data);
@@ -34,12 +38,6 @@ const FRAME_MS = 14;
 const SETTLE_STEPS = 120;
 /** Past this many ms a step, the status line says why the board grows slowly. */
 const SLOW_MS = 120;
-const SQ3 = Math.sqrt(3);
-/** Spectacle's tile colours (shared/tiles/colors.ts PALETTE_BRIGHT), by leaf type. */
-const TYPE_RGB: Record<string, [number, number, number]> = {
-  Delta: [220, 220, 220], Theta: [255, 191, 191], Lambda: [255, 160, 122], Xi: [255, 242, 0], Pi: [135, 206, 250],
-  Sigma: [245, 245, 220], Phi: [0, 255, 0], Psi: [0, 255, 255], Gamma: [255, 255, 255],
-};
 const MAP_LABELS: Record<string, string> = { l2: 'Level 2', l3: 'Level 3', l4: 'Level 4' };
 const N_COLOURS = 8;
 /** localStorage: the last rule picked (sticky across visits; ?rule= still wins). */
@@ -540,7 +538,6 @@ function evaluate(): void {
 
 // ── Geometry ───────────────────────────────────────────────────────────────
 
-interface Geom { size: number; ox: number; oy: number }
 let geom: Geom = { size: 10, ox: 0, oy: 0 };
 let fitSize = 10;
 let cssW = 1;
@@ -548,9 +545,7 @@ let cssH = 1;
 
 /** A board position's centre with unit cell size, origin at (0, 0). */
 function unitCentre(p: number): [number, number] {
-  const row = Math.floor(p / board.w);
-  const col = p % board.w;
-  return [SQ3 * (col + row / 2), 1.5 * row];
+  return axialCentre(p % board.w, Math.floor(p / board.w));
 }
 
 function centre(p: number): [number, number] {
@@ -560,22 +555,17 @@ function centre(p: number): [number, number] {
 
 /** The midpoint of edge d of a cell centred at (x, y): direction d sits at -60·d degrees. */
 function edgeMid(x: number, y: number, d: number, f = 1): [number, number] {
-  const a = (-Math.PI / 3) * d;
-  const r = geom.size * (SQ3 / 2) * f;
-  return [x + r * Math.cos(a), y + r * Math.sin(a)];
+  return sharedEdgeMid(x, y, d, geom.size, f);
+}
+
+/** The unit-centre box of the board's cells. */
+function boardBounds() {
+  return bounds((add) => { for (let i = 0; i < board.n; i++) add(board.pos[i] % board.w, Math.floor(board.pos[i] / board.w)); });
 }
 
 function fit(): void {
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (let i = 0; i < board.n; i++) {
-    const [x, y] = unitCentre(board.pos[i]);
-    minX = Math.min(minX, x); maxX = Math.max(maxX, x);
-    minY = Math.min(minY, y); maxY = Math.max(maxY, y);
-  }
-  const pad = 12;
-  const size = Math.max(0.5, Math.min((cssW - 2 * pad) / (maxX - minX + SQ3), (cssH - 2 * pad) / (maxY - minY + 2)));
-  fitSize = size;
-  geom = { size, ox: cssW / 2 - (size * (minX + maxX)) / 2, oy: cssH / 2 - (size * (minY + maxY)) / 2 };
+  geom = fitGeom(boardBounds(), cssW, cssH, 2 * 12);
+  fitSize = geom.size;
   bgDirty = dirty = true;
 }
 
@@ -597,17 +587,7 @@ function resize(): void {
 
 /** The board position under a canvas point in geometry `g`, or -1. */
 function posAtGeom(g: Geom, x: number, y: number): number {
-  const fr = (y - g.oy) / (1.5 * g.size);
-  const fq = (x - g.ox) / (SQ3 * g.size) - fr / 2;
-  const fs = -fq - fr;
-  let q = Math.round(fq);
-  let r = Math.round(fr);
-  const s = Math.round(fs);
-  const dq = Math.abs(q - fq);
-  const dr = Math.abs(r - fr);
-  const ds = Math.abs(s - fs);
-  if (dq > dr && dq > ds) q = -r - s;
-  else if (dr > ds) r = -q - s;
+  const [q, r] = axialAt(g, x, y);
   return board.on(r, q) ? r * board.w + q : -1;
 }
 
@@ -626,16 +606,7 @@ function cellAtGeom(g: Geom, x: number, y: number): number {
 /** The largest hexagon-cell grid that fits a w×h box with `pad` to spare, centred on the board's own cells
  * (fit()'s formula, parametrised for a small tile canvas rather than the main view). */
 function fitMini(w: number, h: number, pad: number): Geom {
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (let i = 0; i < board.n; i++) {
-    const [x, y] = unitCentre(board.pos[i]);
-    if (x < minX) minX = x;
-    if (x > maxX) maxX = x;
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
-  }
-  const size = Math.max(0.5, Math.min((w - pad) / (maxX - minX + SQ3), (h - pad) / (maxY - minY + 2)));
-  return { size, ox: w / 2 - (size * (minX + maxX)) / 2, oy: h / 2 - (size * (minY + maxY)) / 2 };
+  return fitGeom(boardBounds(), w, h, pad);
 }
 
 function zoomAt(x: number, y: number, f: number): void {
@@ -686,17 +657,7 @@ function ensurePatternPaths(): PatternPaths {
   const rs = ensureRuleStrands();
   const key = `${rs.key}|${geom.size.toFixed(6)}|${geom.ox.toFixed(3)}|${geom.oy.toFixed(3)}`;
   if (patternPaths && patternPaths.key === key) return patternPaths;
-  const solid = new Path2D();
-  const dash = new Path2D();
-  for (const st of rs.strands) {
-    const path = st.closed ? solid : dash;
-    for (let k = 0; k < st.rows.length; k++) {
-      const [x, y] = centre(st.rows[k] * board.w + st.cols[k]);
-      path.moveTo(...edgeMid(x, y, st.ins[k]));
-      path.lineTo(...edgeMid(x, y, st.outs[k]));
-    }
-  }
-  return (patternPaths = { key, solid, dash });
+  return (patternPaths = { key, ...strandPaths(rs.strands, geom) });
 }
 
 /** Turn the whole-rule pattern overlay on or off: persists across visits (localStorage, try/catch) and
@@ -730,28 +691,10 @@ function readColours(): void {
   };
 }
 
-function rgbOf(css: string): [number, number, number] {
-  const m = /^#([0-9a-f]{6})$/i.exec(css);
-  if (m) { const n = parseInt(m[1], 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; }
-  const nums = css.match(/[\d.]+/g)?.map(Number) ?? [255, 255, 255];
-  return [nums[0], nums[1], nums[2]];
-}
-
 // ── Drawing ────────────────────────────────────────────────────────────────
 
 let bg: HTMLCanvasElement | null = null;
 let bgDirty = true;
-
-function hexPath(path: Path2D, x: number, y: number, s: number): void {
-  for (let k = 0; k < 6; k++) {
-    const a = (Math.PI / 180) * (60 * k - 30);
-    const px = x + s * Math.cos(a);
-    const py = y + s * Math.sin(a);
-    if (k === 0) path.moveTo(px, py);
-    else path.lineTo(px, py);
-  }
-  path.closePath();
-}
 
 /** The tiles: Spectacle's type colours (or plain), outlines, and each tile's rotation (a dart at local edge 0,
  * as Spectacle's board draws it) once there is room. Cached; redrawn on a view, board or theme change. */
@@ -763,49 +706,8 @@ function drawBackground(): void {
   const g = bg.getContext('2d')!;
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, cssW, cssH);
-  const cell = rgbOf(colours.cell);
-  const groups = new Map<string, Path2D>();
-  const s = geom.size * 0.985;
-  const outline = new Path2D();
-  const darts = new Path2D();
-  for (let i = 0; i < board.n; i++) {
-    const p = board.pos[i];
-    const [x, y] = centre(p);
-    if (x < -geom.size || y < -geom.size || x > cssW + geom.size || y > cssH + geom.size) continue;
-    let fill = colours.cell;
-    if (showTypes) {
-      const c = TYPE_RGB[table.leafOrder[board.type(p)]] ?? [255, 255, 255];
-      const m = colours.mix;
-      fill = `rgb(${c.map((v, k) => Math.round(cell[k] + (v - cell[k]) * m)).join(' ')})`;
-    }
-    let path = groups.get(fill);
-    if (!path) groups.set(fill, (path = new Path2D()));
-    hexPath(path, x, y, s);
-    if (geom.size > 5) hexPath(outline, x, y, s);
-    if (showTypes && geom.size >= 9) {
-      const d = board.edgeDir(p, 0);
-      const [tx, ty] = edgeMid(x, y, d, 0.62);
-      const a = (-Math.PI / 3) * d;
-      const bx = x + geom.size * 0.12 * Math.cos(a);
-      const by = y + geom.size * 0.12 * Math.sin(a);
-      const w = geom.size * 0.17;
-      darts.moveTo(tx, ty);
-      darts.lineTo(bx - w * Math.sin(a), by + w * Math.cos(a));
-      darts.lineTo(bx + w * Math.sin(a), by - w * Math.cos(a));
-      darts.closePath();
-    }
-  }
-  for (const [fill, path] of groups) {
-    g.fillStyle = fill;
-    g.fill(path);
-  }
-  g.strokeStyle = colours.edge;
-  g.lineWidth = 0.6;
-  g.stroke(outline);
-  g.globalAlpha = 0.35;
-  g.fillStyle = colours.muted;
-  g.fill(darts);
-  g.globalAlpha = 1;
+  drawTiles(g, board, table.leafOrder, geom, cssW, cssH,
+    { types: showTypes, cell: colours.cell, edge: colours.edge, muted: colours.muted, mix: colours.mix });
   bgDirty = false;
 }
 
@@ -949,20 +851,7 @@ function drawSuper(s: number): void {
  * saturated tile, the same casing the taps' own strands get. */
 function drawRulePattern(s: number): void {
   if (!showPattern) return;
-  const { solid, dash } = ensurePatternPaths();
-  ctx.strokeStyle = colours.halo;
-  ctx.globalAlpha = 0.5;
-  ctx.lineWidth = Math.max(2, s * 0.14);
-  ctx.stroke(solid);
-  ctx.stroke(dash);
-  ctx.strokeStyle = colours.muted;
-  ctx.globalAlpha = 0.6;
-  ctx.lineWidth = Math.max(1, s * 0.07);
-  ctx.stroke(solid);
-  ctx.setLineDash([Math.max(2, s * 0.22), Math.max(2, s * 0.18)]);
-  ctx.stroke(dash);
-  ctx.setLineDash([]);
-  ctx.globalAlpha = 1;
+  strokePattern(ctx, ensurePatternPaths(), s, colours.halo, colours.muted);
 }
 
 /** The true strands, thin, underneath, and what the model actually draws on top of them: the ordinary
@@ -1560,18 +1449,8 @@ $('zoomFit').addEventListener('click', () => fit());
  * next nearest to try instead, so a refused tap still lands as close to the click as it can, deterministically
  * (not the chord table's own order, which cycled through chords on repeat taps near the same spot). */
 function rankChords(row: number, col: number, x: number, y: number): [number, number][] {
-  const p = row * board.w + col;
-  const chords = chordsAt(table, rule, board, row, col);
-  const [cx, cy] = centre(p);
-  const distOf = (ch: [number, number]): number => {
-    const [ax, ay] = edgeMid(cx, cy, ch[0]);
-    const [bx, by] = edgeMid(cx, cy, ch[1]);
-    const vx = bx - ax;
-    const vy = by - ay;
-    const t = Math.max(0, Math.min(1, ((x - ax) * vx + (y - ay) * vy) / (vx * vx + vy * vy)));
-    return (ax + vx * t - x) ** 2 + (ay + vy * t - y) ** 2;
-  };
-  return chords.slice().sort((a, b) => distOf(a) - distOf(b));
+  const [cx, cy] = centre(row * board.w + col);
+  return sharedRankChords(chordsAt(table, rule, board, row, col), cx, cy, geom.size, x, y);
 }
 
 /** A tap at a canvas point: the current rule's chord nearest the point, on the tile under it. */

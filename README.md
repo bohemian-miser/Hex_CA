@@ -195,8 +195,11 @@ src/lines.ts    random pictures for tests and the demo (loops, bridges, scribble
 tests/          vitest: oracle, fill, fuzz, overshoot, engine, field, garbage, rotate
 src/strand.ts   Spectacle's strand rules on its hex fields: rule table, split, rendering, walker
 src/strand-nca.ts  the trained strand NCAs (FrameNCA, StrandNCA, v1) in TypeScript
-web/            the demo page (page.html + main.ts), the trained NCA's page (nca.html + nca.ts) and the strand
-                page (strand.html + strand.ts), bundled by scripts/build-web.ts
+src/draw.ts     hex drawing and pointer maths the pages share (fit, cell under a point, chord ranking, tiles)
+src/game/       the hybrid game (docs/spectacle-ca-hybrid.md): host.ts, the referee; stubs/ until the line CA
+                and the area layer land
+web/            the demo page (page.html + main.ts), the trained NCA's page (nca.html + nca.ts), the strand
+                page (strand.html + strand.ts) and the game (game.html + game.ts), bundled by scripts/build-web.ts
 scripts/bench.ts  settle steps / ms / µs-per-update at three field sizes
 .github/        CI on pull requests; build and deploy to Pages from main
 ```
@@ -377,6 +380,17 @@ https://storage.googleapis.com/recipe-lanes-staging-hexca-runs/dash/index.html
 The hybrid's code paths (`--floods`, `--aux`, `--teach`, pooled-max/min
 perception) still exist behind flags — `nca/train.py`'s docstring has the
 exact v4/v5/v6 recipes — but nothing shipped uses them now.
+
+## Spectacle as a CA: the game
+
+**Play:** https://bohemian-miser.github.io/Hex_CA/game.html. The design is `docs/spectacle-ca-hybrid.md`: the
+lines are a hand-written local CA (every edge, chord, collision and wipe decided by a tile from itself and its six
+neighbours), and each player's area is the trained flood fill with that player's lines as its walls. Players sit
+at one screen: select one (keys 1-8) and tap for them; each has a rule of their own, sticky across visits. Score =
+the tiles your lines are on + the tiles your flood fills for you alone. Knobs: growth until a line stops or a few
+chords per tap (`fuel`), one-way taps, speed, flood steps per line step; boards are Spectacle's hex levels 2-4
+(the flood is ~30-50 ms a step per player at level 3 on a Pi's CPU, so areas fill in over seconds there).
+`?map=l2|l3|l4`, `?rules=<rule>,<rule>` (one per seat).
 
 ## Strand NCA: Spectacle's lines, grown by a network
 
