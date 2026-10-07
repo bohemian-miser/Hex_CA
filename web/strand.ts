@@ -13,7 +13,8 @@
 
 import dataJson from './strand-data.json';
 import {
-  css3, divLevel as sharedDivLevel, LEVELS, pixel, ramps as sharedRamps,
+  css3, divLevel as sharedDivLevel, fitPca3, hslRgb, hueBlend, LEVELS, pcaColour, pixel,
+  ramps as sharedRamps, type Pca3,
 } from '../src/ramp.js';
 import { Board, PAIRS, RuleTable, walk, type Rule, type Strand, type StrandData } from '../src/strand.js';
 import { StrandNCA, chordsAt, loadStrandWeights, type StrandWeights, type Tap } from '../src/strand-nca.js';
@@ -99,12 +100,82 @@ let dirty = true;
 let tapsDirty = true;
 /** The tap owning each cell, for strays on a shared board: the nearest tap's strand (BFS over cells). */
 let owner = new Int16Array(0);
-/** The channel shown large on the board in place of the strands (web/nca.ts's `shown`), or null for the
- * ordinary strand/truth view. */
-let shown: number | null = null;
+/** The channel shown large on the board in place of the strands (web/nca.ts's `shown`), 'super' for every
+ * selected channel folded into one picture, or null for the ordinary strand/truth view. */
+type ShownView = number | 'super' | null;
+let shown: ShownView = null;
 /** The channel tiles (one per state channel of the model being inspected) redraw at most this often. */
 let gridDirty = true;
 let lastGrid = 0;
+
+// ── Superimposed view: every (hidden) channel folded into one picture ───────
+// See web/nca.ts's twin of this section for the rationale: PCA's top 3 directions of spread, by default, or
+// an additive hue-per-channel blend as an alternative. Here "hidden" means every channel but the mask (0) and
+// the 6 edges the model draws (1-6) — channelName()'s own split.
+type SuperScope = 'hidden' | 'all' | 'noEdges';
+type SuperMode = 'pca' | 'hue';
+let superScope: SuperScope = 'hidden';
+let superMode: SuperMode = 'pca';
+let superOverlay = true;
+let superBasis: Pca3 | null = null;
+let superHues: [number, number, number][] = [];
+let superFitStep = -1;
+const SUPER_REFIT_STEPS = 50;
+/** Snap step for the superimposed view's colours (RGB units), same idea as the quantised ramps: a frame fills
+ * one path per colour, not one per cell. */
+const SUPER_RGB_STEP = 8;
+
+/** localStorage: whether the superimposed view was picked last (sticky across visits; ?view= still wins). */
+const VIEW_STORAGE_KEY = 'hexca.strand.view';
+function loadStoredView(): 'super' | null {
+  try {
+    return localStorage.getItem(VIEW_STORAGE_KEY) === 'super' ? 'super' : null;
+  } catch {
+    return null; // private window, or site data cleared/blocked: just not sticky
+  }
+}
+function storeView(v: 'super' | null): void {
+  try {
+    if (v) localStorage.setItem(VIEW_STORAGE_KEY, v);
+    else localStorage.removeItem(VIEW_STORAGE_KEY);
+  } catch {
+    // ditto: the choice just isn't sticky across visits
+  }
+}
+
+/** The channels the superimposed view blends, under the current scope, for a model with `C` channels. */
+function superChannels(C: number): number[] {
+  const out: number[] = [];
+  for (let c = 0; c < C; c++) {
+    if (superScope === 'hidden' && c <= 6) continue; // 0 mask, 1-6 edges
+    if (superScope === 'noEdges' && c >= 1 && c <= 6) continue;
+    out.push(c);
+  }
+  return out;
+}
+
+/** Hue mode's fixed hue per selected channel (by position, not channel number): recomputed only when the
+ * selection changes, not per frame. */
+function refreshSuperHues(C: number): void {
+  const n = superChannels(C).length;
+  superHues = Array.from({ length: n }, (_, i) => hslRgb((360 * i) / Math.max(1, n), 75, 55));
+}
+
+/** Refits the PCA basis if it is missing, or `force`, or it has been SUPER_REFIT_STEPS since the last fit. */
+function fitSuperBasis(model: StrandNCA, force = false): void {
+  if (superMode !== 'pca') return;
+  if (!force && superBasis && model.steps - superFitStep < SUPER_REFIT_STEPS) return;
+  const sel = superChannels(model.C);
+  if (!sel.length) {
+    superBasis = null;
+    return;
+  }
+  const C = model.C;
+  const st = model.state;
+  const cells = Int32Array.from({ length: board.n }, (_, i) => i);
+  superBasis = fitPca3((i, k) => st[i * C + sel[k]], sel.length, cells, superBasis ?? undefined);
+  superFitStep = model.steps;
+}
 
 const why = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const fmt = (x: number | undefined | null, d = 2) => (typeof x === 'number' ? x.toFixed(d) : '–');
@@ -169,6 +240,8 @@ function buildModels(): void {
   for (const t of taps) t.since = null;
   lastChange = 0;
   drawnKey = 0;
+  superBasis = null; // a fresh model: last fit's basis no longer applies
+  superFitStep = -1;
   dirty = tapsDirty = gridDirty = true;
 }
 
@@ -732,6 +805,100 @@ function drawChannel(c: number, s: number): void {
   }
 }
 
+/** Every selected channel of the model being inspected, folded into one picture (the "super" view): PCA's top
+ * 3 directions of spread → red/green/blue (the default — refit every SUPER_REFIT_STEPS steps, or on demand),
+ * or each channel its own fixed hue, weighted by |value| and added together. */
+function drawSuper(s: number): void {
+  const model = activeModel();
+  if (!model) return;
+  const C = model.C;
+  const sel = superChannels(C);
+  const hs = s * 0.985;
+  const groups = new Map<string, Path2D>();
+  const snap = (x: number) => Math.max(0, Math.min(255, Math.round(x / SUPER_RGB_STEP) * SUPER_RGB_STEP));
+  const addCell = (i: number, rgb: readonly [number, number, number]) => {
+    const col = css3([snap(rgb[0]), snap(rgb[1]), snap(rgb[2])]);
+    let path = groups.get(col);
+    if (!path) groups.set(col, (path = new Path2D()));
+    const [x, y] = centre(board.pos[i]);
+    hexPath(path, x, y, hs);
+  };
+  const bg = rgbOf(colours.cell);
+  if (!sel.length) {
+    for (let i = 0; i < board.n; i++) addCell(i, bg);
+  } else if (superMode === 'pca') {
+    fitSuperBasis(model);
+    const basis = superBasis;
+    const st = model.state;
+    const row = new Float64Array(sel.length);
+    for (let i = 0; i < board.n; i++) {
+      if (!basis) {
+        addCell(i, bg);
+        continue;
+      }
+      for (let k = 0; k < sel.length; k++) row[k] = st[i * C + sel[k]];
+      addCell(i, pcaColour(basis, row));
+    }
+  } else {
+    const [, hi] = clampRange();
+    const span = Math.max(1e-6, hi);
+    const st = model.state;
+    const hueWeights = new Array<number>(sel.length);
+    for (let i = 0; i < board.n; i++) {
+      for (let k = 0; k < sel.length; k++) hueWeights[k] = Math.min(1, Math.abs(st[i * C + sel[k]]) / span);
+      addCell(i, hueBlend(hueWeights, superHues, bg));
+    }
+  }
+  for (const [col, path] of groups) {
+    ctx.fillStyle = col;
+    ctx.fill(path);
+  }
+}
+
+/** The true strands, thin, underneath, and what the model actually draws on top of them: the ordinary
+ * "strands" view, and — when superOverlay is on — layered over the superimposed view too. */
+function drawStrandsOverlay(s: number): void {
+  if (showTruth) {
+    ctx.lineWidth = Math.max(1.2, s * 0.11);
+    ctx.globalAlpha = 0.8;
+    for (const t of taps) {
+      const path = new Path2D();
+      const st = t.strand;
+      for (let k = 0; k < st.rows.length; k++) {
+        const [x, y] = centre(st.rows[k] * board.w + st.cols[k]);
+        path.moveTo(...edgeMid(x, y, st.ins[k]));
+        path.lineTo(...edgeMid(x, y, st.outs[k]));
+      }
+      ctx.strokeStyle = colours.taps[t.colour];
+      ctx.stroke(path);
+    }
+    ctx.globalAlpha = 1;
+  }
+  // what the model draws
+  const solid = taps.map(() => new Path2D());
+  const stray = new Path2D();
+  const strayOf = sharedModel ? null : taps.map(() => new Path2D());
+  if (sharedModel) addModelChords(drawnOf(sharedModel), taps, solid, stray, null);
+  else for (const t of taps) if (t.model) addModelChords(drawnOf(t.model), [t], solid, stray, strayOf);
+  const lw = Math.max(1.6, s * 0.26);
+  ctx.strokeStyle = colours.halo;
+  ctx.lineWidth = lw + Math.max(2, s * 0.14);
+  for (const p of solid) ctx.stroke(p);
+  ctx.stroke(stray);
+  if (strayOf) for (const p of strayOf) ctx.stroke(p);
+  ctx.lineWidth = lw;
+  taps.forEach((t, k) => {
+    ctx.strokeStyle = colours.taps[t.colour];
+    ctx.stroke(solid[k]);
+  });
+  ctx.setLineDash([Math.max(2, s * 0.3), Math.max(2, s * 0.25)]);
+  ctx.lineWidth = Math.max(1.2, s * 0.18);
+  ctx.strokeStyle = colours.stray;
+  ctx.stroke(stray);
+  if (strayOf) taps.forEach((t, k) => { ctx.strokeStyle = colours.taps[t.colour]; ctx.stroke(strayOf[k]); });
+  ctx.setLineDash([]);
+}
+
 function draw(): void {
   dirty = false;
   if (bgDirty || !bg) drawBackground();
@@ -743,51 +910,17 @@ function draw(): void {
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   const s = geom.size;
-  if (shown !== null) {
+  if (shown === 'super') {
+    // every selected channel folded into one picture; optionally the strands drawn on top, same as "strands"
+    drawSuper(s);
+    if (superOverlay) drawStrandsOverlay(s);
+  } else if (shown !== null) {
     // the "state" view: one channel of the model being inspected, large, in place of the strands (legend()
     // carries the matching "spectrum" — the diverging scale's low/0/high swatches).
     drawChannel(shown, s);
   } else {
-    // the true strands, thin, underneath
-    if (showTruth) {
-      ctx.lineWidth = Math.max(1.2, s * 0.11);
-      ctx.globalAlpha = 0.8;
-      for (const t of taps) {
-        const path = new Path2D();
-        const st = t.strand;
-        for (let k = 0; k < st.rows.length; k++) {
-          const [x, y] = centre(st.rows[k] * board.w + st.cols[k]);
-          path.moveTo(...edgeMid(x, y, st.ins[k]));
-          path.lineTo(...edgeMid(x, y, st.outs[k]));
-        }
-        ctx.strokeStyle = colours.taps[t.colour];
-        ctx.stroke(path);
-      }
-      ctx.globalAlpha = 1;
-    }
-    // what the model draws
-    const solid = taps.map(() => new Path2D());
-    const stray = new Path2D();
-    const strayOf = sharedModel ? null : taps.map(() => new Path2D());
-    if (sharedModel) addModelChords(drawnOf(sharedModel), taps, solid, stray, null);
-    else for (const t of taps) if (t.model) addModelChords(drawnOf(t.model), [t], solid, stray, strayOf);
-    const lw = Math.max(1.6, s * 0.26);
-    ctx.strokeStyle = colours.halo;
-    ctx.lineWidth = lw + Math.max(2, s * 0.14);
-    for (const p of solid) ctx.stroke(p);
-    ctx.stroke(stray);
-    if (strayOf) for (const p of strayOf) ctx.stroke(p);
-    ctx.lineWidth = lw;
-    taps.forEach((t, k) => {
-      ctx.strokeStyle = colours.taps[t.colour];
-      ctx.stroke(solid[k]);
-    });
-    ctx.setLineDash([Math.max(2, s * 0.3), Math.max(2, s * 0.25)]);
-    ctx.lineWidth = Math.max(1.2, s * 0.18);
-    ctx.strokeStyle = colours.stray;
-    ctx.stroke(stray);
-    if (strayOf) taps.forEach((t, k) => { ctx.strokeStyle = colours.taps[t.colour]; ctx.stroke(strayOf[k]); });
-    ctx.setLineDash([]);
+    // the true strands, thin, underneath, and what the model draws on top
+    drawStrandsOverlay(s);
   }
   // the taps: a ring on the tapped tile
   for (const t of taps) {
@@ -977,8 +1110,20 @@ function mapInfo(): void {
     + `${mapId === 'l4' ? ' (the models trained on levels 2 and 3; this one is ~8× the work of level 3 a step)' : ''}.`;
 }
 
+/** What the scope select includes, for the legend's one-line explanation. */
+function scopeLabel(): string {
+  return superScope === 'hidden' ? 'the hidden channels' : superScope === 'all' ? 'every channel' : 'every channel but the 6 edges';
+}
+
 function legend(): void {
-  if (shown !== null) {
+  if (shown === 'super') {
+    $('legend').innerHTML = superMode === 'pca'
+      ? [`<span>Superimposed: ${scopeLabel()}, PCA's top 3 directions of spread → <b>red</b>/<b>green</b>/<b>blue</b>.</span>`,
+        `<span>Refit every ${SUPER_REFIT_STEPS} steps, or on demand.</span>`].join('')
+      : `<span>Superimposed: ${scopeLabel()}, each channel its own hue, brightness = |value|, added together.</span>`;
+    return;
+  }
+  if (typeof shown === 'number') {
     // The "spectrum": the diverging scale this channel is drawn on (web/nca.ts's channel legend).
     const [lo, hi] = clampRange();
     const sw = (colour: string) => `<i class="sw" style="background:${colour}"></i>`;
@@ -997,13 +1142,28 @@ function legend(): void {
   ].join('');
 }
 
-/** Show channel `c` large on the board (the "state" view), or null back to the ordinary strand/truth view. */
-function show(c: number | null): void {
+/** Show channel `c` large on the board (the "state" view), 'super' for every selected channel folded into one
+ * picture, or null back to the ordinary strand/truth view. */
+function show(c: ShownView): void {
   shown = c;
   for (const t of tiles) t.el.setAttribute('aria-pressed', String(t.index === c));
   $('showStrands').setAttribute('aria-pressed', String(c === null));
+  $('showSuper').setAttribute('aria-pressed', String(c === 'super'));
+  $('superGroup').hidden = c !== 'super';
+  if (c === 'super') {
+    const model = activeModel();
+    if (model) {
+      refreshSuperHues(model.C);
+      fitSuperBasis(model, true);
+    }
+  }
   legend();
   dirty = true;
+  const u = new URL(location.href);
+  if (c === 'super') u.searchParams.set('view', 'super');
+  else u.searchParams.delete('view');
+  history.replaceState(null, '', u);
+  storeView(c === 'super' ? 'super' : null);
 }
 
 // ── Channel tiles ────────────────────────────────────────────────────────────
@@ -1038,7 +1198,7 @@ function buildTiles(): void {
     box.append(el);
     tiles.push({ index: c, el, cv, ctx: cv.getContext('2d')!, range, text: '' });
   }
-  show(shown !== null && shown < weights.channels ? shown : null);
+  show(shown === 'super' ? 'super' : typeof shown === 'number' && shown < weights.channels ? shown : null);
   gridDirty = true;
 }
 
@@ -1367,6 +1527,38 @@ $<HTMLInputElement>('types').addEventListener('change', (ev) => {
 });
 $<HTMLSelectElement>('map').addEventListener('change', (ev) => setMap((ev.target as HTMLSelectElement).value));
 $('showStrands').addEventListener('click', () => show(null));
+$('showSuper').addEventListener('click', () => show('super'));
+$<HTMLSelectElement>('superScope').addEventListener('change', (ev) => {
+  superScope = (ev.target as HTMLSelectElement).value as SuperScope;
+  superBasis = null;
+  superFitStep = -1;
+  const model = activeModel();
+  if (model) refreshSuperHues(model.C);
+  if (shown === 'super') {
+    legend();
+    dirty = true;
+  }
+});
+for (const mode of ['pca', 'hue'] as const) {
+  $<HTMLInputElement>(`superMode-${mode}`).addEventListener('change', () => {
+    superMode = mode;
+    superBasis = null;
+    superFitStep = -1;
+    if (shown === 'super') {
+      legend();
+      dirty = true;
+    }
+  });
+}
+$<HTMLInputElement>('superOverlay').addEventListener('change', (ev) => {
+  superOverlay = (ev.target as HTMLInputElement).checked;
+  if (shown === 'super') dirty = true;
+});
+$('superRecompute').addEventListener('click', () => {
+  const model = activeModel();
+  if (model) fitSuperBasis(model, true);
+  if (shown === 'super') dirty = true;
+});
 $('reloadWeights').addEventListener('click', () => void reloadWeights());
 let autoTimer = 0;
 $<HTMLInputElement>('autoReload').addEventListener('change', (ev) => {
@@ -1448,6 +1640,10 @@ if (ruleParam) {
   describeRuleNow();
 }
 if (weightsName) document.title = `${weightsName} · ${document.title}`;
+/** ?view=super, else the sticky choice (localStorage): open straight into the superimposed view. */
+const viewParam = params.get('view');
+const storedView = viewParam ? null : loadStoredView();
+const initialView: ShownView = viewParam === 'super' || storedView === 'super' ? 'super' : null;
 void loadAnyWeights().then(() => {
   modelLine();
   const id = params.get('map') ?? 'l3';
@@ -1458,6 +1654,7 @@ void loadAnyWeights().then(() => {
   setMap(id);
   sharedNote();
   buildTiles();
+  show(initialView);
   setPlaying(!!weights);
   requestAnimationFrame(frame);
 });
