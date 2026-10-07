@@ -190,6 +190,7 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
         <label class="slider" id="fuelRow" for="fuel" hidden title="A tap lays at most this many chords each way; tap the stuck end to lay that many more (a change starts the board over)">Chords/tap <input type="range" id="fuel" min="1" max="40" value="8"><output id="fuelOut">8</output></label>
         <label class="check"><input type="checkbox" id="oneWay"><span>One way (out of the end nearer your tap)</span></label>
         <label class="check"><input type="checkbox" id="scoreFill" checked><span>Score the fill, not just the lines</span></label>
+        <label class="check" title="A rival's line wholly inside your area for a moment becomes your rule's chords on its tiles (Spectacle's Normal mode)"><input type="checkbox" id="convert" checked><span>Take rival lines inside your area</span></label>
       </div>
       <div class="group">
         <div class="label">Board</div>

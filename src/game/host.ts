@@ -26,10 +26,16 @@ export interface GameKnobs extends LineKnobs {
   floodPerStep: number;
   /** Line steps between readouts of territory and scores. */
   scoreEvery: number;
+  /** v1.1 (§3.4): a rival's line wholly inside your fill, for `convertPerR` × R flood steps, turns into your rule's
+   * chords on its tiles. Not in the doc's interface; an addition. */
+  convert: boolean;
+  /** How long a line must stay inside before it converts, in flood steps per unit of the flood's radius. */
+  convertPerR: number;
 }
 
 export const DEFAULT_GAME_KNOBS: GameKnobs = {
   ...DEFAULT_LINE_KNOBS, scoreFill: true, respawnMs: 500, stepMs: 50, floodPerStep: 1, scoreEvery: 1,
+  convert: true, convertPerR: 2,
 };
 
 export type GameEvent = {
@@ -88,7 +94,16 @@ export class Game {
   /** Flood steps since a wall last changed. */
   private quiet = 0;
   private sinceRead = 0;
+  /** The territory shown (two-read hysteresis on fill tiles), and the last two raw reads it is made from: the
+   * latest, and the one before it that a flood step separates from it. */
   private terr: Int8Array;
+  private rawNow: Int8Array;
+  private rawBefore: Int8Array;
+  private rawAt = -1;
+  private readonly wasLine: Uint8Array;
+  /** Per line cell: the one rival whose fill covers it (0 none), and the flood step that began. */
+  private readonly insideOf: Int8Array;
+  private readonly insideAt: Float64Array;
   private score: Int32Array;
   private readonly prevT: Int32Array;
   private readonly prevClosed: Int32Array;
@@ -101,6 +116,11 @@ export class Game {
     this.area = area ?? cpuArea(board, weights, DEFAULT_SEATS);
     this.floodR = (Math.max(board.h, board.w) + 2) >> 1;
     this.terr = new Int8Array(board.n);
+    this.rawNow = new Int8Array(board.n);
+    this.rawBefore = new Int8Array(board.n);
+    this.wasLine = new Uint8Array(board.n);
+    this.insideOf = new Int8Array(board.n);
+    this.insideAt = new Float64Array(board.n);
     this.score = new Int32Array(this.area.owners + 1);
     this.prevT = new Int32Array(board.n);
     this.prevClosed = new Int32Array(board.n);
@@ -388,9 +408,26 @@ export class Game {
 
   // ── Readouts ─────────────────────────────────────────────────────────────
 
+  /**
+   * Territory and scores. A line tile is its owner's at once; a tile the flood fills (or stops filling) changes
+   * hands only when two reads a flood step apart agree (§3.4's hysteresis: a settling flood doesn't flicker the
+   * score). Then v1.1's conversions.
+   */
   private read(): void {
     this.sinceRead = 0;
-    this.terr = this.area.territory();
+    let raw = this.area.territory();
+    if (this.knobs.convert && this.convertInside()) raw = this.area.territory();
+    if (this.floodSteps !== this.rawAt) {
+      [this.rawBefore, this.rawNow] = [this.rawNow, this.rawBefore];
+      this.rawAt = this.floodSteps;
+    }
+    this.rawNow.set(raw);
+    const { D, owner } = this.lines.ch;
+    for (let c = 0; c < raw.length; c++) {
+      const line = D[c] !== 0 && owner[c] > 0;
+      if (line || this.wasLine[c] || raw[c] === this.rawBefore[c]) this.terr[c] = raw[c];
+      this.wasLine[c] = line ? 1 : 0;
+    }
     this.score.fill(0);
     if (this.knobs.scoreFill) {
       for (let c = 0; c < this.terr.length; c++) if (this.terr[c] > 0) this.score[this.terr[c]]++;
@@ -399,8 +436,52 @@ export class Game {
     }
   }
 
+  /**
+   * v1.1 conversion (§3.4, Spectacle's convertPath): every line (a component of drawn chords) whose tiles have all
+   * been inside one rival's fill for convertPerR × R flood steps becomes that rival's: its chords go and the
+   * rival's rule's chords are laid on its tiles, with no tips. One 'convert' event per tile. Whether any did.
+   */
+  private convertInside(): boolean {
+    const { D, owner } = this.lines.ch;
+    const n = this.board.n;
+    const fills = this.seated().map((p) => [p.owner, this.area.fill(p.owner)] as const);
+    let any = false;
+    for (let c = 0; c < n; c++) {
+      let p = 0;
+      if (D[c] && owner[c]) {
+        for (const [o, f] of fills) if (o !== owner[c] && f[c]) p = p ? -1 : o;
+      }
+      if (p !== this.insideOf[c]) {
+        this.insideOf[c] = p;
+        this.insideAt[c] = this.floodSteps;
+      }
+      if (p > 0) any = true;
+    }
+    if (!any) return false;
+    const wait = this.knobs.convertPerR * this.floodR;
+    let done = false;
+    for (const comp of this.lines.components()) {
+      const p = this.insideOf[comp.cells[0]];
+      if (p <= 0 || !this.players[p]) continue;
+      let ok = true;
+      for (const c of comp.cells) {
+        if (this.insideOf[c] !== p || this.floodSteps - this.insideAt[c] < wait) { ok = false; break; }
+      }
+      if (!ok) continue;
+      this.lines.convert(comp.cells, this.players[p]!.ruleIx);
+      this.area.update(this.lines, comp.cells);
+      this.quiet = 0;
+      for (const c of comp.cells) {
+        this.insideOf[c] = 0;
+        this.events.push({ t: this.now, kind: 'convert', owner: p, cell: c });
+      }
+      done = true;
+    }
+    return done;
+  }
+
   /** Per board cell, as of the last readout: the owner of a line on it, else the one player whose fill covers
-   * it, else 0; -1 contested. */
+   * it (steadied: see `read`), else 0; -1 contested. */
   territory(): Int8Array {
     return this.terr;
   }

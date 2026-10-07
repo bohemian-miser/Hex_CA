@@ -33,7 +33,7 @@ const GRID_MS = 150;
 /** The side panel's numbers redraw at most this often. */
 const PANEL_MS = 120;
 const SETUP_KEY = 'hexca.game.setup';
-const SPARK_MS = { hit: 700, closed: 1100, tap: 380, refused: 520 } as const;
+const SPARK_MS = { hit: 700, closed: 1100, tap: 380, refused: 520, convert: 1300 } as const;
 const SUPER_REFIT_STEPS = 50;
 const SUPER_RGB_STEP = 8;
 const params = new URLSearchParams(location.search);
@@ -44,10 +44,10 @@ if (theme === 'light' || theme === 'dark') document.documentElement.dataset.them
 // ── Setup: seats, knobs, map (sticky across visits) ─────────────────────────
 
 interface Seat { name: string; rule: Rule; bot: boolean }
-interface Knobs { bounded: boolean; fuel: number; oneWay: boolean; scoreFill: boolean; speed: number; floodPer: number }
+interface Knobs { bounded: boolean; fuel: number; oneWay: boolean; scoreFill: boolean; convert: boolean; speed: number; floodPer: number }
 interface Setup { seats: Seat[]; selected: number; map: string; knobs: Knobs; pattern: boolean; types: boolean }
 
-const DEFAULT_KNOBS: Knobs = { bounded: false, fuel: 8, oneWay: false, scoreFill: true, speed: 20, floodPer: 1 };
+const DEFAULT_KNOBS: Knobs = { bounded: false, fuel: 8, oneWay: false, scoreFill: true, convert: true, speed: 20, floodPer: 1 };
 
 function loadSetup(): Partial<Setup> | null {
   try {
@@ -162,7 +162,7 @@ function newGame(): void {
 
 function gameKnobs() {
   return {
-    fuel: knobs.bounded ? knobs.fuel : 0, oneWay: knobs.oneWay, scoreFill: knobs.scoreFill,
+    fuel: knobs.bounded ? knobs.fuel : 0, oneWay: knobs.oneWay, scoreFill: knobs.scoreFill, convert: knobs.convert,
     stepMs: 1000 / knobs.speed, floodPerStep: knobs.floodPer,
   };
 }
@@ -261,7 +261,7 @@ const sparks: Spark[] = [];
 function absorb(events: GameEvent[], now: number): void {
   for (const e of events) {
     if (e.kind === 'refused' && bots.has(e.owner)) continue; // a bot weighing its options
-    if (e.kind === 'hit' || e.kind === 'closed' || e.kind === 'tap' || e.kind === 'refused') {
+    if (e.kind === 'hit' || e.kind === 'closed' || e.kind === 'tap' || e.kind === 'refused' || e.kind === 'convert') {
       if (e.cell >= 0) sparks.push({ kind: e.kind, cell: e.cell, owner: e.owner, at: now });
     }
     if (e.kind === 'hit' && e.owner) {
@@ -269,6 +269,9 @@ function absorb(events: GameEvent[], now: number): void {
       notice = `${name}'s line was in a collision: both lines are wiped, a wave at a time.`;
     } else if (e.kind === 'closed') {
       notice = `${seats[seatOf(e.owner)]?.name ?? 'A player'} closed a loop: the flood fills what it encloses.`;
+    } else if (e.kind === 'convert') {
+      const name = seats[seatOf(e.owner)]?.name ?? 'A player';
+      notice = `${name} took a rival's line inside their area: its tiles are ${name}'s rule now.`;
     }
   }
   if (sparks.length > 200) sparks.splice(0, sparks.length - 200);
@@ -539,7 +542,13 @@ function drawSparks(s: number, now: number): boolean {
     const y = cy[sp.cell];
     ctx.globalAlpha = 1 - age;
     ctx.lineWidth = Math.max(1.5, s * 0.12);
-    if (sp.kind === 'refused') {
+    if (sp.kind === 'convert') {
+      ctx.fillStyle = ownerColour(sp.owner);
+      ctx.globalAlpha = 0.55 * (1 - age);
+      ctx.beginPath();
+      hexPath(ctx, x, y, s * (0.95 + 0.25 * age));
+      ctx.fill();
+    } else if (sp.kind === 'refused') {
       const r = s * 0.4;
       ctx.strokeStyle = colours.bad;
       ctx.beginPath();
@@ -1023,13 +1032,14 @@ function bindKnobs(): void {
   growthFuel.addEventListener('change', () => { knobs.bounded = true; syncGrowth(); applyKnobs(); tilesDirty = true; });
   fuel.addEventListener('input', () => { $('fuelOut').textContent = fuel.value; });
   fuel.addEventListener('change', () => { knobs.fuel = Number(fuel.value); syncGrowth(); applyKnobs(); });
-  const box = (id: 'oneWay' | 'scoreFill') => {
+  const box = (id: 'oneWay' | 'scoreFill' | 'convert') => {
     const el = $<HTMLInputElement>(id);
     el.checked = knobs[id];
     el.addEventListener('change', () => { knobs[id] = el.checked; applyKnobs(); });
   };
   box('oneWay');
   box('scoreFill');
+  box('convert');
   const slider = (id: 'speed' | 'floodPer', out: string) => {
     const el = $<HTMLInputElement>(id);
     el.value = String(knobs[id]);
