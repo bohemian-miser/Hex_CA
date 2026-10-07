@@ -12,6 +12,7 @@ import {
 } from '../src/draw.js';
 import { css3, divLevel, fitPca3, hslRgb, hueBlend, LEVELS, mixRgb, pcaColour, pixel, ramps, type Pca3 } from '../src/ramp.js';
 import { Game, type GameEvent, type Refusal } from '../src/game/host.js';
+import { Bot } from '../src/game/bot.js';
 
 const data = dataJson as unknown as StrandData;
 const table = new RuleTable(data);
@@ -93,6 +94,8 @@ function boardOf(id: string): Board {
 }
 let board = boardOf(mapId);
 let game!: Game;
+/** The bot seats' tappers, by owner. */
+let bots = new Map<number, Bot>();
 /** Game time (ms): runs while playing. */
 let clock = 0;
 let playing = true;
@@ -127,7 +130,7 @@ if (rulesParam) {
 }
 if (!seats.length) {
   const first = goodRule();
-  seats = [{ name: 'Player 1', rule: first, bot: false }, { name: 'Player 2', rule: goodRule([first]), bot: false }];
+  seats = [{ name: 'Player 1', rule: first, bot: false }, { name: 'Bot 2', rule: goodRule([first]), bot: true }];
 }
 
 /** The game owner of seat i: seats sit in order, so owner i + 1. */
@@ -147,6 +150,7 @@ function newGame(): void {
     }
     if (owner !== ownerOf(i)) throw new Error(`seat ${i} sat as owner ${owner}`);
   });
+  bots = new Map(seats.flatMap((s, i) => (s.bot ? [[ownerOf(i), new Bot(game, ownerOf(i), Math.random)] as const] : [])));
   clock = 0;
   sparks.length = 0;
   superBasis = null;
@@ -256,6 +260,7 @@ const sparks: Spark[] = [];
 
 function absorb(events: GameEvent[], now: number): void {
   for (const e of events) {
+    if (e.kind === 'refused' && bots.has(e.owner)) continue; // a bot weighing its options
     if (e.kind === 'hit' || e.kind === 'closed' || e.kind === 'tap' || e.kind === 'refused') {
       if (e.cell >= 0) sparks.push({ kind: e.kind, cell: e.cell, owner: e.owner, at: now });
     }
@@ -747,7 +752,7 @@ function renderPlayers(): void {
     if (chipS.textContent !== sc) chipS.textContent = sc;
     chip.classList.toggle('wait', wait > 0);
   });
-  $<HTMLButtonElement>('addPlayer').disabled = seats.length >= MAX_SEATS;
+  $<HTMLButtonElement>('addPlayer').disabled = $<HTMLButtonElement>('addBot').disabled = seats.length >= MAX_SEATS;
 }
 
 function describeRule(): void {
@@ -824,14 +829,19 @@ function select(i: number): void {
   saveSetup();
 }
 
-function addSeat(): void {
+function addSeat(bot: boolean): void {
   if (seats.length >= MAX_SEATS) return;
   const rule = goodRule(seats.map((s) => s.rule));
-  const name = `Player ${seats.length + 1}`;
-  const owner = game.addPlayer(name, rule);
+  const name = `${bot ? 'Bot' : 'Player'} ${seats.length + 1}`;
+  const owner = game.addPlayer(name, rule, bot);
   if (owner !== ownerOf(seats.length)) return;
-  seats.push({ name, rule, bot: false });
-  select(seats.length - 1);
+  seats.push({ name, rule, bot });
+  if (bot) {
+    bots.set(owner, new Bot(game, owner, Math.random));
+    playersKey = '';
+    panelDirty = tilesDirty = gridDirty = true;
+    saveSetup();
+  } else select(seats.length - 1);
 }
 
 function removeSeat(i: number): void {
@@ -884,6 +894,7 @@ function frame(now: number): void {
     }
     stepsDone += ran;
     if (ran || flooded) dirty = panelDirty = gridDirty = true;
+    for (const bot of bots.values()) bot.act(clock);
   }
   const events = game.drain();
   if (events.length) {
@@ -963,7 +974,8 @@ $('zoomIn').addEventListener('click', () => zoomAt(cssW / 2, cssH / 2, 1.5));
 $('zoomOut').addEventListener('click', () => zoomAt(cssW / 2, cssH / 2, 1 / 1.5));
 $('zoomFit').addEventListener('click', () => fit());
 
-$('addPlayer').addEventListener('click', addSeat);
+$('addPlayer').addEventListener('click', () => addSeat(false));
+$('addBot').addEventListener('click', () => addSeat(true));
 $('ruleUse').addEventListener('click', () => useRuleText());
 $<HTMLInputElement>('ruleText').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') useRuleText(); });
 function useRuleText(): void {

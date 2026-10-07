@@ -9,6 +9,7 @@ import { Board, RuleTable, walk, type Rule, type StrandData } from '../src/stran
 import { loadWeights } from '../src/nca.js';
 import { edgeMid, unitCentre } from '../src/draw.js';
 import { Game, type GameEvent } from '../src/game/host.js';
+import { Bot } from '../src/game/bot.js';
 
 const data = dataJson as unknown as StrandData;
 const table = new RuleTable(data);
@@ -165,6 +166,27 @@ describe('the game host', () => {
     expect(again.log).toEqual(first.log);
     expect(again.state).toEqual(first.state);
     expect(first.log.some((l) => l.includes(':tap:'))).toBe(true);
+  });
+
+  it('bots tap through the host by themselves, and a seeded bot game replays exactly', () => {
+    const play = () => {
+      const { g, a, b } = twoPlayers();
+      let seed = 11;
+      const rand = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+      const bots = [new Bot(g, a, rand), new Bot(g, b, rand)];
+      const kinds: Record<string, number> = {};
+      let t = 0;
+      for (let k = 0; k < 400; k++) {
+        g.tick((t += 50));
+        for (const bot of bots) bot.act(t);
+        for (const e of g.drain()) kinds[e.kind] = (kinds[e.kind] ?? 0) + 1;
+      }
+      return { kinds, state: snapshot(g), tiles: [g.lines.lineTiles(a), g.lines.lineTiles(b)] };
+    };
+    const first = play();
+    expect(first.kinds.tap).toBeGreaterThan(4);
+    expect(first.tiles[0] + first.tiles[1]).toBeGreaterThan(0);
+    expect(play()).toEqual(first);
   });
 });
 
