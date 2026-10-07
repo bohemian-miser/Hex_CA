@@ -340,7 +340,7 @@ def overfit_episodes(tab, bd, cfg, K, S, seed):
             i = int(rng.integers(nb))
             geo = T2.pad_geo(bd.board(group, i), S)
             sl = E.draw(rng, tab, geo, kind, cfg["speed"], cfg["slack"], "train", cfg["stagger"], cfg["hitMax"],
-                        rules=rules[:1] if kind != "t2" else rules, tries=3)
+                        rules=rules[:1] if kind != "t2" else rules, tries=3, n=2 if kind == "t2" else None)
             if sl is None or not lo <= sl.length <= hi:
                 continue
             key = (i, tuple(tuple(tp) for tp in sl.taps))
@@ -842,7 +842,8 @@ def write_snapshot(path, it, pools, tab, last_level, last_idx, slack, early):
     """pool.npz in train2.write_snapshot's contract; the target = the edges due at each slot's age, walls = cells
     with chords under any of its taps' rules, the tap = its first."""
     out = {"iteration": np.int64(it), "radii": np.array(sorted(P["geo"].shape[-1] - 1 for P in pools.values())),
-           "last_R": np.int64(pools[last_level]["geo"].shape[-1] - 1), "last_idx": np.asarray(last_idx, np.int64)}
+           "last_R": np.int64(pools[last_level]["geo"].shape[-1] - 1), "last_idx": np.asarray(last_idx, np.int64),
+           "damage_names": np.array(DAMAGE)}
     for P in pools.values():
         n, S = min(len(P["age"]), V1.SNAP_N), P["geo"].shape[-1]
         R, S2 = S - 1, 2 * S - 1

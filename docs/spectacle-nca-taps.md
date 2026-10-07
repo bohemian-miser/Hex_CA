@@ -223,3 +223,92 @@ launch 10 starts, so the GPU hours buy only the question that needs them.
 
 Not in this document: implementation, Conquest (captures, the owner slot), conversion, one-way taps, rule
 changes and regrow, the closed flag beyond its place in the curriculum, and routing itself.
+
+## 6. Built: the trainer side (2026-10-07)
+
+Build items 3-7. Items 1-2 (`nca/strand/sim.py` and its parity with Spectacle's engine) are PR #24. This section
+records what was built, where it departs from §1-§5, and the Pi overfits of §1 and §5. **Measured** as above.
+
+| Piece | Where |
+|---|---|
+| The trainer | `nca/strand/train3.py`; `train2.py` is unchanged (launches 6-9) |
+| Episodes: the adapter over `sim.py` | `nca/strand/episodes.py` |
+| Self-check; the §1 overfits (`--overfit`) | `nca/strand/selftest3.py` |
+| Training memory | `nca/strand/memprobe.py --train3` |
+| Play page | `src/strand-nca.ts`, `web/strand.ts`, `nca/strand/export.py` (weights version 2 carry `tap`) |
+| Two patterns meeting | `scripts/strand-meet.ts` (event taps; counts "both lines gone") |
+| Dashboard | the default strand series |
+| Launch 10 | `nca/cloud/plan-10.txt` |
+
+**What it does.** `--tap impulse` puts the 59 tap planes on the tapped cell for `--tap-steps` steps (t + 1 ..
+t + tapSteps), then zero. `--tap fixed` never sets the tap planes; at age t the host writes the cell's state, then
+the update runs. The write sets edge channels 1 + d0 and 1 + d1 to max(itself, 1), so it adds to a line already
+there (§2 case 7). It also sets the code's 35-plane form (8 class bits, then each digit as 3 bits MSB first, ±1)
+into the last 35 channels, which are scalar: at 96 channels and 6 directional groups, channels 61-95. `--tap held`
+is train2's tap, kept as the overfits' baseline.
+
+The targets are `sim.py`'s. Every edge has up to K = 4 intervals [on, off) in nominal steps (chord k of a tap at
+t + 2k). The windows are `sim.target_weight`'s: required from on + 2, don't-care from on - 1 and for 2 steps after
+off. A slot holds up to four taps with their times. Episodes come from `sim.draw_taps`:
+- t1: one tap.
+- t2: 2-4 codes that collide. The draw is repeated until the first hit is by `--hit-max` (48).
+- control: a quarter of t2 slots, two codes whose strands share no cell.
+- t3: own meetings, redrawn until two taps stood.
+
+Taps the host refuses are dropped from the slot, since the CA never sees one. Stages are T1 / T2 / T3 with
+`--remix` (1/3). Damage:
+- noise on the hidden channels of line cells (p 0.3, σ U[0.1, 0.3]);
+- the episodes' collisions and staggered taps (by age `--stagger`, 24);
+- from T2 on, a mid-episode tap on 10 % of kept slots. In T2 it is a rival on a strand through the slot's lines;
+  in T3 it is half own, half rival. The slot is re-simulated and its past is unchanged.
+
+**The metrics** (`train3.py`'s docstring has the exact definitions; `selftest3` checks every one against an oracle
+that draws the targets, and against variants that decay, never wipe, regrow or drop part of a meeting):
+- `speed`: from the run of chords drawn out of each tap.
+- `persist` `x1` / `x2` / `x4`: exact at 1, 2 and 4 × each tap's ideal, on 48 level-3 taps.
+- `collide`: wipe, falseWipe, regrow, worm against wormMax.
+- `own`: collateral, phantom, stray.
+- The code probes: the linear one and the MLP (`codeMlp`), each with `byAge` (x1 / x2 / x4) on the persist set's
+  line cells.
+
+The score that best.pt and the collapse guard use is the mean of balanced, persist.x4,
+wipe × (1 − falseWipe) and own.exact, over those a stage measures.
+
+### Where it departs from §1-§5
+
+1. **Timing is `sim.py`'s**, not the "2k − 1 / 2k + slack" written in §2. Chord k is nominally at t + 2k. It is
+   due from 2k + 2 and may be drawn from 2k − 1. A wipe at the step h + j the wave reaches the chord leaves it
+   drawn until h + j − 1, don't-care to h + j + 1. Erased chords linger 2 steps. `--early -1` drops the
+   not-before entirely. With `--speed 1 --slack 1 --early -1`, one tap's target is train2's exactly (checked at
+   every age).
+2. **phantom** cannot be "cells still flagged tip": the CA has no tip output. It is the share of own-line
+   episodes whose drawing still changes after ideal + slack (a tip still running, or flicker).
+3. **wipe** counts only the doomed edges the model drew while they were due. Otherwise a model that draws nothing
+   scores 1.0. **worm** is reported next to **wormMax**, the most the targets allow (the chords due after the
+   hit, given the slack), rather than as "≤ d".
+4. **The overfits** use 48 channels, not 32. The fixed write needs 35 scalar channels after 13 + 6 × groups, so
+   all arms use `--dir-groups 0`. They also use hidden 64 at depth 2, and lr 1e-3 (warm-up 50) to fit the Pi's
+   time box. Their exact is read as train2 reads it, after max(8 S, ideal + 8) steps. "onTime" is exact at the
+   ideal step itself.
+5. **The persist set** is level 3 only in plan-10: at level 4 most taps' 4 × ideal passes the 1,200-step cap.
+6. **The warm start's best.pt** is iteration 0 of tap-e2-w-l3, that is tap-e2-w-l2's last best. The l3 stage
+   never beat it on the balanced score (0.217), although its ckpt.pt, 7.7k iterations on, has the higher
+   right-exit rate (0.90 vs 0.85). plan-10 uses best.pt as §0 says; ckpt.pt is in the bucket if the lead prefers
+   the routing.
+7. **Draws** are `sim.draw_taps`'. Its collisions come early: the first hit at median age 2-3 on levels 2 and 3.
+   Its own draws often place a second tap on a drawn chord, and the host refuses it. That is why "two taps stood"
+   is a redraw condition.
+8. **The broadcast inputs** (`e-bc`, `c-bc`) are refused by train3: the rule on every tile is not a one-time tap.
+9. **The quick check** costs about 2.1× plan-9's (rollout work counted per set): legacy and wide at the doubled
+   ideal are 1.86×, and persist plus the episode sets add the rest. Expect ~5 min a check on the L4 where plan-9
+   took 85-155 s; plan-10 spaces checks ~20 min of training apart.
+
+### Memory (launch 10)
+
+`python -m nca.strand.memprobe --train3 --channels 96 --hidden 256 --depth 2 --batch 8 --window 4 20 --last-k 48`
+measures the peak RSS per backprop step at batch 8 (saved tensors in brackets):
+- level-3 boards (S 37): 52.5 MB impulse, 50.3 MB fixed (38.7);
+- level-4 crops (S 42): 76.9 / 71.4 MB (50), against plan-9's 68-73 MB (49) for the same net in train2.
+
+At batch 16 and window 48 that is ~5.0 GB an arm, ~11 GB for both arms with pools and CUDA contexts, of the L4's
+~22.5 GB.

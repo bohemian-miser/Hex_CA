@@ -81,11 +81,11 @@ def run(tab, geo, taps, period, slack, exits=None):
     return Slot(list(taps), on, off, int(ep.settle), hit, kind, int((~ep.chords["maybe"]).sum()), codes), ep
 
 
-def draw(rng, tab, geo, kind, period, slack, split="train", t_max=24, hit_max=48, rules=None, tries=20):
+def draw(rng, tab, geo, kind, period, slack, split="train", t_max=24, hit_max=48, rules=None, tries=20, n=None):
     """A Slot of train3's `kind` (t1 one tap; t2 a collision with its first hit by hit_max; ctrl a control pair;
-    t3 an own meeting: two or more taps that stood) via sim.draw_taps, or None."""
+    t3 an own meeting: two or more taps that stood) via sim.draw_taps (n taps, or its own count), or None."""
     for _ in range(tries):
-        taps = SIM.draw_taps(rng, tab, geo, SIM_KIND[kind], t_max=t_max, split=split, rules=rules)
+        taps = SIM.draw_taps(rng, tab, geo, SIM_KIND[kind], n=n, t_max=t_max, split=split, rules=rules)
         if taps is None:
             continue
         try:

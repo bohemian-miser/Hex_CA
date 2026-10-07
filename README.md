@@ -391,7 +391,7 @@ the tapped chord; the true strand (Spectacle's rule and walker, in
 Taps share one board by default, so strands of different rules can run into
 each other — never trained, just shown. Each tap's input is training's: the
 rule's 53-bit code and the tapped chord's two edges on the tapped tile, held
-every step.
+every step (train2's models; the next ones take the tap once, below).
 
 **When two patterns meet** (`npx tsx scripts/strand-meet.ts WEIGHTS`: the page's runner on a shared board, `tap-e2-l3` and `tap-e2-w-l3`:
 pairs of taps of training rules whose strands share tiles, each strand drawn exactly when alone; 25 pairs on
@@ -403,6 +403,15 @@ levels 2 and 3). The game wants the line that is hit to disappear; these models 
 - *Both taps from step 0:* both strands usually lose a few chords where they meet. Both are exact on 2 of 25
   pairs.
 - The `-bc` and v1 models carry one rule on every tile, so their taps can't share a board.
+
+**The tap as an event** (`nca/strand/train3.py`, `docs/spectacle-nca-taps.md`, launch 10). The next models take
+a tap once, as the game does: its inputs on for one step (impulse), or a write of the tapped tile's state (fixed).
+After that the line has to keep itself alive and grow a chord every two steps. When two patterns meet, both lines
+have to go (Spectacle's rule: the pattern owns the tile). The targets come from `nca/strand/sim.py`. Such weights
+say so (`tap` in the file, version 2). On the page a tap is fired into the running board and refused where
+Spectacle would refuse it. Taking a tap away starts the board over, with the others fired again at step 0. Older
+weights hold their taps as above. `strand-meet.ts` also counts the pairs where both lines end up gone, the game's
+answer: `tap-e2-l3` (level 2) gets 0 of 8.
 
 `python -m nca.strand.export CKPT` writes a strand checkpoint (FrameNCA at any
 depth, the plain-conv StrandNCA, v1) as `web/strand-weights.json`'s format

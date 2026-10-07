@@ -262,7 +262,10 @@ def pool_to_json(pool_path: Path) -> dict:
                 "tap": tap.astype(np.int64).reshape(-1).tolist() if tap is not None else [],
             }
 
-        return {"iteration": iteration, "radii": radii, "last_R": last_R, "last_idx": last_idx, "by_radius": by_radius}
+        out = {"iteration": iteration, "radii": radii, "last_R": last_R, "last_idx": last_idx, "by_radius": by_radius}
+        if "damage_names" in keys:  # the trainer's own damage kinds (nca/strand/train3.py), by code 0, 1, ...
+            out["damageNames"] = [str(x) for x in np.atleast_1d(z["damage_names"]).tolist()]
+        return out
 
 
 # ── gallery.npz -> JSON (nca/strand/train.py's write_gallery contract) ────────────────────────
@@ -2035,7 +2038,7 @@ function renderPool(pool) {
       }
       var isHighlighted = R === pool.last_R && highlightSet[idx];
       dom.wrap.classList.toggle("highlight", !!isHighlighted);
-      var dmg = DAMAGE_LABELS[String(b.damage)] || "?";
+      var dmg = (pool.damageNames && b.damage >= 0 ? pool.damageNames[b.damage] : DAMAGE_LABELS[String(b.damage)]) || "?";
       var lossText = (b.loss == null || isNaN(b.loss)) ? "-" : (+b.loss.toPrecision(3));
       dom.cap.innerHTML =
         '<span>' + lossText + (idx < group.m ? ' <span class="state-dot" title="full state available"></span>' : '') + '</span>' +

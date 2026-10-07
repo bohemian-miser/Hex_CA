@@ -456,8 +456,9 @@ def runs():
         js = pool_to_json(Path("runs/warm/pool.npz"))
         R = js["radii"][0]
         g = js["by_radius"][str(R)]
-        check(f"pool.npz reads through nca.dashboard.pool_to_json (R {R}, S {g['S']}, n {g['n']}, C {g['C']})",
-              g["S"] == 2 * R + 1 and g["n"] == 8 and g["C"] == 16)
+        check(f"pool.npz reads through nca.dashboard.pool_to_json (R {R}, S {g['S']}, n {g['n']}, C {g['C']}, damage "
+              f"kinds {js.get('damageNames')})", g["S"] == 2 * R + 1 and g["n"] == 8 and g["C"] == 16
+              and js.get("damageNames") == ["noise", "midtap"])
     except Exception as e:  # noqa: BLE001
         check(f"pool.npz reads through nca.dashboard.pool_to_json ({e!r})", False)
     from . import export as X
