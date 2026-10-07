@@ -406,6 +406,73 @@ from `src/nca.ts`); two players' fills resolve to `territory` with contested cel
 **Game** (`tests/game.test.ts`): a scripted two-player game at level 2, 500 ticks, deterministic replay byte-identical;
 respawn blocks taps for `respawnMs`; score = line tiles + sole fill at every read.
 
+### 5.1 Parity, measured (D2, D3; `LineCA` of PR #33)
+
+`npx tsx scripts/game-parity.ts` replays a fixture of timed taps (collide.json's format) through `LineCA` and writes
+every chord's on and off step; `python -m nca.strand.ca_parity` runs (b) and (c) and gives each difference a class;
+`tests/game-parity.test.ts` runs (a) and pins (c) to `tests/fixtures/ca-collide-classes.json` (collide.json itself is
+now under `tests/fixtures`). All measured, at `maxTips` 99 (the engine's `maxHeads` 12 never binds on the fixture).
+
+- **(a) the walker at double time:** 900 single taps (300 each on l2, l3, l4; random rules; taps at t = 0-3). Every
+  chord k ≥ 1 from the tap (a loop: the shorter way round) is drawn at t + 2k for a tap on an even step and
+  t + 2k - 1 on an odd one (the go steps are even, so the first chord comes one step *early*, not late as §2.10
+  says). At rest the line is the whole strand: 900/900.
+- **(b) sim.py's CA mode:** 1,000 episodes, 200 each of `draw_taps`' four kinds plus `busy` (3-6 players, up to 4
+  taps each, as collide.json's), L2/L3, seed 1. Equal at rest (accepted taps and every chord): single 200, control
+  200, own 199, collide 175, busy 144. On and off steps within 1 of the sim's: on 99.9 %, off 80 %. The off steps
+  come 1-3 steps early because the CA's collisions are early (below). Every difference is timing.
+  `nca.strand.ca_parity._CATiming` is the sim's CA mode with the CA's own timing added, as seven switches (phase
+  and the six below). Against it, `LineCA` matches every chord's on and off step in 1,000/1,000 episodes, and in
+  8,500 more (seeds 2-4 on L2/L3, 7,500; seed 5 on 1,000 L4 crops). 0 unexplained.
+- **(c) Spectacle's engine** (collide.json, 400 episodes):
+
+  | measure | result |
+  |---|---|
+  | accepted taps equal | 359/400 |
+  | end state equal | 339/400 |
+  | both equal | 327/400 (sim.py's CA mode: 318) |
+  | survival agrees | 1,702 of the engine's 1,800 lines (1,070 survive) |
+  | chords at rest | engine 15,020, `LineCA` 13,261, both 12,791 |
+
+  The 73 differing episodes:
+
+  | class | episodes | what it is |
+  |---|---|---|
+  | as sim.py's CA mode: waves | 35 | `LineCA` = the sim at rest; instant wipes (`wave=0`) would make it the engine |
+  | as sim.py's CA mode: waves + head timing | 12 | the same |
+  | as sim.py's CA mode: head timing | 4 | the engine's second-head bookkeeping (sim_parity) |
+  | the CA's own timing | 22 | phase 16, phase + early 2, early 1, hitter 1, early + cold 1, phase + early + tap window 1 |
+
+  0 unexplained. Against the sim with the CA's timing, every chord's on and off step is equal in 400/400.
+
+**The wave-vs-join race is not the only divergence at rest.** These are the CA-only events in the 47 wave-caused
+episodes; one episode can have several:
+
+| event | episodes | what happens |
+|---|---|---|
+| worm hits | 27 | a dying line's fleeing tip hits a third line before its wave catches it, and the third line dies |
+| taps refused on a dying line | 18 | |
+| hits on a dying line | 16 | |
+| dying-tile hits | 6 | |
+| contact | 5 | §2.10's join race: a line that joins a dying line goes with it |
+| waves met head on | 1 | |
+
+All of these are the wipe taking a step a chord: the "a race only" rows of §2.10 do change rest states.
+
+**Timing beyond §2.10's table.** Each item is a `_CATiming` switch, and each one is needed somewhere:
+
+- **early:** collisions do not wait for `go`. `aimed`, `hitAt`, `victim` and `crash` read tips on any step, so a
+  tip placed on a go step collides on the next step, one before it would move.
+- **hitter:** a hitter's last chord goes on the hit step, both ends and a fresh tap's other tip with it. W goes
+  out of both ends.
+- **tap window:** W refuses a tap for exactly one step: on a wiped chord, on a crash tile, and where a wave is about
+  to cross in (`waveAt`, PR #33).
+- **wait:** a tip facing a hot or hit tile of its own rule waits; it does not die.
+- **cold:** W leaves only by ends no wave came in by, so a chord that two waves meet in leaves its tile free the
+  next step.
+- **cross:** a wave reaching a tile on the step a tip of its rule draws there finds nothing and is spent. The
+  newcomer lives on, as it would in the engine, where the old line is already gone.
+
 ## 6. Work breakdown
 
 Agents A-D in parallel from hour 0; interfaces are §4.1. Times are coding-agent estimates.

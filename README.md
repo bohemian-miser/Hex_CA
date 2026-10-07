@@ -392,6 +392,18 @@ chords per tap (`fuel`), one-way taps, speed, flood steps per line step; boards 
 (the flood is ~30-50 ms a step per player at level 3 on a Pi's CPU, so areas fill in over seconds there).
 `?map=l2|l3|l4`, `?rules=<rule>,<rule>` (one per seat).
 
+**Parity** (`docs/spectacle-ca-hybrid.md` §5.1). The line CA is checked in two ways. First, against Spectacle's own
+engine on 400 scripted collision games: they agree at rest on 327. Second, against the strand simulator's CA mode
+(`nca/strand/sim.py`). Every difference is classified, and none is unexplained:
+- Most come from the simulator's own wave and head-timing races, which the CA shares.
+- The rest come from the CA's own timing. With that timing added, the simulator matches the CA chord for chord,
+  every step, on thousands of games.
+
+```bash
+npx tsx scripts/game-parity.ts       # LineCA on data/strand-v2/collide.json -> ca-collide.json, against the engine
+python -m nca.strand.ca_parity       # (b) against sim.py's CA mode, (c) against the engine, every difference classed
+```
+
 ## Strand NCA: Spectacle's lines, grown by a network
 
 **Play:** https://bohemian-miser.github.io/Hex_CA/strand.html (e.g.
