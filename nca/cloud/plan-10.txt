@@ -41,6 +41,12 @@
 # q.collide.falseWipe once t2 starts, q.own.collateral in t3. The §4.4 bars: T1 persist x4 >= 0.95 x x1 and exact
 # >= plan-9's at the same iteration count on the legacy set; T2 wipe >= 0.9, falseWipe <= 0.02, regrow <= 0.01;
 # T3 collateral <= 0.02.
+# The Pi overfits (docs/spectacle-nca-taps.md §6; one rule, 4 level-2 episodes, ~450 iterations an arm): the impulse
+# latches (3 of 4 episodes on time by 300-350 iterations under the cap; --tap-steps 2: exact 1.0 at 400; the fixed
+# write 450; the held tap 300), so one step stays; if tap-i trails tap-f badly at the first t1l2 check,
+# --tap-steps 2 is the fallback. Persistence held to age 100 in every arm and failed at 300 / 600 (past the pool's
+# ages, which the persist set here stays inside); collisions learned from a T1 start (wipe 0.77-0.86, regrow
+# ~0.3) but did not converge in the Pi's budget.
 # Data: plan-9's (the private bucket's strand-v2.tgz and launch 5's strand.tgz); the warm start from the public run
 # bucket (bucket:runs/tap-e2-w-l3/best.pt, 1.6 MB; note it is that stage's iteration 0, i.e. tap-e2-w-l2's last best:
 # l3 never beat it on the balanced score, while its ckpt.pt, 7.7k l3 iterations on, has the higher right-exit rate

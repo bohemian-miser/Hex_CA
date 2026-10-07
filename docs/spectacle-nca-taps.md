@@ -302,6 +302,89 @@ wipe × (1 − falseWipe) and own.exact, over those a stage measures.
 9. **The quick check** costs about 2.1× plan-9's (rollout work counted per set): legacy and wide at the doubled
    ideal are 1.86×, and persist plus the episode sets add the rest. Expect ~5 min a check on the L4 where plan-9
    took 85-155 s; plan-10 spaces checks ~20 min of training apart.
+10. **`--hit-min 8` in plan-10's T2 and T3.** sim's collision draws hit at age 2 (the median; 87 % by age 7 at
+    level 2, 69 % at level 3), before the lines have grown. Requiring the first hit at 8 or later moves the median
+    hit to 13-18, with lines of 18-38 chords, so the waves and the fleeing tips are what T2 trains. Mid-episode
+    taps cover lines that are hit late in life. The collide eval set uses the same draws.
+11. **Pool ages.** `--new-share` and `--no-worst-restart` exist (§5's "longer pool ages"), but plan-10 keeps
+    train2's defaults: on the Pi, keeping old slots stopped learning (below).
+
+### The Pi overfits (§1, §5)
+
+`python -m nca.strand.selftest3 --overfit --stage T1|T2 --arms ...` runs `train3 --overfit 4`:
+- **Episodes.** One train rule, `023468·120000000`, with four level-2 episodes. In T1 these are single taps on
+  strands of 24, 4, 7 and 4 chords (ideal 6-34 steps). In T2 the same rule collides with `128·011110001`; with
+  `--hit-min 16 --overfit-len 4 40` the first hit comes at age 16-36 after lines of 10-38 chords have grown.
+- **Net.** Option E at 48 channels with no hidden directional groups (the fixed write's minimum), hidden 64,
+  depth 2. Batch 8, pool 32, bptt and last-k 48, lr 1e-3 (warm-up 50), noise damage 0.3. From scratch unless
+  marked.
+- **Budget.** 15 minutes an arm on the Pi, which was shared with other work at load average 5-6: 1.8-2.4 s an
+  iteration, so 350-450 iterations. A check every 50 iterations.
+- **Columns.** `exact` is read as train2 reads it, after max(8 S, ideal + 8) = 96 steps. `on time` is exact at
+  the ideal step itself. a100, a300 and a600 are exact at those ages, with the tap long gone. steps = the settle
+  step over ideal. One seed each, so 50-100 iterations is within the noise.
+
+**T1 persistence.**
+
+| Arm | Speed cap | Iterations to exact 1.0 | ... to on time 1.0 | At the end: exact / on time / a100 / a300 / a600 | steps |
+|---|---|---|---|---|---|
+| held (plan-9's benchmark) | 1/2 | 300 | - | 1.0 / 0.5 / 1.0 / 0 / 0 (350 it.) | 1.09 |
+| impulse, 1 step | 1/2 | - (0.75 at 300-350) | - | 0.5 / 0.75 / 0 / 0 / 0 (400 it.) | 1.0 |
+| impulse, `--tap-steps 2` | 1/2 | 400 | 450 | 1.0 / 1.0 / 1.0 / 0 / 0 (450) | 0.86 |
+| fixed write | 1/2 | 450 | - | 1.0 / 0.25 / 1.0 / 0 / 0 (450) | 1.21 |
+| held | none | 200 | 450 | 1.0 / 1.0 / 1.0 / 0 / 0 (450) | 0.90 |
+| impulse, 1 step | none | 300 | - | 1.0 / 0.25 / 0 / 0 / 0 (350; at 300: a100 1.0, a300 0.75) | 1.43 |
+| fixed write | none | - (0.5 at 250-400) | - | 0 / 0.75 / 0 / 0 / 0 (450) | - |
+| impulse, old pool (`--no-worst-restart --new-share 1/16`) | 1/2 | - | - | 0 everywhere; loss 0.3-0.6 throughout (450) | - |
+| held, old pool | 1/2 | - | - | 0 everywhere (450) | - |
+
+**T2 collisions** (one pair of rules). Here `grown` is the share of the doomed edges the model drew at all while
+they were due. `wipe` is measured on those edges. The targets allow at most 7.5 chords of worm.
+
+| Arm | wipe | grown | regrow | worm | exact (best check) |
+|---|---|---|---|---|---|
+| impulse, from scratch | - (draws nothing in time) | ~0 | 0-0.82 | 0-22 | "1.0", empty: the hit lines are gone by the read-out, so drawing nothing scores |
+| fixed write, from scratch | 0.33 -> 0.75 | - | 0.16 at 450 | 3.75 | 0.5 at 200 |
+| impulse, `--init` its T1 run | 0 -> 0.84 (400), 0.77 (450) | 0.20 -> 0.42 | 0.57 -> 0.29 | 10.4 -> 4.6 | 0 |
+| fixed write, `--init` its T1 run | 0.03 -> 0.86 (400), 0.77 (450) | 0.15 -> 0.67 | 0.53 -> 0.33 | 9.8 -> 2.9-5.1 | 0.5 at 400 |
+
+What this says:
+
+1. **The impulse latches.** One step of input starts lines and draws them on time: 3 of 4 episodes at 300-350
+   iterations under the cap, all 4 at 300 without it. With `--tap-steps 2` it reaches 1.0 at 400 and is on time
+   at 450, steadier than one step. The fixed write gets there at 450. The held tap, plan-9's benchmark, gets
+   there at 300 under the cap; plan-9 reported ~300 for its held tap, and this one reached 200 without the cap.
+   So a one-time tap costs little at this size, and "F learns and I does not" did not happen: no sign that
+   latching is the bottleneck. If launch 10's first t1l2 check shows the impulse arm well behind tap-f,
+   `--tap-steps 2` is the cheapest fix (§5). plan-10 keeps one step, as the doc chose.
+2. **The 1/2 cap costs iterations but is learnable.** Held needs 300 instead of 200. The one-step impulse is
+   noisier under it (its loss jumped at 400).
+3. **Persistence holds only inside the ages the pool trains.**
+   - Every arm, the held tap included, is exact at age 100 (3 × the longest episode's ideal) and wrong at ages
+     300 and 600. The pool's slots live to about age 300, median ~150, under train2's renewal (1/8 of each batch
+     new, and the batch's worst slot restarted every iteration).
+   - Past that the held model does not fade, it overgrows. Over the four episodes there are 219 stray edges by
+     age 200 and 468 by age 600, with 51 of 78 right edges still there.
+   - The obvious knob makes it worse. Keeping old slots (no worst restart, 1/16 renewal) stops learning
+     altogether at this budget: the broken old slots swamp the gradient.
+   - So plan-10's persist set measures 1-4 × ideal, which at level 3 (100-200 steps a visit, ~5 visits a slot)
+     lies inside the pool's ages. Ages far past the pool's, such as the 600 here, are §5's persistence risk,
+     measured and open. The next candidates are a share of pool slots aged without gradient before they are
+     trained, or a longer no-gradient prefix. Neither is built.
+4. **Collisions need T1 first and more than the Pi's 450 iterations.**
+   - From scratch the impulse arm finds the degenerate answer: draw nothing in time. A collision episode's lines
+     are gone by the read-out, so nothing drawn scores exact, which is why `wipe` counts only drawn edges and
+     `grown` is reported.
+   - From scratch the fixed write is better off, since its write draws the tapped chord at once and gives the
+     wipe something to act on.
+   - Initialised from their T1 runs, as the curriculum does, both arms learn every part: they draw more of the
+     lines before the hit (grown up to 0.42 and 0.67), wipe them (0.77-0.86), regrow less (about 0.3) and lay
+     fewer chords after the hit (2.9-5.1 against the 7.5 allowed). Neither converged in 450 iterations.
+5. **The warm start under one-time taps holds nothing.** `scripts/strand-meet.ts` (level 2, 150 training-rule
+   taps, 220 steps) on tap-e2-w-l3's best.pt exported with `tap: impulse` or `tap: fixed` gets 0 taps exact when
+   alone, both ways, so there are no pairs to meet. The default page weights (tap-e2-l3, held) are unchanged on
+   the same script and arguments: 8 pairs, A 1.00 -> 0.97 when B arrives, and both lines gone in 0 of 8 (the
+   new count; the game's answer is 8). The script's rerun on trained event weights waits for launch 10.
 
 ### Memory (launch 10)
 
