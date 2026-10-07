@@ -1406,15 +1406,18 @@ function buildLegend(container, series, hiddenSet, chart, onToggle) {
 }
 
 // ---- metric visibility: ~60 quick-check series in one tangle by default is not useful -- show a
-// sensible few (strand: exact/balanced/byLen, the code probe and the right-exit rate; flood: each q<N>
-// group's both/bridge/mix) and hide the rest behind the legend's existing toggles (or "show all"),
+// sensible few (strand: the right-exit rate and persistence first -- they move early --, exact / balanced, the
+// growth speed, the wipe and false-wipe rates of collisions and own-line collateral once a run measures them
+// (train3, docs/spectacle-nca-taps.md §4.5), and the code probes; flood: each q<N> group's both/bridge/mix) and
+// hide the rest behind the legend's existing toggles (or "show all"),
 // remembered per browser (localStorage,
 // best-effort: a private window or cleared storage just means it decides afresh every visit). Decided
 // PER LABEL, once, the first time it's seen -- so a metric that starts appearing later (e.g. q.code
 // once the probe kicks in) still gets a sensible default instead of silently popping in hidden or not.
 var METRIC_HIDDEN_KEY = "ncaDash.hiddenMetrics";
-var STRAND_METRIC_SHOW = ["q.exact", "q.balanced", "q.byLen.short.exact", "q.byLen.medium.exact",
-                          "q.byLen.long.exact", "q.code.exact", "q.exit.rate"];
+var STRAND_METRIC_SHOW = ["q.exit.rate", "q.persist.x4", "q.exact", "q.balanced", "q.speed.rate",
+                          "q.collide.wipe", "q.collide.falseWipe", "q.own.collateral", "q.code.exact",
+                          "q.codeMlp.exact", "q.overfit.exact"];
 function loadStoredHidden(key) {
   try {
     var p = JSON.parse(localStorage.getItem(key) || "null");

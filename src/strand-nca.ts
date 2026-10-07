@@ -15,6 +15,15 @@
 //                                                  group takes local output g + sigma_f^-1(d))
 //   state    clamp(state + d); state[0] = 1 (the mask); off-board cells don't exist here.
 // The state is cell-major: state[i * C + c].
+//
+// The tap (the weights' `tap`, nca/strand/train3.py's --tap; absent in older files = held):
+//   held     the tap's consts (code, chord edges) on its cell every step from the tap on (train2's taps):
+//            setTaps(), as ever
+//   impulse  tap(): the tap's consts on its cell for the next `steps` steps only, then gone. Its part of the
+//            bias touches the cell and its six neighbours, so only those cells' bias is redone, per step it is on
+//   fixed    tap(): no consts at all; the cell's state is written at once: edge channels 1 + d0, 1 + d1 <-
+//            max(itself, 1), and the code's 35-plane form (class bits, then each digit as 3 bits, MSB first; +-1)
+//            into `codeChannels`
 
 import { Board, CODE_BITS, PAIRS, type Rule, RuleTable } from './strand.js';
 
@@ -42,6 +51,16 @@ export interface StrandMeta {
   [key: string]: unknown;
 }
 
+export type TapMode = 'held' | 'impulse' | 'fixed';
+
+export interface TapSpec {
+  mode: TapMode;
+  /** impulse: the steps a tap's consts stay on. */
+  steps: number;
+  /** fixed: the 35 state channels the code is written into. */
+  codeChannels: number[] | null;
+}
+
 export interface StrandWeights {
   arch: 'frame' | 'taps';
   kind: 'v1' | 'v2';
@@ -65,6 +84,10 @@ export interface StrandWeights {
   b2: Float32Array;
   /** [108, planes]: the static input planes per geo. */
   staticLut: { planes: number; data: Float32Array } | null;
+  /** How a tap enters (older files: held). */
+  tap: TapSpec;
+  /** CA steps per chord the model was trained to grow at (older files: 1). */
+  speed: number;
   meta: StrandMeta;
 }
 
@@ -104,7 +127,7 @@ function tensor(t: TensorJson, shape: number[], what: string): Float32Array {
 export function loadStrandWeights(json: unknown): StrandWeights {
   if (!isStrandWeights(json)) throw new Error('not strand weights (no "format": "hexca-strand"): a flood model?');
   const j = json as Record<string, unknown> & { tensors: Record<string, unknown> };
-  if (j.version !== 1) throw new Error(`strand weights version ${String(j.version)}: this page reads version 1`);
+  if (j.version !== 1 && j.version !== 2) throw new Error(`strand weights version ${String(j.version)}: this page reads versions 1 and 2`);
   const C = j.channels as number;
   const H = j.hidden as number;
   const nIn = j.nIn as number;
@@ -114,6 +137,13 @@ export function loadStrandWeights(json: unknown): StrandWeights {
   }
   const T = j.tensors as { w1: TensorJson; b1: TensorJson; mids: { w: TensorJson; b: TensorJson }[]; w2: TensorJson; b2: TensorJson };
   const lut = j.staticLut as { planes: number; data: string } | undefined;
+  const tj = (j.tap ?? null) as { mode?: string; steps?: number | null; codeChannels?: number[] | null } | null;
+  const mode = (tj?.mode ?? 'held') as TapMode;
+  if (!['held', 'impulse', 'fixed'].includes(mode)) throw new Error(`strand weights: unknown tap mode "${mode}"`);
+  const tap: TapSpec = { mode, steps: tj?.steps ?? 1, codeChannels: tj?.codeChannels ?? null };
+  if (mode === 'fixed' && (!tap.codeChannels || tap.codeChannels.length !== CODE35)) {
+    throw new Error(`strand weights: a fixed tap needs ${CODE35} code channels`);
+  }
   return {
     arch: j.arch as 'frame' | 'taps',
     kind: j.kind as 'v1' | 'v2',
@@ -133,8 +163,22 @@ export function loadStrandWeights(json: unknown): StrandWeights {
     w2: tensor(T.w2, [C, H], 'w2'),
     b2: tensor(T.b2, [C], 'b2'),
     staticLut: lut ? { planes: lut.planes, data: decodeF32(lut.data) } : null,
+    tap,
+    speed: (j.speed as number | undefined) ?? 1,
     meta: (j.meta as StrandMeta) ?? {},
   };
+}
+
+/** The fixed tap's code: the 8 class bits, then each of the 9 digits as 3 bits (MSB first); +-1 (train3.code35). */
+export const CODE35 = 8 + 3 * 9;
+export function code35(table: RuleTable, rule: Rule): Float32Array {
+  const code = table.code(rule);
+  const out = new Float32Array(CODE35);
+  for (let k = 0; k < 8; k++) out[k] = code[k] ? 1 : -1;
+  rule.digits.forEach((d, t) => {
+    for (let j = 0; j < 3; j++) out[8 + 3 * t + j] = (d >> (2 - j)) & 1 ? 1 : -1;
+  });
+  return out;
 }
 
 /** A tap: a rule, and the tapped chord (d0, d1) of cell (row, col). */
@@ -249,7 +293,7 @@ function gemm4(M: Float32Array, rows: number, K: number, X: Float32Array, xStrid
 /** The const channels of one board cell, sparse: [channel, value] pairs (channel indexes the consts, mask = 0). */
 type SparseConsts = [number, number][];
 
-/** The trained strand CA on one board, with a set of taps held on their cells. */
+/** The trained strand CA on one board: taps held on their cells (held weights), or taps as events. */
 export class StrandNCA {
   readonly C: number;
   readonly H: number;
@@ -266,7 +310,11 @@ export class StrandNCA {
   private readonly w1cT: Float32Array;
   /** Per cell: b1 + the consts' part of w1 · taps. [n, H] */
   private bias: Float32Array;
+  /** The bias with no tap anywhere (event modes: the taps' parts are added on top while they are on). */
+  private baseBias: Float32Array | null = null;
   private taps: Tap[] = [];
+  /** impulse: the taps whose consts are on, with the steps they have left. */
+  private pulses: { tap: Tap; left: number; delta: Map<number, Float64Array> }[] = [];
   // scratch, four cells at a time
   private readonly X: Float32Array;
   private readonly hA: Float32Array;
@@ -305,20 +353,62 @@ export class StrandNCA {
     return this.taps;
   }
 
-  /** The fresh state: zeros, channel 0 (the mask) 1. */
+  /** How these weights take a tap. */
+  get tapMode(): TapMode {
+    return this.weights.tap.mode;
+  }
+
+  /** Whether taps are one-time events (impulse, fixed) rather than held inputs. */
+  get eventTaps(): boolean {
+    return this.weights.tap.mode !== 'held';
+  }
+
+  /** The fresh state: zeros, channel 0 (the mask) 1. Event modes also forget their taps (and any impulse). */
   reset(): void {
     this.state.fill(0);
     for (let i = 0; i < this.board.n; i++) this.state[i * this.C] = 1;
     this.steps = 0;
+    if (this.eventTaps && (this.taps.length || this.pulses.length)) {
+      this.taps = [];
+      this.pulses = [];
+      this.bias.set(this.baseBias!);
+    }
   }
 
-  /** Hold these taps from now on (the state is kept: call reset() to start over). */
+  /** Hold these taps from now on (the state is kept: call reset() to start over). Held weights only: with event
+   * weights use tap(). */
   setTaps(taps: Tap[]): void {
     if (this.weights.ruleEverywhere && taps.length > 1) {
       throw new Error('this model carries its rule on every cell: one tap per board');
     }
+    if (this.eventTaps && taps.length) throw new Error(`these weights take taps as events (${this.tapMode}): use tap()`);
     this.taps = taps.slice();
     this.buildBias();
+  }
+
+  /** A tap now (before the next step). Held weights: it joins the held taps. Impulse: its consts are on for the
+   * next `steps` steps. Fixed: the cell's state is written. */
+  tap(t: Tap): void {
+    if (!this.eventTaps) {
+      this.setTaps([...this.taps, t]);
+      return;
+    }
+    if (this.weights.ruleEverywhere && this.taps.length >= 1) {
+      throw new Error('this model carries its rule on every cell: one tap per board');
+    }
+    const i = this.board.cellOf[t.row * this.board.w + t.col];
+    if (i < 0) throw new Error(`tap off the board at (${t.row}, ${t.col})`);
+    this.taps.push(t);
+    if (this.tapMode === 'fixed') {
+      const C = this.C;
+      for (const d of [t.d0, t.d1]) this.state[i * C + 1 + d] = Math.max(this.state[i * C + 1 + d], 1);
+      const code = code35(this.table, t.rule);
+      const ch = this.weights.tap.codeChannels!;
+      for (let k = 0; k < CODE35; k++) this.state[i * C + ch[k]] = code[k];
+      return;
+    }
+    this.pulses.push({ tap: t, left: Math.max(1, this.weights.tap.steps), delta: this.tapDelta(t) });
+    this.applyPulses();
   }
 
   /** The consts of every cell, sparse (training's inputs: train2.Planes, train.consts_of). */
@@ -379,6 +469,7 @@ export class StrandNCA {
     const B = this.board;
     const F = this.frames;
     const cs = this.constsOf();
+    if (this.eventTaps && !this.baseBias) this.baseBias = new Float32Array(this.bias.length);
     for (let i = 0; i < B.n; i++) {
       const f = this.frameOf[i];
       const o = i * H;
@@ -395,15 +486,79 @@ export class StrandNCA {
       }
       for (let h = 0; h < H; h++) this.bias[o + h] = this.weights.b1[h] + acc[h];
     }
+    if (this.baseBias && !this.taps.length) this.baseBias.set(this.bias);
   }
 
-  /** One synchronous step of every cell. */
+  /** An impulse tap's part of the bias: per cell whose 7 taps see the tapped cell (it and its neighbours), the
+   * consts' part of w1 · taps that the tap's planes add. */
+  private tapDelta(t: Tap): Map<number, Float64Array> {
+    const { H } = this;
+    const W = this.weights;
+    const B = this.board;
+    const F = this.frames;
+    const src = B.cellOf[t.row * B.w + t.col];
+    let off = 0;
+    const planes: [number, number][] = [];
+    for (const [name, n] of W.consts) {
+      if (name === 'tapCode') {
+        const code = this.table.code(t.rule);
+        for (let k = 0; k < CODE_BITS; k++) if (code[k]) planes.push([off + k, 1]);
+      } else if (name === 'tapDirs') {
+        planes.push([off + t.d0, 1], [off + t.d1, 1]);
+      }
+      off += n;
+    }
+    const out = new Map<number, Float64Array>();
+    for (const i of [src, ...Array.from({ length: 6 }, (_, d) => B.nbr[src * 6 + d])]) {
+      if (i < 0 || out.has(i)) continue;
+      const f = this.frameOf[i];
+      const acc = new Float64Array(H);
+      for (let j = 0; j < 7; j++) {
+        const dir = F.tapDir[f * 7 + j];
+        if ((dir < 0 ? i : B.nbr[i * 6 + dir]) !== src) continue;
+        for (const [ch, v] of planes) {
+          const w = (j * W.nIn + F.constLocal[f * W.nIn + ch]) * H;
+          for (let h = 0; h < H; h++) acc[h] += v * this.w1cT[w + h];
+        }
+      }
+      out.set(i, acc);
+    }
+    return out;
+  }
+
+  /** The bias of the cells the impulses touch (now or last step): the base plus every impulse that is on. */
+  private applyPulses(cells?: Iterable<number>): void {
+    const { H } = this;
+    const touched = new Set<number>(cells ?? []);
+    for (const p of this.pulses) for (const i of p.delta.keys()) touched.add(i);
+    for (const i of touched) {
+      const o = i * H;
+      const acc = new Float64Array(H);
+      for (let h = 0; h < H; h++) acc[h] = this.baseBias![o + h];
+      for (const p of this.pulses) {
+        const d = p.delta.get(i);
+        if (d) for (let h = 0; h < H; h++) acc[h] += d[h];
+      }
+      for (let h = 0; h < H; h++) this.bias[o + h] = acc[h];
+    }
+  }
+
+  /** One synchronous step of every cell (an impulse tap's consts count down by one). */
   step(): void {
     this.stepRange(0, this.board.n);
     const t = this.state;
     this.state = this.next;
     this.next = t;
     this.steps++;
+    if (this.pulses.length) {
+      const was = new Set<number>();
+      for (const p of this.pulses) {
+        p.left--;
+        if (p.left <= 0) for (const i of p.delta.keys()) was.add(i);
+      }
+      this.pulses = this.pulses.filter((p) => p.left > 0);
+      if (was.size) this.applyPulses(was);
+    }
   }
 
   /** The new state of cells [lo, hi) into `next` (from `state`). */

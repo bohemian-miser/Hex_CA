@@ -1,22 +1,28 @@
 // What a strand NCA does when two patterns meet on one board (the strand page's shared board: both taps are
 // inputs of one state), with the page's runner (src/strand-nca.ts):
-//   npx tsx scripts/strand-meet.ts WEIGHTS.json [board l2|l3|l4] [pool 24] [pairs 12] [seed 1] [split train|heldout]
+//   npx tsx scripts/strand-meet.ts WEIGHTS.json [board l2|l3|l4] [pool 24] [pairs 12] [seed 1] [split train|heldout] [tries 2000]
 // Phase 1: a pool of taps (strands of 8..50 chords) that the model draws EXACTLY alone in 110 steps.
 // Phase 2: pairs from the pool whose true strands share tiles (each tap in at most two pairs): (a) both taps from
 // step 0; (b) A alone until complete, then B added with the state kept -- a line already there, another pattern
 // runs into it. Per pair: the share of each strand's chords drawn, strays, where A lost chords, and for each way
 // out of B's tap that reaches A whether B stops within a chord of the first tile it shares with A.
+// The tap is the weights' (src/strand-nca.ts): held weights (train2) hold both taps every step, as before; event
+// weights (train3's impulse or fixed write) take each tap once -- in (b) B is a tap into the running board -- and
+// the rollout is G x their speed (a chord per two steps). Under the game's rule (docs/spectacle-nca-taps.md:
+// the pattern owns the tile, both lines go) the right answer for two patterns meeting is both lines GONE, which
+// the summary counts too (a strand "gone": under a tenth of its chords drawn).
 import { readFileSync } from 'node:fs';
 import { Board, RuleTable, walk, type Strand, type StrandData } from '../src/strand.js';
 import { StrandNCA, chordsAt, loadStrandWeights, type Tap } from '../src/strand-nca.js';
 import { rng } from '../src/lines.js';
 const data = JSON.parse(readFileSync(new URL('../web/strand-data.json', import.meta.url), 'utf8')) as StrandData;
 const table = new RuleTable(data);
-const [wfile, boardName = 'l3', poolN = '24', pairN = '12', seedS = '1', splitArg = 'train'] = process.argv.slice(2);
+const [wfile, boardName = 'l3', poolN = '24', pairN = '12', seedS = '1', splitArg = 'train', triesS = '2000'] = process.argv.slice(2);
 const w = loadStrandWeights(JSON.parse(readFileSync(wfile, 'utf8')));
 const b = new Board(data.boards[boardName]);
 const rand = rng(Number(seedS));
-const G = 110;
+const events = w.tap.mode !== 'held';
+const G = 110 * Math.max(1, w.speed);
 interface T { tap: Tap; st: Strand; cells: Set<number>; edges: Set<number>; name: string }
 const cellOf = (st: Strand, k: number) => b.cellOf[st.rows[k] * b.w + st.cols[k]];
 function mk(tap: Tap): T {
@@ -34,9 +40,10 @@ function drawn(m: StrandNCA): Set<number> {
 const chordOn = (t: T, P: Set<number>, k: number) => P.has(cellOf(t.st, k) * 6 + t.st.ins[k]) && P.has(cellOf(t.st, k) * 6 + t.st.outs[k]);
 const frac = (t: T, P: Set<number>) => t.st.rows.filter((_, k) => chordOn(t, P, k)).length / t.st.rows.length;
 const exactAlone = (t: T, P: Set<number>) => P.size === t.edges.size && [...t.edges].every((e) => P.has(e));
+/** Held weights: hold `taps` from now on. Event weights: fire the taps the model has not had yet, now. */
 function run(taps: Tap[], steps: number, m?: StrandNCA): StrandNCA {
   const mm = m ?? new StrandNCA(w, b, table);
-  mm.setTaps(taps);
+  if (events) { for (const t of taps) if (!mm.tapList.includes(t)) mm.tap(t); } else mm.setTaps(taps);
   for (let s = 0; s < steps; s++) mm.step();
   return mm;
 }
@@ -44,7 +51,7 @@ function run(taps: Tap[], steps: number, m?: StrandNCA): StrandNCA {
 const pool: T[] = [];
 let cand = 0;
 const t0 = Date.now();
-while (pool.length < Number(poolN) && cand < 2000) {
+while (pool.length < Number(poolN) && cand < Number(triesS)) {
   const r = table.sample(rand, splitArg as 'train' | 'heldout');
   const p = b.pos[Math.floor(rand() * b.n)];
   const row = Math.floor(p / b.w);
@@ -58,7 +65,7 @@ while (pool.length < Number(poolN) && cand < 2000) {
   cand++;
   if (exactAlone(t, drawn(run([t.tap], G)))) pool.push(t);
 }
-console.log(`${wfile} ${boardName}: pool ${pool.length} exact-alone taps of ${cand} tried (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
+console.log(`${wfile} ${boardName} (tap ${w.tap.mode}${events ? `, ${G} steps` : ''}): pool ${pool.length} exact-alone taps of ${cand} tried (${((Date.now() - t0) / 1000).toFixed(0)} s)`);
 // phase 2
 const pairs: [T, T][] = [];
 for (let i = 0; i < pool.length && pairs.length < Number(pairN); i++) {
@@ -76,7 +83,8 @@ for (let i = 0; i < pool.length && pairs.length < Number(pairN); i++) {
     pairs.push([A, B]);
   }
 }
-const S = { n: 0, togA: 0, togB: 0, togBoth: 0, seqA0: 0, seqA: 0, seqB: 0, seqBoth: 0, aLostShared: 0, aLostElse: 0, aChords: 0, bStop: 0, bOn: 0, bNoMeet: 0, togStray: 0, seqStray: 0, aGone: 0, aIntact: 0 };
+const S = { n: 0, togA: 0, togB: 0, togBoth: 0, seqA0: 0, seqA: 0, seqB: 0, seqBoth: 0, aLostShared: 0, aLostElse: 0, aChords: 0, bStop: 0, bOn: 0, bNoMeet: 0, togStray: 0, seqStray: 0, aGone: 0, aIntact: 0, togGone: 0, seqGone: 0 };
+const GONE = 0.1;
 for (const [A, B] of pairs) {
   const union = new Set([...A.edges, ...B.edges]);
   const shared = [...A.cells].filter((c) => B.cells.has(c));
@@ -114,6 +122,7 @@ for (const [A, B] of pairs) {
   S.n++; S.togA += tA; S.togB += tB; S.togBoth += +(tA === 1 && tB === 1 && st1 === 0); S.seqA0 += a0; S.seqA += qA; S.seqB += qB;
   S.seqBoth += +(qA === 1 && qB === 1 && st2 === 0); S.aLostShared += lostS; S.aLostElse += lostE; S.aChords += A.st.rows.length;
   S.togStray += st1; S.seqStray += st2; S.aGone += +(qA < 0.5); S.aIntact += +(qA === 1);
+  S.togGone += +(tA < GONE && tB < GONE); S.seqGone += +(qA < GONE && qB < GONE);
   console.log(`${A.name} x ${B.name}, ${shared.length} shared cells | together: A ${tA.toFixed(2)} B ${tB.toFixed(2)} +${st1} stray | A first (${a0.toFixed(2)}), then B: A ${qA.toFixed(2)} (lost ${lostS} chords at shared cells, ${lostE} elsewhere) B ${qB.toFixed(2)} +${st2} stray | B: ${ways.join('; ')}`);
 }
 const n = S.n || 1;
@@ -122,3 +131,4 @@ console.log(`\nSUMMARY ${wfile} on ${boardName}, ${S.n} pairs, each tap exact al
 console.log(`  together from step 0: A ${f(S.togA)} B ${f(S.togB)} of their chords drawn, both exact ${S.togBoth}/${S.n}, ${f(S.togStray)} stray edges`);
 console.log(`  A first, then B: A ${f(S.seqA0)} -> ${f(S.seqA)} (lost ${S.aLostShared} chords at shared cells + ${S.aLostElse} elsewhere of ${S.aChords}; A intact in ${S.aIntact}, mostly gone in ${S.aGone}), B ${f(S.seqB)}, both exact ${S.seqBoth}/${S.n}, ${f(S.seqStray)} stray`);
 console.log(`  B's ways that reach A: stop there ${S.bStop}, run on ${S.bOn} (${S.bNoMeet} ways never reach A)`);
+console.log(`  both lines gone (the game's answer; under ${GONE * 100}% of each strand drawn): together ${S.togGone}/${S.n}, A first then B ${S.seqGone}/${S.n}`);

@@ -4,6 +4,12 @@
 //
 // Weights: ?weights=<url>&name=<label> (the training dashboard's Play), else strand-weights.json beside the page
 // (the build copies web/strand-weights.json there), else the GitHub Pages copy. ?map=l2|l3|l4, ?rule=<describeRule>.
+//
+// How a tap enters is the weights' (src/strand-nca.ts, `tap`): held weights (train2's) hold every tap on its tile
+// for good, so taking one away changes the board's inputs; event weights (train3's impulse or fixed write) take a
+// tap once, as Spectacle does, and the line has to keep itself alive. With event weights a tap is refused where
+// Spectacle refuses it (a rival's line owns its whole tile; on a tile of your own line only a free chord takes a
+// tap), and taking a tap away, or Reset, starts the board over with the remaining taps fired at step 0.
 
 import dataJson from './strand-data.json';
 import { Board, PAIRS, RuleTable, walk, type Rule, type Strand, type StrandData } from '../src/strand.js';
@@ -52,6 +58,8 @@ interface PlayTap {
   ruleBits: Int16Array;
   /** Its own model when taps don't share a board. */
   model: StrandNCA | null;
+  /** The step it was tapped at (event weights). */
+  at: number;
   exact: boolean;
   since: number | null;
   drawn: number;
@@ -96,6 +104,8 @@ function boardOf(id: string): Board {
 }
 
 const canShare = () => !!weights && !weights.ruleEverywhere;
+/** The weights take taps as one-time events (train3's impulse / fixed write), not held inputs. */
+const eventTaps = () => !!weights && weights.tap.mode !== 'held';
 const usingShared = () => shared && canShare();
 /** Steps the models have run (a shared board's, else the oldest tap's). */
 function stepCount(): number {
@@ -103,20 +113,23 @@ function stepCount(): number {
   return taps.reduce((a, t) => Math.max(a, t.model?.steps ?? 0), 0);
 }
 
-/** Every model rebuilt from the fresh state, the taps held from step 0. */
+/** Every model rebuilt from the fresh state, the taps held from step 0 (event weights: fired at step 0). */
 function buildModels(): void {
   sharedModel = null;
   for (const t of taps) t.model = null;
   if (!weights) return;
   if (usingShared()) {
     sharedModel = new StrandNCA(weights, board, table);
-    sharedModel.setTaps(taps.map((t) => t.tap));
+    if (eventTaps()) for (const t of taps) sharedModel.tap(t.tap);
+    else sharedModel.setTaps(taps.map((t) => t.tap));
   } else {
     for (const t of taps) {
       t.model = new StrandNCA(weights, board, table);
-      t.model.setTaps([t.tap]);
+      if (eventTaps()) t.model.tap(t.tap);
+      else t.model.setTaps([t.tap]);
     }
   }
+  for (const t of taps) t.at = 0;
   for (const t of taps) t.since = null;
   lastChange = 0;
   drawnKey = 0;
@@ -140,20 +153,24 @@ function makeTap(tap: Tap): PlayTap {
   if (used.has(colour)) colour = (nextId - 1) % N_COLOURS;
   return {
     id: nextId++, tap, colour, strand, trueEdge, trueChords, ruleBits: table.render(tap.rule, board), model: null,
-    exact: false, since: null, drawn: 0, missing: 0, stray: 0,
+    at: stepCount(), exact: false, since: null, drawn: 0, missing: 0, stray: 0,
   };
 }
 
 /** The taps changed: the shared model takes the new set (its state kept, as a board in play would), or the new
- * tap gets a model of its own. */
+ * tap gets a model of its own. Event weights: a new tap is fired into the running board; a tap taken away starts
+ * the board over (a tap that happened can't un-happen), the rest fired again at step 0. */
 function tapsChanged(added: PlayTap | null): void {
   if (weights) {
     if (usingShared()) {
       if (!sharedModel) buildModels();
-      else sharedModel.setTaps(taps.map((t) => t.tap));
+      else if (!eventTaps()) sharedModel.setTaps(taps.map((t) => t.tap));
+      else if (added) sharedModel.tap(added.tap);
+      else buildModels();
     } else if (added) {
       added.model = new StrandNCA(weights, board, table);
-      added.model.setTaps([added.tap]);
+      if (eventTaps()) added.model.tap(added.tap);
+      else added.model.setTaps([added.tap]);
     }
   }
   computeOwners();
@@ -186,10 +203,41 @@ function computeOwners(): void {
   for (let i = 0; i < board.n; i++) if (owner[i] < 0) owner[i] = 0;
 }
 
+/** Why Spectacle would refuse a tap of the current rule on cell i (event weights on one board), or a free chord of
+ * the tile to tap instead of (d0, d1): a rival's line (a tap of another rule whose strand the model draws on the
+ * tile) owns the whole tile; on a tile of your own line, a chord it already runs on is taken (freeChord). */
+function legalTap(row: number, col: number, d0: number, d1: number): { why: string } | { d0: number; d1: number } {
+  if (!sharedModel || !eventTaps()) return { d0, d1 };
+  const i = board.cellOf[row * board.w + col];
+  const P = drawnOf(sharedModel);
+  const name = table.describe(rule);
+  for (const t of [...taps].reverse()) { // the latest tap first: drawn edges carry no rule, so this is a guess
+    const chords = t.trueChords.get(i);
+    if (!chords || table.describe(t.tap.rule) === name) continue;
+    if (chords.some(([a, b]) => P[i * 6 + a] || P[i * 6 + b])) {
+      return { why: `Refused: a line of ${table.describe(t.tap.rule)} is on that tile, and a rival's line owns its whole tile (Spectacle's rule).` };
+    }
+  }
+  const free = ([a, b]: [number, number]) => !P[i * 6 + a] && !P[i * 6 + b];
+  if (free([d0, d1])) return { d0, d1 };
+  const other = chordsAt(table, rule, board, row, col).find(free);
+  return other ? { d0: other[0], d1: other[1] } : { why: 'Refused: your line already runs on every chord of that tile.' };
+}
+
 /** Add a tap of the current rule at cell (row, col), the chord (d0, d1); a tap already on that cell is replaced
- * (or, the same rule and chord again, taken away). */
+ * (or, the same rule and chord again, taken away). Event weights: a tap is refused where Spectacle refuses it and is
+ * otherwise a new tap, whatever is on the tile. */
 function addTap(row: number, col: number, d0: number, d1: number): void {
-  const at = taps.findIndex((t) => t.tap.row === row && t.tap.col === col);
+  if (eventTaps()) {
+    const ok = legalTap(row, col, d0, d1);
+    if ('why' in ok) {
+      notice = ok.why;
+      readout();
+      return;
+    }
+    [d0, d1] = [ok.d0, ok.d1];
+  }
+  const at = eventTaps() ? -1 : taps.findIndex((t) => t.tap.row === row && t.tap.col === col);
   if (at >= 0) {
     const old = taps[at];
     const same = table.describe(old.tap.rule) === table.describe(rule)
@@ -716,7 +764,9 @@ function sharedNote(): void {
   $('sharedNote').textContent = !weights ? '' : !canShare()
     ? `These weights carry the rule on every tile (${weights.kind === 'v1' ? "v1's chord planes" : 'the code broadcast'}), so each tap runs on a board of its own.`
     : usingShared()
-      ? 'Every tap is an input of one board, so strands can run into each other. The models were never trained on that: this shows what they do.'
+      ? (eventTaps()
+        ? 'Every tap happens once on one board: a line keeps itself alive, a line of another pattern that runs into it should take both away, and a tap where Spectacle refuses one is refused here too.'
+        : 'Every tap is an input of one board, so strands can run into each other. The models were never trained on that: this shows what they do.')
       : 'Each tap runs on a board of its own, as in training; the drawings are laid over each other.';
 }
 
@@ -740,7 +790,9 @@ function readout(): void {
     ? ` <span class="warn">${MAP_LABELS[mapId]} has ${board.n.toLocaleString()} tiles: about ${Math.round(msPerStep)} ms a step here (the network runs on every tile, every step, on this browser's main thread), so strands grow slowly.</span>`
     : '';
   $('status').innerHTML = (notice || (taps.length
-    ? `Tap a tile to add a strand with <b>${table.describe(rule)}</b>; tap a tapped tile to replace its tap.`
+    ? (eventTaps()
+      ? `Tap a tile to start a line of <b>${table.describe(rule)}</b> (a one-time tap: the line must keep itself going).`
+      : `Tap a tile to add a strand with <b>${table.describe(rule)}</b>; tap a tapped tile to replace its tap.`)
     : `Tap a tile: the strand of <b>${table.describe(rule)}</b> starts at the chord nearest your tap.`)) + slow;
 }
 
@@ -758,6 +810,11 @@ function modelLine(): void {
       ? `option E (every tile in its own frame)${weights.inputs === 'e-bc' ? ' + the rule broadcast to every tile (a diagnostic)' : ''}`
       : `option ${weights.inputs.toUpperCase()} (the grid's frame)${weights.inputs.endsWith('-bc') ? ' + the rule broadcast to every tile (a diagnostic)' : ''}`;
   const ho = m.heldOut;
+  const tapHow = weights.tap.mode === 'held'
+    ? 'each tap held on its tile every step'
+    : `each tap a one-time event (${weights.tap.mode === 'impulse'
+      ? `its inputs on for ${weights.tap.steps} step${weights.tap.steps > 1 ? 's' : ''}` : 'a fixed write of its tile\'s state'}), `
+      + `growing a chord every ${weights.speed} step${weights.speed > 1 ? 's' : ''}`;
   const lv = ho?.byLevel ? Object.entries(ho.byLevel).map(([k, v]) => `L${k} ${fmt(v.exact)}`).join(', ') : '';
   const held = ho && typeof ho.exact === 'number'
     ? `held-out exact <b>${fmt(ho.exact)}</b>${lv ? ` (${lv})` : ''}, length-balanced ${fmt(ho.balanced)}`
@@ -765,12 +822,13 @@ function modelLine(): void {
   const it = typeof m.iteration === 'number'
     ? `${m.file ?? 'checkpoint'} at iteration ${m.iteration.toLocaleString()}${m.prevIterations ? ` (+${m.prevIterations.toLocaleString()} before, from ${m.init ?? 'its --init'})` : ''}`
     : '';
-  el.innerHTML = `Weights: <b>${escapeHtml(String(name))}</b> — ${arch}; ${held}${it ? `; ${escapeHtml(it)}` : ''}.`
+  el.innerHTML = `Weights: <b>${escapeHtml(String(name))}</b> — ${arch}; ${tapHow}; ${held}${it ? `; ${escapeHtml(it)}` : ''}.`
     + (weightsError ? `<span class="err">${escapeHtml(weightsError)}</span>` : '');
   $('source').textContent = `${weightsFrom} · ${weights.kind} ${weights.arch}, inputs ${weights.inputs}`;
   $('meta').textContent = `${weights.channels} channels (1-6: the edges drawn), ${weights.hidden} hidden, depth ${weights.depth}, `
     + `${weights.nIn} const inputs (${weights.consts.map(([k, n]) => `${k} ${n}`).join(', ')}), clamp `
-    + `${weights.clamp ? `[${weights.clamp.join(', ')}]` : 'none'}; a tile's edge is drawn where its channel > 0.5.`;
+    + `${weights.clamp ? `[${weights.clamp.join(', ')}]` : 'none'}; a tile's edge is drawn where its channel > 0.5; tap ${weights.tap.mode}`
+    + `${weights.tap.mode === 'impulse' ? ` for ${weights.tap.steps}` : ''}${weights.tap.mode === 'fixed' ? ` into channels ${weights.tap.codeChannels![0]}-${weights.tap.codeChannels![34]}` : ''}.`;
 }
 
 function escapeHtml(s: string): string {
@@ -1030,7 +1088,9 @@ $('step').addEventListener('click', () => {
 });
 $('reset').addEventListener('click', () => {
   buildModels();
-  notice = 'Every model is back at the fresh state, its taps held from step 0.';
+  notice = eventTaps()
+    ? 'Every model is back at the fresh state, its taps fired again at step 0.'
+    : 'Every model is back at the fresh state, its taps held from step 0.';
   setPlaying(true);
 });
 $<HTMLInputElement>('speed').addEventListener('input', (ev) => {
@@ -1086,7 +1146,13 @@ Object.assign(window, {
     /** Each tap's numbers: rule, length, drawn, stray, exact. */
     stats() {
       return taps.map((t) => ({ rule: table.describe(t.tap.rule), row: t.tap.row, col: t.tap.col, length: t.strand.rows.length,
-        closed: t.strand.closed, drawn: t.drawn, missing: t.missing, stray: t.stray, exact: t.exact, since: t.since }));
+        closed: t.strand.closed, drawn: t.drawn, missing: t.missing, stray: t.stray, exact: t.exact, since: t.since, at: t.at }));
+    },
+    /** Tap (row, col) with the current rule, as a click would (its nearest chord: the first). */
+    tap(row: number, col: number) {
+      const ch = chordsAt(table, rule, board, row, col);
+      if (ch.length) addTap(row, col, ch[0][0], ch[0][1]);
+      return notice;
     },
     setRule(text: string) { const r = table.parse(text); if (typeof r !== 'string') setRule(r); return r; },
     run(n: number) { for (let k = 0; k < n; k++) stepAll(); dirty = true; },
