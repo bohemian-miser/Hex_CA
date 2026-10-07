@@ -158,6 +158,7 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
         <ol class="players" id="players"></ol>
         <div class="buttons">
           <button id="addPlayer" title="Another player at this screen: select a player, then tap for them">Add player</button>
+          <button id="addBot" title="A player who taps by itself, with a rule of its own">Add bot</button>
         </div>
       </div>
       <div class="group">
@@ -177,6 +178,7 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
           </select>
         </div>
         <p class="ruleNow" id="ruleNow"></p>
+        <p class="note" id="ruleHint"></p>
         <p class="note" id="ruleErr" aria-live="polite"></p>
       </div>
       <div class="group">

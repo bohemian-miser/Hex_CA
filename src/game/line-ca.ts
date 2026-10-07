@@ -430,6 +430,27 @@ export class LineCA {
   }
 
   /**
+   * The host's rewrite of whole tiles, between steps: every chord on these tiles goes at once, and `rule`'s own
+   * chords on them are laid in their place with no tips. Rule 0 just clears them (a player's lines when they change
+   * rule: Spectacle's setRule wipes them). A rule: v1.1's conversion (docs/spectacle-ca-hybrid.md §3.4, Spectacle's
+   * convertPath → sprout, the pieces not growing); a tile where it has no chord is left empty. Not in the doc's
+   * interface; an addition (src/game/host.ts).
+   */
+  convert(cells: ArrayLike<number>, rule: number): void {
+    const owner = this.ownerOf[rule];
+    for (let k = 0; k < cells.length; k++) {
+      const c = cells[k];
+      if (!(c >= 0 && c < this.n)) continue;
+      let D = 0;
+      for (let d = 0; d < 6; d++) if (this.pt(rule, c, d) >= 0) D |= 1 << d;
+      this.write(c, D ? rule : 0, D ? owner : 0, D, 0, 0);
+      this.ca.writeState('W', c, 0);
+      this.ca.writeState('closed', c, 0);
+      for (let d = 0; d < 6; d++) this.ca.writeState(`probe${d}`, c, 0);
+    }
+  }
+
+  /**
    * One synchronous step. `go[owner]` (owners 0..15): whose tiles draw this step; default: all on steps ≡ 0 mod
    * period. An owner who went last step does not go this one (a line grows at most a chord every two steps).
    */
