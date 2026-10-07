@@ -10,7 +10,8 @@ import { HexNCA, cellCoords, cellIndex, fieldMask, hexDist, loadWeights, randomB
 import { coordsOf, indexOf, makeBoard } from '../src/hex.js';
 import { randomLoop, rng } from '../src/lines.js';
 import {
-  css3, divLevel as sharedDivLevel, fillLevel, LEVELS, pixel, ramps as sharedRamps, type Ramps,
+  css3, divLevel as sharedDivLevel, fillLevel, fitPca3, hslRgb, hueBlend, LEVELS, pcaColour, pixel,
+  ramps as sharedRamps, rgbOf, type Pca3, type Ramps,
 } from '../src/ramp.js';
 import hexL2 from '../nca/fields/hex-l2.json';
 import hexL3 from '../nca/fields/hex-l3.json';
@@ -88,14 +89,119 @@ let oracleCounts: number[] = [];
 let editedAt = 0;
 let playing = true;
 let tool: 'wall' | 'erase' = 'wall';
-/** The channel on the big board, or null for the fill view. */
-let shown: number | null = null;
+/** The channel on the big board, 'super' for every hidden channel superimposed, or null for the fill view. */
+type ShownView = number | 'super' | null;
+let shown: ShownView = null;
 /** Edit-trained weights (meta.pool) carry on across edits; the rest start over. */
 let resetOnEdit = meta.pool !== true;
 let notice = '';
 let dirty = true;
 let gridDirty = true;
 let readoutDirty = true;
+
+// ── Superimposed view: every (hidden) channel folded into one picture ───────
+// Two false-colour modes (src/ramp.ts): PCA's top 3 directions of a chosen set of channels → red/green/blue
+// (the default: it finds whatever is most different across the board, however many channels there are), or
+// each channel its own fixed hue, weighted by |value| and added together (washes out with many channels, but
+// needs no basis). The PCA basis is refit only now and then (SUPER_REFIT_STEPS, or the Recompute button) —
+// projecting a fitted basis every frame is cheap, refitting it isn't worth doing every frame.
+type SuperScope = 'hidden' | 'all' | 'noOut';
+type SuperMode = 'pca' | 'hue';
+let superScope: SuperScope = 'hidden';
+let superMode: SuperMode = 'pca';
+let superOverlay = true;
+let superBasis: Pca3 | null = null;
+let superHues: [number, number, number][] = [];
+let superFitStep = -1;
+const SUPER_REFIT_STEPS = 50;
+/** Snap step for the superimposed view's colours (RGB units): a frame fills one path per colour, same idea as
+ * the quantised ramps above, so a board of thousands of nearly-but-not-quite-equal cells doesn't mean
+ * thousands of separate fill() calls. */
+const SUPER_RGB_STEP = 8;
+
+/** localStorage: whether the superimposed view was picked last (sticky across visits; ?view= still wins). */
+const VIEW_STORAGE_KEY = 'hexca.nca.view';
+function loadStoredView(): 'super' | null {
+  try {
+    return localStorage.getItem(VIEW_STORAGE_KEY) === 'super' ? 'super' : null;
+  } catch {
+    return null; // private window, or site data cleared/blocked: just not sticky
+  }
+}
+function storeView(v: 'super' | null): void {
+  try {
+    if (v) localStorage.setItem(VIEW_STORAGE_KEY, v);
+    else localStorage.removeItem(VIEW_STORAGE_KEY);
+  } catch {
+    // ditto: the choice just isn't sticky across visits
+  }
+}
+
+/** The channels the superimposed view blends, under the current scope. */
+function superChannels(): number[] {
+  const out: number[] = [];
+  for (let c = 0; c < C; c++) {
+    if (superScope === 'hidden' && c < 2) continue; // 0 wall, 1 fill
+    if (superScope === 'noOut' && c === 1) continue; // fill is the one trained output
+    out.push(c);
+  }
+  return out;
+}
+
+/** Hue mode's fixed hue per selected channel (by position, not channel number): recomputed only when the
+ * selection changes, not per frame. */
+function refreshSuperHues(): void {
+  const n = superChannels().length;
+  superHues = Array.from({ length: n }, (_, i) => hslRgb((360 * i) / Math.max(1, n), 75, 55));
+}
+
+/** Refits the PCA basis if it is missing, or `force`, or it has been SUPER_REFIT_STEPS since the last fit. */
+function fitSuperBasis(force = false): void {
+  if (superMode !== 'pca') return;
+  if (!force && superBasis && m.steps - superFitStep < SUPER_REFIT_STEPS) return;
+  const sel = superChannels();
+  if (!sel.length) {
+    superBasis = null;
+    return;
+  }
+  const chans = sel.map((c) => m.channel(c));
+  superBasis = fitPca3((i, k) => chans[k][i], sel.length, m.cells, superBasis ?? undefined);
+  superFitStep = m.steps;
+}
+
+/** Every on-board cell's superimposed colour, added to `fills` (web/nca.ts's draw()). */
+function drawSuperFills(fills: Fills, col: Colours): void {
+  const sel = superChannels();
+  if (!sel.length) {
+    for (const i of m.cells) fills.add(col.cell, i);
+    return;
+  }
+  const chans = sel.map((c) => m.channel(c));
+  const snap = (x: number) => Math.max(0, Math.min(255, Math.round(x / SUPER_RGB_STEP) * SUPER_RGB_STEP));
+  if (superMode === 'pca') {
+    fitSuperBasis();
+    const basis = superBasis;
+    const row = new Float64Array(sel.length);
+    for (const i of m.cells) {
+      if (!basis) {
+        fills.add(col.cell, i);
+        continue;
+      }
+      for (let k = 0; k < sel.length; k++) row[k] = chans[k][i];
+      const [r, g, b] = pcaColour(basis, row);
+      fills.add(css3([snap(r), snap(g), snap(b)]), i);
+    }
+  } else {
+    const bg = rgbOf(col.cell);
+    const hueWeights = new Array<number>(sel.length);
+    const span = Math.max(1e-6, HI);
+    for (const i of m.cells) {
+      for (let k = 0; k < sel.length; k++) hueWeights[k] = Math.min(1, Math.abs(chans[k][i]) / span);
+      const [r, g, b] = hueBlend(hueWeights, superHues, bg);
+      fills.add(css3([snap(r), snap(g), snap(b)]), i);
+    }
+  }
+}
 
 // ── The automaton ───────────────────────────────────────────────────────────
 
@@ -116,6 +222,8 @@ function newModel(): void {
   m.reset();
   wallsChanged();
   layout();
+  superBasis = null; // the cell set just changed under it
+  superFitStep = -1;
 }
 
 function wallsChanged(): void {
@@ -343,6 +451,9 @@ function draw(): void {
   if (shown === null) {
     const fill = m.channel(1);
     for (const i of m.cells) fills.add(m.walls[i] ? col.line : css3(rp.fill[fillLevel(fill[i])]), i);
+  } else if (shown === 'super') {
+    drawSuperFills(fills, col);
+    if (superOverlay) for (const i of m.cells) if (m.walls[i]) inset.add(col.line, i);
   } else {
     const v = m.channel(shown);
     for (const i of m.cells) {
@@ -358,7 +469,7 @@ function draw(): void {
     hexes(Array.from(m.cells), s);
     ctx.stroke();
   }
-  if (shown === null) {
+  if (shown === null || (shown === 'super' && superOverlay)) {
     // A dot on every cell the network gets wrong.
     const bad = differing();
     if (bad.length) {
@@ -469,12 +580,23 @@ function drawGrid(): void {
   }
 }
 
-function show(c: number | null): void {
+function show(c: ShownView): void {
   shown = c;
   for (const t of tiles) if (t.kind === 'state') t.el.setAttribute('aria-pressed', String(t.index === c));
   $('showFill').setAttribute('aria-pressed', String(c === null));
+  $('showSuper').setAttribute('aria-pressed', String(c === 'super'));
+  $('superGroup').hidden = c !== 'super';
+  if (c === 'super') {
+    refreshSuperHues();
+    fitSuperBasis(true);
+  }
   legend();
   dirty = true;
+  const u = new URL(location.href);
+  if (c === 'super') u.searchParams.set('view', 'super');
+  else u.searchParams.delete('view');
+  history.replaceState(null, '', u);
+  storeView(c === 'super' ? 'super' : null);
 }
 
 // ── Readout ─────────────────────────────────────────────────────────────────
@@ -529,8 +651,20 @@ function metaLine(): string {
   return `Weights: ${parts.join(' · ')}${note}`;
 }
 
+/** What the scope select includes, for the legend's one-line explanation. */
+function scopeLabel(): string {
+  return superScope === 'hidden' ? 'the hidden channels' : superScope === 'all' ? 'every channel' : 'every channel but fill';
+}
+
 function legend(): void {
   const sw = (colour: string, label: string, cls = 'sw') => `<span><i class="${cls}" style="background:${colour}"></i>${label}</span>`;
+  if (shown === 'super') {
+    $('legend').innerHTML = superMode === 'pca'
+      ? [`<span>Superimposed: ${scopeLabel()}, PCA's top 3 directions of spread → <b>red</b>/<b>green</b>/<b>blue</b>.</span>`,
+        `<span>Refit every ${SUPER_REFIT_STEPS} steps, or on demand.</span>`].join('')
+      : [`<span>Superimposed: ${scopeLabel()}, each channel its own hue, brightness = |value|, added together.</span>`].join('');
+    return;
+  }
   $('legend').innerHTML = shown === null
     ? [sw('var(--line)', 'wall'), sw('var(--flood)', 'fill 1'), sw('var(--cell)', 'fill 0'), sw('var(--bad)', 'wrong vs oracle', 'sw dot')].join('')
     : [`<span>Board: channel <b>${shown}</b> (${NAMES[shown]})</span>`,
@@ -661,6 +795,34 @@ $('loop').addEventListener('click', addLoop);
 $('bridge').addEventListener('click', addBridge);
 $('clear').addEventListener('click', () => edit(Array.from(m.cells), 0));
 $('showFill').addEventListener('click', () => show(null));
+$('showSuper').addEventListener('click', () => show('super'));
+$<HTMLSelectElement>('superScope').addEventListener('change', (ev) => {
+  superScope = (ev.target as HTMLSelectElement).value as SuperScope;
+  superBasis = null;
+  superFitStep = -1;
+  refreshSuperHues();
+  if (shown === 'super') {
+    legend();
+    dirty = true;
+  }
+});
+for (const mode of ['pca', 'hue'] as const) {
+  $<HTMLInputElement>(`superMode-${mode}`).addEventListener('change', () => {
+    superMode = mode;
+    if (shown === 'super') {
+      legend();
+      dirty = true;
+    }
+  });
+}
+$<HTMLInputElement>('superOverlay').addEventListener('change', (ev) => {
+  superOverlay = (ev.target as HTMLInputElement).checked;
+  if (shown === 'super') dirty = true;
+});
+$('superRecompute').addEventListener('click', () => {
+  fitSuperBasis(true);
+  if (shown === 'super') dirty = true;
+});
 const resetBox = $<HTMLInputElement>('resetOnEdit');
 resetBox.checked = resetOnEdit;
 resetBox.addEventListener('change', () => {
@@ -733,6 +895,9 @@ function setWeights(w: NCAWeights): void {
   C = w.channels;
   [LO, HI] = w.clamp ?? [-1, 1];
   NAMES = Array.from({ length: C }, (_, c) => (c === 0 ? 'wall' : c === 1 ? 'fill' : 'hidden'));
+  superBasis = null; // the channel count may just have changed
+  superFitStep = -1;
+  refreshSuperHues();
 }
 
 function showSource(): void {
@@ -794,7 +959,7 @@ async function reloadWeights(auto: boolean): Promise<void> {
       buildTiles();
       $('meta').textContent = metaLine();
       newModel();
-      show(shown !== null && shown < C ? shown : null);
+      show(shown === 'super' ? 'super' : shown !== null && shown < C ? shown : null);
       source = { label: weightsName || weightsUrl, loaded: new Date() };
     }
     source.error = undefined;
@@ -832,13 +997,15 @@ Object.assign(window, {
 
 /** ?map=<id>: which board to open on (MAPS' ids; falls back to the hexagon). */
 const initialMap = params.get('map');
+/** ?view=super, else the sticky choice (localStorage): open straight into the superimposed view. */
+const initialView: ShownView = params.get('view') === 'super' || loadStoredView() === 'super' ? 'super' : null;
 
 void initialWeights().then(() => {
   $('meta').textContent = metaLine();
   buildTiles();
   setMap(initialMap && mapById.has(initialMap) ? initialMap : 'hex');
   addLoop();
-  show(null);
+  show(initialView);
   setPlaying(true);
   requestAnimationFrame(frame);
 });

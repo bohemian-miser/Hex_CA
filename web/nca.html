@@ -150,6 +150,24 @@ dl.readout dd { margin: 0; text-align: right; }
         <div class="label">Show</div>
         <div class="buttons">
           <button id="showFill" aria-pressed="true">Fill</button>
+          <button id="showSuper" title="Every selected channel folded into one false-colour picture">Superimposed</button>
+        </div>
+        <div class="group" id="superGroup" hidden>
+          <label class="check">Channels
+            <select id="superScope">
+              <option value="hidden">Hidden only</option>
+              <option value="all">All channels</option>
+              <option value="noOut">All but fill</option>
+            </select>
+          </label>
+          <div class="views">
+            <label class="check"><input type="radio" name="superMode" id="superMode-pca" checked> PCA (top 3 → RGB)</label>
+            <label class="check"><input type="radio" name="superMode" id="superMode-hue"> Hue sum</label>
+          </div>
+          <label class="check"><input type="checkbox" id="superOverlay" checked><span>Overlay walls</span></label>
+          <div class="buttons">
+            <button id="superRecompute" title="Refit the PCA basis now, instead of waiting for the next automatic refit">Recompute colours</button>
+          </div>
         </div>
         <div class="legend" id="legend"></div>
       </div>
