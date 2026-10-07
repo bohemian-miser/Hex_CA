@@ -89,6 +89,8 @@ export class CA {
   private listed: Uint8Array;
   /** Pending writes: (slot, value per channel) records, flat. */
   private pending: Int32Array;
+  /** The slots changed in the last step, in order (the first `changed` entries). */
+  private changedSlots: Int32Array;
 
   constructor(topo: Topology, rule: Rule, u: Omit<Uniforms, 'step'>, constants?: Record<string, ArrayLike<number>>) {
     this.topo = topo;
@@ -131,6 +133,7 @@ export class CA {
     this.list = new Int32Array(size);
     this.work = new Int32Array(size);
     this.listed = new Uint8Array(size);
+    this.changedSlots = new Int32Array(size);
     // Room for 64 changed slots to start with; `pass` doubles it as needed.
     this.pending = new Int32Array(Math.max(16, (this.nCh + 1) * 64));
     // Everything is computed once before anything can be quiet.
@@ -154,6 +157,32 @@ export class CA {
     if (!(slot >= 0 && slot < this.topo.size) || !this.topo.isField[slot]) return;
     this.ch[c][slot] = v;
     this.enlistWithTaps(slot);
+  }
+
+  /**
+   * The host's write into a state channel (anything but 'const'), for a rule whose events are host decisions
+   * (src/game/line-ca.ts's taps write rule, owner, chords and tips). Activates the slot and its taps, as `write`.
+   */
+  writeState(name: string, slot: number, v: number): void {
+    const c = this.channel(name);
+    if (this.rule.channels[c].kind === 'const') throw new Error(`${name} is a const channel`);
+    if (!(slot >= 0 && slot < this.topo.size) || !this.topo.isField[slot]) return;
+    this.ch[c][slot] = v;
+    this.enlistWithTaps(slot);
+  }
+
+  /**
+   * List one field slot for the next step. For a rule whose update reads a uniform that changes from step to
+   * step (line-ca's per-owner `go` pulses): the host lists every slot whose output the new uniform can change,
+   * so the active step still equals `stepFull`.
+   */
+  touch(slot: number): void {
+    if (slot >= 0 && slot < this.topo.size && this.topo.isField[slot]) this.enlist(slot);
+  }
+
+  /** The slots whose value changed in the last step (a view, valid until the next step). */
+  lastChanged(): Int32Array {
+    return this.changedSlots.subarray(0, this.changed);
   }
 
   /** One step over the active slots. */
@@ -231,6 +260,7 @@ export class CA {
       const at = i * rec;
       const slot = pending[at];
       for (let c = 0; c < nCh; c++) ch[c][slot] = pending[at + 1 + c];
+      this.changedSlots[i] = slot;
       this.enlistWithTaps(slot);
     }
     this.changed = count;
