@@ -9,6 +9,7 @@ import weightsJson from './nca-weights.json';
 import { HexNCA, cellCoords, cellIndex, fieldMask, hexDist, loadWeights, randomBridge, side, targets, type NCAWeights } from '../src/nca.js';
 import { coordsOf, indexOf, makeBoard } from '../src/hex.js';
 import { randomLoop, rng } from '../src/lines.js';
+import { axialAt, bounds, centreOf, cubeRound, Fills, fitGeom, hexes, type Geom } from '../src/draw.js';
 import {
   css3, divLevel as sharedDivLevel, fillLevel, fitPca3, hslRgb, hueBlend, LEVELS, pcaColour, pixel,
   ramps as sharedRamps, rgbOf, type Pca3, type Ramps,
@@ -249,12 +250,7 @@ function edit(cells: Iterable<number>, v: 0 | 1): void {
 
 // ── Geometry and pointer ────────────────────────────────────────────────────
 
-const SQ3 = Math.sqrt(3);
-interface Geom { size: number; ox: number; oy: number }
 let geom: Geom = { size: 10, ox: 0, oy: 0 };
-
-const centreOf = (g: Geom, q: number, r: number): [number, number] =>
-  [g.ox + g.size * SQ3 * (q + r / 2), g.oy + g.size * 1.5 * r];
 
 /**
  * The largest hexagonal-cell grid that fits a w×h box with `pad` to spare, centred on the
@@ -262,42 +258,16 @@ const centreOf = (g: Geom, q: number, r: number): [number, number] =>
  * ratio of its own cells to the bounding hexagon's, e.g. Spectacle's level 4 is under a
  * fifth), and equivalent to the old fixed formula for the hexagon itself.
  */
-function fitGeom(R: number, mask: Uint8Array, w: number, h: number, pad: number): Geom {
+function fitBoard(R: number, mask: Uint8Array, w: number, h: number, pad: number): Geom {
   const S = side(R);
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (let row = 0; row < S; row++) {
-    for (let col = 0; col < S; col++) {
-      if (!mask[row * S + col]) continue;
-      const x = SQ3 * (col - R + (row - R) / 2);
-      const y = 1.5 * (row - R);
-      if (x < minX) minX = x;
-      if (x > maxX) maxX = x;
-      if (y < minY) minY = y;
-      if (y > maxY) maxY = y;
-    }
-  }
-  const size = Math.max(0.5, Math.min((w - pad) / (maxX - minX + SQ3), (h - pad) / (maxY - minY + 4)));
-  return { size, ox: w / 2 - (size * (minX + maxX)) / 2, oy: h / 2 - (size * (minY + maxY)) / 2 };
-}
-
-function cubeRound(fq: number, fr: number): [number, number] {
-  const fs = -fq - fr;
-  let q = Math.round(fq);
-  let r = Math.round(fr);
-  const s = Math.round(fs);
-  const dq = Math.abs(q - fq);
-  const dr = Math.abs(r - fr);
-  const ds = Math.abs(s - fs);
-  if (dq > dr && dq > ds) q = -r - s;
-  else if (dr > ds) r = -q - s;
-  return [q, r];
+  return fitGeom(bounds((add) => {
+    for (let row = 0; row < S; row++) for (let col = 0; col < S; col++) if (mask[row * S + col]) add(col - R, row - R);
+  }), w, h, pad, 4);
 }
 
 /** The cell index whose hexagon holds (x, y) under `g`, or −1 off the board (off `mask`, not just off the full hexagon of radius R). */
 function cellAtPoint(g: Geom, R: number, mask: Uint8Array, x: number, y: number): number {
-  const fx = (x - g.ox) / g.size;
-  const fy = (y - g.oy) / g.size;
-  const [q, r] = cubeRound((SQ3 / 3) * fx - fy / 3, (2 / 3) * fy);
+  const [q, r] = axialAt(g, x, y);
   if (hexDist(q, r) > R) return -1;
   const i = cellIndex(R, q, r);
   return mask[i] ? i : -1;
@@ -385,7 +355,7 @@ function layout(): void {
   canvas.width = Math.round(rect.width * dpr);
   canvas.height = Math.round(rect.height * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  geom = fitGeom(m.R, m.mask, rect.width, rect.height, 16);
+  geom = fitBoard(m.R, m.mask, rect.width, rect.height, 16);
   cx = new Float64Array(m.N);
   cy = new Float64Array(m.N);
   for (const i of m.cells) {
@@ -393,38 +363,6 @@ function layout(): void {
     [cx[i], cy[i]] = centreOf(geom, q, r);
   }
   dirty = true;
-}
-
-const CORNERS = Array.from({ length: 6 }, (_, k) => {
-  const a = (Math.PI / 180) * (60 * k - 30);
-  return [Math.cos(a), Math.sin(a)] as const;
-});
-
-/** A path of hexagons, each closed by a line back to its first corner: closePath() costs more the longer the path is in Chromium, and a big board's path is long. */
-function hexes(cells: readonly number[], s: number): void {
-  ctx.beginPath();
-  for (const i of cells) {
-    ctx.moveTo(cx[i] + s * CORNERS[0][0], cy[i] + s * CORNERS[0][1]);
-    for (let k = 1; k <= 6; k++) ctx.lineTo(cx[i] + s * CORNERS[k % 6][0], cy[i] + s * CORNERS[k % 6][1]);
-  }
-}
-
-/** Cells grouped by colour, so a frame sets each colour once. */
-class Fills {
-  private groups = new Map<string, number[]>();
-  constructor(private readonly s: number) {}
-  add(colour: string, cell: number): void {
-    let g = this.groups.get(colour);
-    if (!g) this.groups.set(colour, (g = []));
-    g.push(cell);
-  }
-  draw(): void {
-    for (const [colour, cells] of this.groups) {
-      ctx.fillStyle = colour;
-      hexes(cells, this.s);
-      ctx.fill();
-    }
-  }
 }
 
 /** On-board cells where the thresholded fill and the closest of the oracle's targets disagree. */
@@ -446,8 +384,8 @@ function draw(): void {
   const rect = canvas.getBoundingClientRect();
   ctx.clearRect(0, 0, rect.width, rect.height);
   const s = geom.size * 0.97;
-  const fills = new Fills(s);
-  const inset = new Fills(s * 0.45);
+  const fills = new Fills(ctx, cx, cy, s);
+  const inset = new Fills(ctx, cx, cy, s * 0.45);
   if (shown === null) {
     const fill = m.channel(1);
     for (const i of m.cells) fills.add(m.walls[i] ? col.line : css3(rp.fill[fillLevel(fill[i])]), i);
@@ -466,7 +404,7 @@ function draw(): void {
   if (geom.size > 6) {
     ctx.strokeStyle = col.edge;
     ctx.lineWidth = 0.5;
-    hexes(Array.from(m.cells), s);
+    hexes(ctx, cx, cy, m.cells, s);
     ctx.stroke();
   }
   if (shown === null || (shown === 'super' && superOverlay)) {
@@ -539,7 +477,7 @@ function miniLayout(): NonNullable<typeof mini> | null {
   const w = Math.round(rect.width * dpr);
   const h = Math.round(rect.height * dpr);
   if (mini && mini.mask === m.mask && mini.w === w && mini.h === h) return mini;
-  const g = fitGeom(m.R, m.mask, rect.width, rect.height, 4);
+  const g = fitBoard(m.R, m.mask, rect.width, rect.height, 4);
   const map = new Int32Array(w * h);
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) map[y * w + x] = cellAtPoint(g, m.R, m.mask, (x + 0.5) / dpr, (y + 0.5) / dpr);
