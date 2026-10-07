@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { Board, RuleTable, splitHash, walk, type Rule, type StrandData } from '../src/strand.js';
+import { allStrands, Board, RuleTable, splitHash, walk, type Rule, type StrandData } from '../src/strand.js';
 import { CODE35, StrandNCA, chordsAt, code35, decodeF32, isStrandWeights, loadStrandWeights, type Tap } from '../src/strand-nca.js';
 import { rng } from '../src/lines.js';
 
@@ -98,6 +98,40 @@ describe('strand rules (src/strand.ts against nca/strand/rules.py)', () => {
       seen.add(h.s);
     }
     expect(seen.size).toBe(7);
+  });
+
+  it('allStrands covers every chord of a rule exactly once, agreeing with walk() from any of its chords', () => {
+    for (const key of ['l2', 'l3']) {
+      const board = boards[key];
+      for (const r of ['15·000000000', '128·010100000']) {
+        const rule = table.parse(r) as Rule;
+        const bits = table.render(rule, board);
+        const ex = table.exits(rule, board);
+        let total = 0;
+        for (let p = 0; p < bits.length; p++) for (let k = 0; k < 15; k++) if ((bits[p] >> k) & 1) total++;
+        const strands = allStrands(ex, board);
+        const seen = new Set<string>();
+        let covered = 0;
+        for (const st of strands) {
+          covered += st.rows.length;
+          expect(st.rows.length).toBeGreaterThan(0);
+          const again = walk(ex, board, st.rows[0], st.cols[0], st.ins[0], st.outs[0]);
+          expect(again.closed).toBe(st.closed);
+          expect(again.rows).toEqual(st.rows);
+          expect(again.cols).toEqual(st.cols);
+          expect(again.ins).toEqual(st.ins);
+          expect(again.outs).toEqual(st.outs);
+          for (let k = 0; k < st.rows.length; k++) {
+            const a = Math.min(st.ins[k], st.outs[k]);
+            const b = Math.max(st.ins[k], st.outs[k]);
+            const chordKey = `${st.rows[k]},${st.cols[k]},${a},${b}`;
+            expect(seen.has(chordKey)).toBe(false); // every chord walked exactly once
+            seen.add(chordKey);
+          }
+        }
+        expect(covered).toBe(total);
+      }
+    }
   });
 
   it('the boards are the Delta patches of levels 2, 3 and 4', () => {

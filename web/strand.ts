@@ -16,7 +16,7 @@ import {
   css3, divLevel as sharedDivLevel, fitPca3, hslRgb, hueBlend, LEVELS, pcaColour, pixel,
   ramps as sharedRamps, type Pca3,
 } from '../src/ramp.js';
-import { Board, PAIRS, RuleTable, walk, type Rule, type Strand, type StrandData } from '../src/strand.js';
+import { allStrands, Board, PAIRS, RuleTable, walk, type Rule, type Strand, type StrandData } from '../src/strand.js';
 import { StrandNCA, chordsAt, loadStrandWeights, type StrandWeights, type Tap } from '../src/strand-nca.js';
 
 const data = dataJson as unknown as StrandData;
@@ -44,6 +44,8 @@ const MAP_LABELS: Record<string, string> = { l2: 'Level 2', l3: 'Level 3', l4: '
 const N_COLOURS = 8;
 /** localStorage: the last rule picked (sticky across visits; ?rule= still wins). */
 const RULE_STORAGE_KEY = 'hexca.strand.rule';
+/** localStorage: whether the whole-rule pattern overlay was shown last (sticky; ?pattern= still wins). */
+const PATTERN_STORAGE_KEY = 'hexca.strand.pattern';
 /** With its box ticked, the page refetches the weights this often and swaps in ones that changed (web/nca.ts). */
 const AUTO_RELOAD_MS = 120_000;
 /** The channel tiles and their mini boards redraw at most this often while running. */
@@ -93,6 +95,7 @@ let playing = true;
 let speed = 30;
 let showTruth = true;
 let showTypes = true;
+let showPattern = true;
 let notice = '';
 let lastChange = 0;
 let drawnKey = 0;
@@ -198,6 +201,24 @@ function storeRule(r: Rule): void {
     localStorage.setItem(RULE_STORAGE_KEY, table.describe(r));
   } catch {
     // private window, or site data cleared/blocked: the rule just isn't sticky across visits
+  }
+}
+
+/** Whether the rule pattern overlay was on last time (localStorage), or null with nothing stored. */
+function loadStoredPattern(): boolean | null {
+  try {
+    const v = localStorage.getItem(PATTERN_STORAGE_KEY);
+    return v === null ? null : v !== '0';
+  } catch {
+    return null; // private window, or site data cleared/blocked: just not sticky
+  }
+}
+
+function storePattern(on: boolean): void {
+  try {
+    localStorage.setItem(PATTERN_STORAGE_KEY, on ? '1' : '0');
+  } catch {
+    // ditto: the choice just isn't sticky across visits
   }
 }
 
@@ -624,6 +645,74 @@ function zoomAt(x: number, y: number, f: number): void {
   bgDirty = dirty = true;
 }
 
+// ── Whole-rule pattern overlay ───────────────────────────────────────────────
+// Every strand of the selected rule, across the whole board, faint and underneath everything else ("Show rule
+// pattern" below): the same rule table and walker the page already uses for a tap's own ground truth, just run
+// over every chord instead of one (allStrands). Walking the whole board costs in proportion to the rule's own
+// chords — a few per tile — so it is cached by (map, rule) and only redone when either changes, never per frame
+// or per step; the screen-space Path2D built from it is cached again by the camera, rebuilt only when the view
+// moves (the same trade-off drawBackground already makes).
+
+interface RuleStrands { key: string; strands: Strand[]; circuits: number; tails: number; longestCircuit: number; longestTail: number }
+let ruleStrands: RuleStrands | null = null;
+
+function ensureRuleStrands(): RuleStrands {
+  const key = `${mapId}|${table.describe(rule)}`;
+  if (ruleStrands && ruleStrands.key === key) return ruleStrands;
+  const ex = table.exits(rule, board);
+  const strands = allStrands(ex, board);
+  let circuits = 0;
+  let tails = 0;
+  let longestCircuit = 0;
+  let longestTail = 0;
+  for (const st of strands) {
+    if (st.closed) {
+      circuits++;
+      longestCircuit = Math.max(longestCircuit, st.rows.length);
+    } else {
+      tails++;
+      longestTail = Math.max(longestTail, st.rows.length);
+    }
+  }
+  return (ruleStrands = { key, strands, circuits, tails, longestCircuit, longestTail });
+}
+
+interface PatternPaths { key: string; solid: Path2D; dash: Path2D }
+let patternPaths: PatternPaths | null = null;
+
+/** The pattern's Path2D (circuits in `solid`, tails in `dash`) in the current view: rebuilt only when the
+ * rule's strands or the camera changed since the last build. */
+function ensurePatternPaths(): PatternPaths {
+  const rs = ensureRuleStrands();
+  const key = `${rs.key}|${geom.size.toFixed(6)}|${geom.ox.toFixed(3)}|${geom.oy.toFixed(3)}`;
+  if (patternPaths && patternPaths.key === key) return patternPaths;
+  const solid = new Path2D();
+  const dash = new Path2D();
+  for (const st of rs.strands) {
+    const path = st.closed ? solid : dash;
+    for (let k = 0; k < st.rows.length; k++) {
+      const [x, y] = centre(st.rows[k] * board.w + st.cols[k]);
+      path.moveTo(...edgeMid(x, y, st.ins[k]));
+      path.lineTo(...edgeMid(x, y, st.outs[k]));
+    }
+  }
+  return (patternPaths = { key, solid, dash });
+}
+
+/** Turn the whole-rule pattern overlay on or off: persists across visits (localStorage, try/catch) and
+ * reflects into the URL (?pattern=0) so a link can hand it off too. */
+function setShowPattern(on: boolean): void {
+  showPattern = on;
+  $<HTMLInputElement>('pattern').checked = on;
+  const u = new URL(location.href);
+  if (on) u.searchParams.delete('pattern');
+  else u.searchParams.set('pattern', '0');
+  history.replaceState(null, '', u);
+  storePattern(on);
+  legend();
+  dirty = true;
+}
+
 // ── Colours ────────────────────────────────────────────────────────────────
 
 interface Colours {
@@ -855,9 +944,31 @@ function drawSuper(s: number): void {
   }
 }
 
+/** The selected rule's whole pattern, faint, under everything else: every strand across the whole board —
+ * circuits solid, tails dashed (the legend says which) — with a halo underneath so it still reads over a
+ * saturated tile, the same casing the taps' own strands get. */
+function drawRulePattern(s: number): void {
+  if (!showPattern) return;
+  const { solid, dash } = ensurePatternPaths();
+  ctx.strokeStyle = colours.halo;
+  ctx.globalAlpha = 0.5;
+  ctx.lineWidth = Math.max(2, s * 0.14);
+  ctx.stroke(solid);
+  ctx.stroke(dash);
+  ctx.strokeStyle = colours.muted;
+  ctx.globalAlpha = 0.6;
+  ctx.lineWidth = Math.max(1, s * 0.07);
+  ctx.stroke(solid);
+  ctx.setLineDash([Math.max(2, s * 0.22), Math.max(2, s * 0.18)]);
+  ctx.stroke(dash);
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+}
+
 /** The true strands, thin, underneath, and what the model actually draws on top of them: the ordinary
  * "strands" view, and — when superOverlay is on — layered over the superimposed view too. */
 function drawStrandsOverlay(s: number): void {
+  drawRulePattern(s);
   if (showTruth) {
     ctx.lineWidth = Math.max(1.2, s * 0.11);
     ctx.globalAlpha = 0.8;
@@ -966,6 +1077,8 @@ function setRule(r: Rule, why = ''): void {
   u.searchParams.set('rule', table.describe(rule));
   history.replaceState(null, '', u);
   storeRule(rule);
+  legend(); // the whole-rule pattern legend names the rule
+  dirty = true; // the pattern overlay itself changed
 }
 
 const tapRows = new Map<number, { badge: HTMLElement; sub: HTMLElement }>();
@@ -1116,11 +1229,18 @@ function scopeLabel(): string {
 }
 
 function legend(): void {
+  // The whole-rule pattern overlay draws only where drawStrandsOverlay runs: the plain "strands" view always,
+  // the superimposed view only with its own "overlay the strands" box also checked.
+  const patternLegend = showPattern
+    ? [`<span><i class="pattern"></i>${table.describe(rule)}'s whole pattern: circuits</span>`,
+      '<span><i class="pattern dash"></i>… tails</span>']
+    : [];
   if (shown === 'super') {
-    $('legend').innerHTML = superMode === 'pca'
+    const base = superMode === 'pca'
       ? [`<span>Superimposed: ${scopeLabel()}, PCA's top 3 directions of spread → <b>red</b>/<b>green</b>/<b>blue</b>.</span>`,
-        `<span>Refit every ${SUPER_REFIT_STEPS} steps, or on demand.</span>`].join('')
-      : `<span>Superimposed: ${scopeLabel()}, each channel its own hue, brightness = |value|, added together.</span>`;
+        `<span>Refit every ${SUPER_REFIT_STEPS} steps, or on demand.</span>`]
+      : [`<span>Superimposed: ${scopeLabel()}, each channel its own hue, brightness = |value|, added together.</span>`];
+    $('legend').innerHTML = base.concat(superOverlay ? patternLegend : []).join('');
     return;
   }
   if (typeof shown === 'number') {
@@ -1139,7 +1259,7 @@ function legend(): void {
     '<span><i></i>the network\'s strand (in its tap\'s colour)</span>',
     '<span><i class="thin"></i>the true strand</span>',
     '<span><i class="dash"></i>drawn, on no true strand</span>',
-  ].join('');
+  ].concat(patternLegend).join('');
 }
 
 /** Show channel `c` large on the board (the "state" view), 'super' for every selected channel folded into one
@@ -1521,6 +1641,7 @@ $<HTMLInputElement>('truth').addEventListener('change', (ev) => {
   showTruth = (ev.target as HTMLInputElement).checked;
   dirty = true;
 });
+$<HTMLInputElement>('pattern').addEventListener('change', (ev) => setShowPattern((ev.target as HTMLInputElement).checked));
 $<HTMLInputElement>('types').addEventListener('change', (ev) => {
   showTypes = (ev.target as HTMLInputElement).checked;
   bgDirty = dirty = true;
@@ -1552,7 +1673,10 @@ for (const mode of ['pca', 'hue'] as const) {
 }
 $<HTMLInputElement>('superOverlay').addEventListener('change', (ev) => {
   superOverlay = (ev.target as HTMLInputElement).checked;
-  if (shown === 'super') dirty = true;
+  if (shown === 'super') {
+    legend(); // the pattern legend lines only show while the strands are overlaid too
+    dirty = true;
+  }
 });
 $('superRecompute').addEventListener('click', () => {
   const model = activeModel();
@@ -1572,6 +1696,8 @@ document.addEventListener('keydown', (ev) => {
     box.checked = !box.checked;
     showTruth = box.checked;
     dirty = true;
+  } else if (ev.key === 'p' || ev.key === 'P') {
+    setShowPattern(!showPattern);
   } else if (ev.key === ' ' && !(ev.target instanceof HTMLButtonElement)) {
     ev.preventDefault();
     setPlaying(!playing);
@@ -1644,6 +1770,9 @@ if (weightsName) document.title = `${weightsName} · ${document.title}`;
 const viewParam = params.get('view');
 const storedView = viewParam ? null : loadStoredView();
 const initialView: ShownView = viewParam === 'super' || storedView === 'super' ? 'super' : null;
+/** ?pattern=0 turns the whole-rule pattern overlay off; otherwise the sticky choice (localStorage), else on. */
+const patternParam = params.get('pattern');
+setShowPattern(patternParam !== null ? patternParam !== '0' : (loadStoredPattern() ?? true));
 void loadAnyWeights().then(() => {
   modelLine();
   const id = params.get('map') ?? 'l3';
