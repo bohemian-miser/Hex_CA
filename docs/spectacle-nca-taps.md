@@ -17,6 +17,11 @@ them, and the compute plan keeps them as the first thing to read on the dashboar
 
 ## 0. Decisions for the owner
 
+**Owner's answers (2026-10-07): all recommendations accepted.** On the hit rule: "pattern owns the
+tile" -- a rival's line owns its whole tile for growth as well as for taps, so the tile rule is the
+game's rule, not only the CA's; Spectacle's default `crossingMode` moves from `geometric` to `tile`
+(a Spectacle PR, the owner merges). Both tap arms (impulse and fixed write) run in launch 10.
+
 | # | Decision | Recommendation |
 |---|---|---|
 | 1 | **How the tap enters.** A one-step input impulse (the 59 tap planes on the tapped cell for one step, then zero), a fixed write of the code and the tapped chord into named state channels, or a learned linear encoder added to the state once | **Impulse as the product, fixed write as a diagnostic arm.** The encoder is dropped: the update's first layer already *is* a learned linear map of the tap planes, and the impulse lets the write depend on what is already on the cell (§1) |
