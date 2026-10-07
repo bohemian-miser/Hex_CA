@@ -1067,8 +1067,8 @@ async function mainV2(args: Record<string, string>, root: string): Promise<void>
 //             0), scoreTiles; and, for what the CA does not model: respawnDelayMs 0 (scripted taps), captures and
 //             conversion off (captureOnEnclose, takeEnclosed: out of scope, the doc's case 11), taps inside a
 //             rival's circuit allowed (the host's geometry, not the CA's)
-//   boards    "L2/<root>" / "L3/<root>": the board's geo (type * 12 + rot * 2 + mirror bit, -1 off), h, w (the
-//             same frames as boards.npz)
+//   boards    "L2/<root>" / "L3/<root>": the board's geo (type * 12 + rot * 2 + mirror bit, -1 off), tile (Spectacle's
+//             tile index in the field, -1 off), h, w (the same frames as boards.npz)
 //   episodes  board, players (rules as [subset, digit_0 .. digit_8], in the engine's player order), taps
 //             ({t, player, row, col, d0, d1, ok, reason}: a tap at CA step t lands after the engine's t-th tick,
 //             forward head through d1, then a second tap on the same chord grows it from its d0 end too, as a CA
@@ -1153,17 +1153,20 @@ async function mainCollide(args: Record<string, string>, root: string): Promise<
 
   // Boards: the full L2 / L3 patches, in boards.npz's frames.
   const boards = new Map<string, Board>();
-  const boardOut: Record<string, { h: number; w: number; geo: number[] }> = {};
+  const boardOut: Record<string, { h: number; w: number; geo: number[]; tile: number[] }> = {};
   for (const level of [2, 3]) {
     for (let ri = 0; ri < leaf.length; ri++) {
       const b = boardOf(latticeOf(S, S.buildField({ family: 'hex', level, rootTile: leaf[ri] })), level, ri, null);
       const key = `L${level}/${ri}`;
       boards.set(key, b);
       const geo = new Array<number>(b.h * b.w).fill(-1);
+      const tile = new Array<number>(b.h * b.w).fill(-1);
       b.old.forEach((t, i) => {
-        geo[(b.ra[i] - b.r0) * b.w + (b.qa[i] - b.q0)] = b.lat.field.types[t] * 12 + b.g[b.lat.rot[t]] * 2 + (b.mirror < 0 ? 1 : 0);
+        const p = (b.ra[i] - b.r0) * b.w + (b.qa[i] - b.q0);
+        geo[p] = b.lat.field.types[t] * 12 + b.g[b.lat.rot[t]] * 2 + (b.mirror < 0 ? 1 : 0);
+        tile[p] = t;
       });
-      boardOut[key] = { h: b.h, w: b.w, geo };
+      boardOut[key] = { h: b.h, w: b.w, geo, tile };
     }
   }
 
@@ -1343,6 +1346,7 @@ async function mainCollide(args: Record<string, string>, root: string): Promise<
     conventions: {
       time: 'CA steps = engine ticks of 500 ms at 1000 ms a chord; a tap at t lands after tick t',
       chords: '[player, row, col, a, b, on, off]: a < b, the chord\'s two edge directions; off -1 = there at rest',
+      boards: 'geo = type * 12 + rot * 2 + (mirror < 0), tile = Spectacle\'s tile index, both [row * w + col], -1 off the board',
     },
     boards: boardOut,
     episodes,

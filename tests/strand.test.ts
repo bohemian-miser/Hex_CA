@@ -147,6 +147,19 @@ describe('strand rules (src/strand.ts against nca/strand/rules.py)', () => {
       }
     }
   });
+
+  it("each board cell carries its Spectacle tile index: every tile of the patch exactly once", () => {
+    for (const b of Object.values(boards)) {
+      const tile = b.data.tile!;
+      expect(tile.length).toBe(b.h * b.w);
+      const seen = new Uint8Array(b.n);
+      for (let p = 0; p < tile.length; p++) {
+        expect(tile[p] >= 0).toBe(b.geo[p] >= 0);
+        if (tile[p] >= 0) seen[tile[p]]++;
+      }
+      expect(seen.every((x) => x === 1)).toBe(true);
+    }
+  });
 });
 
 /** max |TS - torch| over the case's channels and on-board cells, and the torch state off the board (must be 0). */

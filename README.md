@@ -417,7 +417,8 @@ answer: `tap-e2-l3` (level 2) gets 0 of 8.
 depth, the plain-conv StrandNCA, v1) as `web/strand-weights.json`'s format
 (float32, exact; the run's held-out numbers from its `log.jsonl`); `--board-data`
 writes `web/strand-data.json` (the rule table and the three Delta patches,
-from `data/strand-v2`), `--fixtures` the parity fixtures. `src/strand-nca.ts`
+from `data/strand-v2`; each board cell carries its `geo` and Spectacle's `tile`
+index), `--fixtures` the parity fixtures. `src/strand-nca.ts`
 matches PyTorch to ~2e-6 over 8 steps (`tests/strand.test.ts`: option E at
 depth 1 and 2, E-bc, C, A, v1, two and three taps on one board). The page's
 default weights are `tap-e2-l3`'s best (option E, depth 2; held-out exact

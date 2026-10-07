@@ -184,6 +184,8 @@ every tile's chords and carry the rule along the line itself, for rules it never
 
 ```bash
 npx tsx scripts/strand-export.ts --rule-table        # -> data/strand-v2 (git-ignored), ~30 s on an idle Pi
+npx tsx scripts/strand-export.ts --collide           # -> data/strand-v2/collide.json (the engine fixture), ~5 s
+python -m nca.strand.export --board-data             # -> web/strand-data.json (rules + the L2/L3/L4 Delta patches)
 python -m nca.strand.rules --split --parity --bench  # the split vs the exporter, rendering + walks vs walkStrand, speed
 python -m nca.strand.probe --hidden 128 1024         # the per-cell lookup probe (§3), A / C / D / D-cs / D-fourier / E
 python -m nca.strand.train2 --name c-l2 --inputs c --levels 2 --minutes 25
@@ -196,6 +198,7 @@ python -m nca.strand.selftest2                       # a few minutes; the v1 sel
 |---|---|
 | `rules-hex.json` | per leaf type its six local edges' classes; per kernel subset (all 7, class 0 included) and type the non-crossing matchings in Spectacle's order (`nonCrossingForTile`) and each one's local chords (`localChords`); the split's definition, per-subset check values and 448 keyed sample rules; Spectacle's commit |
 | `boards.npz` | geometry only: per group `<g>_type/rot/tile` [B,H,W] (-1 off board), `<g>_mirror/root/orient/h/w/tiles`; groups `L2`, `L3` (the nine patches each), `L4` (2,048 training crops, box 42 x 38), `L4eval` (64 crops, seed 20261006), `L4full` (the Delta patch) |
+| `collide.json` | Spectacle's engine on 400 scripted tap episodes of 2-4 players on the L2 / L3 patches (`--collide`; `python -m nca.strand.sim --parity`); its boards carry `geo` and `tile` (Spectacle's tile index) per cell, `[row * w + col]`, -1 off the board |
 | `parity.npz` | 2,000 rule-boards (every rule of the six small subsets + 1,556 of the fully packed one, each on an L2 / L3 / L4 board in turn): Spectacle's own rendering as 15 bits per cell, its whole-board strand decomposition, and 16 taps per board walked by `walkStrand` both ways |
 
 **Rules.** A rule is `(s, digits)`: `s` one of the 7 subsets, `digits[t]` the position of type `t`'s matching

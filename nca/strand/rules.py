@@ -309,17 +309,19 @@ def random_chord(rng: np.random.Generator, bits: np.ndarray):
 # ---------------------------------------------------------------- boards
 
 class Boards:
-    """boards.npz: per group the geo planes [B,H,W] (int16, -1 off board), sizes and mirror signs."""
+    """boards.npz: per group the geo planes [B,H,W] (int16, -1 off board), Spectacle's tile index per cell (int32,
+    -1 off board), sizes and mirror signs."""
 
     def __init__(self, data_dir: str | None = None):
         self.dir = data_dir or default_dir()
         with np.load(os.path.join(self.dir, "boards.npz")) as z:
             a = {k: z[k] for k in z.files}
-        self.geo, self.hw, self.mirror, self.tiles = {}, {}, {}, {}
+        self.geo, self.tile, self.hw, self.mirror, self.tiles = {}, {}, {}, {}, {}
         for g in GROUPS:
             t, r, m = a[f"{g}_type"].astype(np.int16), a[f"{g}_rot"].astype(np.int16), a[f"{g}_mirror"]
             mb = (m < 0).astype(np.int16)[:, None, None]
             self.geo[g] = np.where(t >= 0, t * 12 + r * 2 + mb, -1).astype(np.int16)
+            self.tile[g] = a[f"{g}_tile"].astype(np.int32)
             self.hw[g] = np.stack([a[f"{g}_h"], a[f"{g}_w"]], 1)
             self.mirror[g] = m
             self.tiles[g] = a[f"{g}_tiles"]
@@ -327,6 +329,11 @@ class Boards:
     def board(self, group: str, i: int) -> np.ndarray:
         h, w = self.hw[group][i]
         return self.geo[group][i, :h, :w]
+
+    def tile_index(self, group: str, i: int) -> np.ndarray:
+        """int32 [h, w]: Spectacle's tile index (in the board's field) of each cell, -1 off the board."""
+        h, w = self.hw[group][i]
+        return self.tile[group][i, :h, :w]
 
 
 # ---------------------------------------------------------------- checks
