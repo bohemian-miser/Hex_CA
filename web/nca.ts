@@ -9,6 +9,9 @@ import weightsJson from './nca-weights.json';
 import { HexNCA, cellCoords, cellIndex, fieldMask, hexDist, loadWeights, randomBridge, side, targets, type NCAWeights } from '../src/nca.js';
 import { coordsOf, indexOf, makeBoard } from '../src/hex.js';
 import { randomLoop, rng } from '../src/lines.js';
+import {
+  css3, divLevel as sharedDivLevel, fillLevel, LEVELS, pixel, ramps as sharedRamps, type Ramps,
+} from '../src/ramp.js';
 import hexL2 from '../nca/fields/hex-l2.json';
 import hexL3 from '../nca/fields/hex-l3.json';
 import hexL4 from '../nca/fields/hex-l4.json';
@@ -24,8 +27,6 @@ const ctx = canvas.getContext('2d')!;
 
 /** Per frame, no more than this much time stepping; a backlog beyond it is dropped. */
 const FRAME_MS = 12;
-/** Colour ramps are quantised so a frame fills one path per colour, not one per cell. */
-const LEVELS = 32;
 /** The channel tiles and the readout redraw at most this often while running. */
 const GRID_MS = 100;
 const READOUT_MS = 150;
@@ -253,41 +254,15 @@ function colours() {
 }
 type Colours = ReturnType<typeof colours>;
 
-/** A #rrggbb colour as [r, g, b] (grey when it is not one). */
-function rgbOf(hex: string): [number, number, number] {
-  const mm = /^#([0-9a-f]{6})$/i.exec(hex);
-  if (!mm) return [128, 128, 128];
-  const n = parseInt(mm[1], 16);
-  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
-}
-
-const mixRgb = (a: string, b: string, t: number): [number, number, number] => {
-  const pa = rgbOf(a);
-  const pb = rgbOf(b);
-  return [0, 1, 2].map((k) => Math.round(pa[k] + (pb[k] - pa[k]) * t)) as [number, number, number];
-};
-const css3 = ([r, g, b]: readonly number[]) => `rgb(${r} ${g} ${b})`;
-/** [r, g, b] as one ImageData pixel (little-endian RGBA). */
-const pixel = ([r, g, b]: readonly number[]) => ((255 << 24) | (b << 16) | (g << 8) | r) >>> 0;
-
-/** Fill intensity: a value clamped to 0…1, quantised. */
-const fillLevel = (v: number) => Math.round(Math.max(0, Math.min(1, v)) * LEVELS);
-
 /** The diverging map's range: the export's clamp, else symmetric round zero. */
 let [LO, HI] = weights.clamp ?? [-1, 1];
 /** A value on the diverging map as a level in −LEVELS…LEVELS (negative: towards --neg). */
 function divLevel(v: number): number {
-  const t = v >= 0 ? (HI > 0 ? Math.min(1, v / HI) : 0) : LO < 0 ? -Math.min(1, v / LO) : 0;
-  return Math.round(t * LEVELS);
+  return sharedDivLevel(v, LO, HI);
 }
 /** The colours of fill levels 0…LEVELS and diverging levels −LEVELS…LEVELS (index + LEVELS). */
-function ramps(col: Colours) {
-  const fill = Array.from({ length: LEVELS + 1 }, (_, k) => mixRgb(col.cell, col.flood, k / LEVELS));
-  const div = Array.from({ length: 2 * LEVELS + 1 }, (_, k) => {
-    const t = (k - LEVELS) / LEVELS;
-    return mixRgb(col.cell, t < 0 ? col.neg : col.pos, Math.abs(t));
-  });
-  return { fill, div };
+function ramps(col: Colours): Ramps {
+  return sharedRamps(col.cell, col.flood, col.neg, col.pos);
 }
 
 // ── The board ───────────────────────────────────────────────────────────────
