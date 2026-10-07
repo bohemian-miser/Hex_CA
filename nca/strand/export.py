@@ -22,9 +22,15 @@ Tensors (float32, little-endian, base64; exact, not rounded):
                  state = clamp(state + d); state[0] = the mask; state *= the mask.
 consts (per cell, mask first): v2 [mask, static planes (`staticLut`, per geo = type * 12 + rot * 2 + mirror bit),
   (bc: the rule's 53-bit code on every board cell), the tap's code (53) and chord edges (6), on the tapped cell
-  only]; v1 [mask, the rule's 15 chord planes on every cell, the tap's chord edges (6)]. Every tap is held every
-  step (train2.py's docstring: "on the tapped cell only and held every step"). `ruleEverywhere` (bc, v1): the
-  consts carry one rule on every cell, so several taps can't share a board.
+  only]; v1 [mask, the rule's 15 chord planes on every cell, the tap's chord edges (6)]. `ruleEverywhere` (bc, v1):
+  the consts carry one rule on every cell, so several taps can't share a board.
+The tap ("tap", from train3's --tap; version 2 files only): {"mode": "held"} (train2, train: version 1 files carry no
+  "tap" and are held: every tap on its cell every step), {"mode": "impulse", "steps": n} (a tap's planes are on its
+  cell for the n steps after it, then zero) or {"mode": "fixed", "codeChannels": [35 channels]} (no tap planes ever;
+  at the tap the cell's state is written: edge channels 1 + d0, 1 + d1 <- max(itself, 1), the code's 35-plane form
+  (train3.code35: 8 class bits, then each digit as 3 bits MSB first, +-1) into codeChannels). "speed": the CA steps
+  per chord it was trained to grow at. A file with an impulse or fixed tap is version 2, so a page that reads only
+  version 1 (and would hold the tap) refuses it.
 Output: edge planes at state channels 1-6 (direction d at 1 + d), drawn where > 0.5 (train2.evaluate).
 """
 
@@ -47,6 +53,7 @@ from .rules import CODE_BITS, MAJORS, N_GEO, N_TYPES, STATIC, RuleTable, Boards,
 from .walker import walk
 
 FORMAT, VERSION = "hexca-strand", 1
+VERSIONS = (1, 2)  # 2: the tap is an event (impulse / fixed)
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WEB_WEIGHTS = os.path.join(ROOT, "web", "strand-weights.json")
 WEB_DATA = os.path.join(ROOT, "web", "strand-data.json")
@@ -172,7 +179,23 @@ def held_out_record(log_path, iteration):
     out["bySet"] = {k: {"exact": v.get("exact"), "balanced": v.get("balanced")} for k, v in by_set.items()}
     if isinstance(q.get("exit"), dict):
         out["exit"] = q["exit"].get("rate")
+    for k, sub in (("persist", "x4"), ("speed", "rate")):  # train3's
+        if isinstance(q.get(k), dict):
+            out[k] = q[k].get(sub)
+    if isinstance(q.get("collide"), dict):
+        out["wipe"] = q["collide"].get("wipe")
+        out["falseWipe"] = q["collide"].get("falseWipe")
     return out
+
+
+def tap_spec(cfg):
+    """The weights' "tap" from a checkpoint config (train3's --tap; anything older is held)."""
+    mode = cfg.get("tap") or "held"
+    if mode == "impulse":
+        return {"mode": "impulse", "steps": int(cfg.get("tapSteps") or 1)}
+    if mode == "fixed":
+        return {"mode": "fixed", "codeChannels": [int(c) for c in cfg["fixedChannels"]]}
+    return {"mode": "held"}
 
 
 def strand_json(model, kind, cfg, meta):
@@ -183,11 +206,14 @@ def strand_json(model, kind, cfg, meta):
     n_in = sum(n for _, n in segs)
     assert Cx == C + n_in, (Cx, C, n_in)
     enc = lambda a: {"shape": list(a.shape), "data": b64(a)}  # noqa: E731
-    out = {"format": FORMAT, "version": VERSION, "arch": arch, "kind": kind, "task": cfg.get("task", "m1a"),
+    tap = tap_spec(cfg)
+    out = {"format": FORMAT, "version": 1 if tap["mode"] == "held" else 2, "arch": arch, "kind": kind,
+           "task": cfg.get("task", "m1a"),
            "inputs": inputs, "channels": C, "hidden": H, "depth": 1 + len(t["mids"]), "nIn": n_in,
            "clamp": list(cfg["clamp"]) if cfg.get("clamp") is not None else None,
            "dirIn": list(model.dir_in) if isinstance(model, FrameNCA) else [],
-           "edges": 1, "consts": segs, "ruleEverywhere": bool(everywhere),
+           "edges": 1, "consts": segs, "ruleEverywhere": bool(everywhere), "tap": tap,
+           "speed": int(cfg.get("speed") or 1),
            "tensors": {"w1": enc(t["w1"]), "b1": enc(t["b1"]),
                        "mids": [{"w": enc(a), "b": enc(b)} for a, b in t["mids"]],
                        "w2": enc(t["w2"]), "b2": enc(t["b2"])},
@@ -199,8 +225,8 @@ def strand_json(model, kind, cfg, meta):
 
 def model_from_json(j):
     """A torch model (FrameNCA / StrandNCA / v1 HexNCA) rebuilt from the weights JSON, float32."""
-    if j.get("format") != FORMAT or j.get("version") != VERSION:
-        raise ValueError(f"not a {FORMAT} v{VERSION} file")
+    if j.get("format") != FORMAT or j.get("version") not in VERSIONS:
+        raise ValueError(f"not a {FORMAT} v{'/'.join(map(str, VERSIONS))} file")
     T = j["tensors"]
     w1 = unb64(T["w1"]["data"], T["w1"]["shape"])
     H, _, Cx = w1.shape
@@ -298,6 +324,42 @@ def build_consts(j, tab, geo, taps, lut=None):
     return np.concatenate(parts, 0)
 
 
+def code35_of(tab, rule):
+    """train3.code35 of one rule (+-1, float32 [35])."""
+    code = tab.code(int(rule[0]), np.asarray(rule[1:], np.int64))
+    out = [1.0 if code[k] else -1.0 for k in range(len(MAJORS))]
+    for d in np.asarray(rule[1:], np.int64):
+        out += [1.0 if (int(d) >> (2 - k)) & 1 else -1.0 for k in range(3)]
+    return np.array(out, np.float32)
+
+
+@torch.no_grad()
+def rollout_events(model, j, tab, geo, taps, steps, every=None):
+    """rollout() under the weights' tap mode, the taps [(rule, (row, col, d0, d1), at)] happening at age `at`
+    (impulse: their planes on in steps at + 1 .. at + steps; held: from at + 1 on; fixed: the state written at age
+    at, before step at + 1): the reference for the play page's tap() (tests/strand.test.ts)."""
+    spec = j.get("tap") or {"mode": "held"}
+    mode = spec["mode"]
+    base = build_consts(j, tab, geo, [])
+    state = torch.zeros(1, j["channels"], *geo.shape)
+    state[:, 0:1] = torch.from_numpy(base[None, :1])
+    snaps = {}
+    for t in range(steps):
+        on = [(r, tp) for r, tp, at in taps if (mode == "held" and at <= t) or
+              (mode == "impulse" and at <= t < at + int(spec.get("steps") or 1))]
+        if mode == "fixed":
+            for r, (row, col, d0, d1), at in taps:
+                if at == t:
+                    for d in (d0, d1):
+                        state[0, 1 + d, row, col] = max(float(state[0, 1 + d, row, col]), 1.0)
+                    state[0, spec["codeChannels"], row, col] = torch.from_numpy(code35_of(tab, r))
+        cs = torch.from_numpy(build_consts(j, tab, geo, on) if on else base)[None]
+        state = model.step(state, cs[:, :1], cs)
+        if every and t + 1 in every:
+            snaps[t + 1] = state[0].numpy().copy()
+    return state[0].numpy().copy(), snaps
+
+
 @torch.no_grad()
 def rollout(model, j, cs, steps, every=None):
     """States [C, H, W] after `steps` steps from the fresh state (and after each step in `every`)."""
@@ -385,8 +447,9 @@ def page_data(data_dir=None):
 
 # ---------------------------------------------------------------- fixtures
 
-def random_model(kind, inputs, channels, hidden, depth, seed, dir_groups=None):
-    """A small model with every parameter random (w2 included: a trained-looking update, not the identity)."""
+def random_model(kind, inputs, channels, hidden, depth, seed, dir_groups=None, tap=None):
+    """A small model with every parameter random (w2 included: a trained-looking update, not the identity); tap:
+    a train3 --tap ("impulse:2", "fixed") for its config."""
     torch.manual_seed(seed)
     if kind == "v1":
         model = V1.make_model(channels, hidden, (-2.0, 2.0), "taps")
@@ -396,6 +459,10 @@ def random_model(kind, inputs, channels, hidden, depth, seed, dir_groups=None):
         model = V2.make_model(channels, hidden, (-2.0, 2.0), n_in, depth, inputs, dir_groups)
         cfg = {"task": "m1a", "inputs": inputs, "channels": channels, "hidden": hidden, "clamp": [-2.0, 2.0],
                "nIn": n_in, "depth": depth, "dirGroups": dir_groups}
+        if tap:
+            mode, _, steps = tap.partition(":")
+            cfg.update({"tap": mode, "tapSteps": int(steps or 1), "speed": 2,
+                        "fixedChannels": list(range(channels - 35, channels)) if mode == "fixed" else None})
     with torch.no_grad():
         for p in model.parameters():
             fan = p[0].numel() if p.dim() > 1 else 4
@@ -434,7 +501,10 @@ def parity_fixture(default_weights):
              ("taps c depth 2", ("v2", "c", 20, 16, 2, None), "l2", 2, 6),
              ("taps a depth 1", ("v2", "a", 16, 12, 1, None), "l2", 3, 5),
              ("v1 chords", ("v1", None, 16, 16, 1, None), "l2", 1, 6),
-             ("default on l3", None, "l3", 3, 3)]
+             ("default on l3", None, "l3", 3, 3),
+             ("impulse e depth 2, taps at 0 and 2", ("v2", "e", 25, 16, 2, 2, "impulse:1"), "l2", 2, 6),
+             ("impulse 2 steps, taps at 0, 1, 3", ("v2", "e", 25, 16, 2, 1, "impulse:2"), "l2", 3, 6),
+             ("fixed write e, taps at 0 and 3", ("v2", "e", 50, 16, 2, 0, "fixed"), "l2", 2, 6)]
     geos = {name: bd.board(group, 0) for name, group, _ in BOARDS}
     for i, (label, spec, board, ntaps, steps) in enumerate(specs):
         rng = np.random.default_rng(100 + i)
@@ -443,17 +513,25 @@ def parity_fixture(default_weights):
             model, _ = model_from_json(j)
             inline = None
         else:
-            kind, inputs, C, Hd, depth, G = spec
-            model, cfg = random_model(kind, inputs, C, Hd, depth, seed=10 + i, dir_groups=G)
+            kind, inputs, C, Hd, depth, G = spec[:6]
+            model, cfg = random_model(kind, inputs, C, Hd, depth, seed=10 + i, dir_groups=G,
+                                      tap=spec[6] if len(spec) > 6 else None)
             j = strand_json(model, kind, cfg, {"note": f"random {label}"})
             inline = j
         geo = geos[board]
         taps = fixture_taps(tab, geo, rng, ntaps)
-        cs = build_consts(j, tab, geo, taps)
-        final, snaps = rollout(model, j, cs, steps, every={1})
+        at = [0] * len(taps)
+        if (j.get("tap") or {}).get("mode", "held") != "held":
+            at = [int(x) for x in label.split("taps at ")[1].replace(" and", ",").split(", ")]
+            final, snaps = rollout_events(model, j, tab, geo, [(r, t, a) for (r, t), a in zip(taps, at)], steps,
+                                          every={1})
+        else:
+            cs = build_consts(j, tab, geo, taps)
+            final, snaps = rollout(model, j, cs, steps, every={1})
         keep = final.shape[0] if board == "l2" else 32  # a big board: the first 32 channels (edges, hidden) only
         case = {"name": label, "weights": inline if inline is not None else "web/strand-weights.json",
-                "board": board, "taps": [{"rule": [int(x) for x in r], "tap": [int(x) for x in t]} for r, t in taps],
+                "board": board, "taps": [{"rule": [int(x) for x in r], "tap": [int(x) for x in t], "at": a}
+                                         for (r, t), a in zip(taps, at)],
                 "steps": steps, "shape": [keep] + list(final.shape[1:]), "state": b64(final[:keep]),
                 "drawn": int(((final[1:7] > 0.5) & (geo >= 0)).sum())}
         if board == "l2":
@@ -461,7 +539,8 @@ def parity_fixture(default_weights):
         cases.append(case)
     return {"what": "states [C, H, W] (shape: the first C channels kept) from the fresh state after `steps` steps (and "
                     "after step 1 on l2), torch float32 (nca.strand.export.parity_fixture); weights: the file, or "
-                    "inline", "cases": cases}
+                    "inline; a tap's `at`: the step it happens before (event weights; held weights hold every tap "
+                    "from step 0)", "cases": cases}
 
 
 def rules_fixture():

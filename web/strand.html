@@ -115,7 +115,7 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
 <div class="wrap">
   <header>
     <h1>Strands, as a trained neural CA</h1>
-    <p>Spectacle's game draws a line from a tapped tile along the player's rule, tile to tile. Here a small neural network runs on every hexagon, step after step, and has to draw that line itself: each tile sees only its own type and which way round it is, and the tapped tile alone is told the rule and the tapped chord. Tap tiles to start strands, each with its rule, and compare what the network draws with the true strand underneath. <a href="nca.html">Fill NCA</a> · <a href="index.html">Hand-written CA</a> · <a href="https://github.com/bohemian-miser/Hex_CA">Source on GitHub</a></p>
+    <p>Spectacle's game draws a line from a tapped tile along the player's rule, tile to tile. Here a small neural network runs on every hexagon, step after step, and has to draw that line itself: each tile sees only its own type and which way round it is, and the tapped tile alone is told the rule and the tapped chord (by older weights at every step; by newer ones once, at the tap, as in the game, after which the line has to keep itself going). Tap tiles to start strands, each with its rule, and compare what the network draws with the true strand underneath. <a href="nca.html">Fill NCA</a> · <a href="index.html">Hand-written CA</a> · <a href="https://github.com/bohemian-miser/Hex_CA">Source on GitHub</a></p>
     <p class="model" id="model" aria-live="polite">Loading weights…</p>
   </header>
 
@@ -182,7 +182,7 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
         <div class="buttons">
           <button id="play" class="primary">Pause</button>
           <button id="step">Step</button>
-          <button id="reset" title="Every model back to the fresh state, the taps held from step 0">Reset state</button>
+          <button id="reset" title="Every model back to the fresh state, the taps held (event weights: fired again) from step 0">Reset state</button>
         </div>
         <label class="slider" for="speed">Steps/s <input type="range" id="speed" min="1" max="120" value="30"><output id="speedOut">30</output></label>
         <label class="check"><input type="checkbox" id="truth" checked><span>True strands underneath <kbd>T</kbd></span></label>

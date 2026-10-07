@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { Board, RuleTable, splitHash, walk, type Rule, type StrandData } from '../src/strand.js';
-import { StrandNCA, chordsAt, decodeF32, isStrandWeights, loadStrandWeights, type Tap } from '../src/strand-nca.js';
+import { CODE35, StrandNCA, chordsAt, code35, decodeF32, isStrandWeights, loadStrandWeights, type Tap } from '../src/strand-nca.js';
 import { rng } from '../src/lines.js';
 
 const readJson = (path: string): unknown => JSON.parse(readFileSync(new URL(path, import.meta.url), 'utf8'));
@@ -22,7 +22,7 @@ interface ParityCase {
   name: string;
   weights: unknown;
   board: string;
-  taps: { rule: number[]; tap: number[] }[];
+  taps: { rule: number[]; tap: number[]; at?: number }[];
   steps: number;
   shape: [number, number, number];
   step1?: string;
@@ -140,10 +140,16 @@ describe('strand NCA (src/strand-nca.ts against PyTorch)', () => {
       const m = new StrandNCA(w, b, table);
       const taps: Tap[] = cs.taps.map((t) => ({ rule: ruleOf(t.rule), row: t.tap[0], col: t.tap[1], d0: t.tap[2], d1: t.tap[3] }));
       for (const t of taps) expect(chordsAt(table, t.rule, b, t.row, t.col).some(([a, c]) => (a === t.d0 && c === t.d1) || (a === t.d1 && c === t.d0))).toBe(true);
-      m.setTaps(taps);
+      // held weights hold every tap from step 0; event weights take each at its step (`at`)
+      const fire = (step: number) => { cs.taps.forEach((t, k) => { if ((t.at ?? 0) === step) m.tap(taps[k]); }); };
+      if (m.eventTaps) fire(0);
+      else m.setTaps(taps);
       m.step();
       if (cs.step1) expect(compare(m, b, decodeF32(cs.step1), [w.channels, b.h, b.w])).toBeLessThan(1e-4);
-      for (let t = 1; t < cs.steps; t++) m.step();
+      for (let t = 1; t < cs.steps; t++) {
+        if (m.eventTaps) fire(t);
+        m.step();
+      }
       expect(compare(m, b, decodeF32(cs.state), cs.shape)).toBeLessThan(1e-4);
       let drawn = 0;
       for (let i = 0; i < b.n; i++) for (let d = 0; d < 6; d++) drawn += +m.edgeOn(i, d);
@@ -164,6 +170,47 @@ describe('strand NCA (src/strand-nca.ts against PyTorch)', () => {
     m.reset();
     for (let t = 0; t < 5; t++) m.step();
     expect(Array.from(m.state)).toEqual(Array.from(a));
+  });
+
+  it('tap modes: older files hold their taps; event weights refuse setTaps, tap() is an event, reset() forgets', () => {
+    const held = loadStrandWeights(readJson('../web/strand-weights.json'));
+    expect(held.tap.mode).toBe('held');
+    expect(held.speed).toBe(1);
+    const b = boards.l2;
+    const rule = table.parse('15·000000000') as Rule;
+    const p = b.pos[10];
+    const [d0, d1] = chordsAt(table, rule, b, Math.floor(p / b.w), p % b.w)[0];
+    const t: Tap = { rule, row: Math.floor(p / b.w), col: p % b.w, d0, d1 };
+    const a = new StrandNCA(held, b, table);
+    const c = new StrandNCA(held, b, table);
+    a.setTaps([t]);
+    c.tap(t); // held weights: tap() = one more held tap
+    for (let k = 0; k < 4; k++) { a.step(); c.step(); }
+    expect(Array.from(c.state)).toEqual(Array.from(a.state));
+    const imp = parity.cases.find((x) => x.name.startsWith('impulse e'))!;
+    const w = loadStrandWeights(imp.weights);
+    expect(w.tap).toEqual({ mode: 'impulse', steps: 1, codeChannels: null });
+    const m = new StrandNCA(w, b, table);
+    expect(m.eventTaps).toBe(true);
+    expect(() => m.setTaps([t])).toThrow();
+    m.tap(t);
+    for (let k = 0; k < 3; k++) m.step();
+    const once = m.state.slice();
+    m.reset();
+    expect(m.tapList.length).toBe(0);
+    m.tap(t);
+    for (let k = 0; k < 3; k++) m.step();
+    expect(Array.from(m.state)).toEqual(Array.from(once)); // the same tap, the same state: nothing left over
+    const fx = loadStrandWeights(parity.cases.find((x) => x.name.startsWith('fixed'))!.weights);
+    const f = new StrandNCA(fx, b, table);
+    f.tap(t);
+    const i = b.cellOf[t.row * b.w + t.col];
+    expect(f.state[i * f.C + 1 + d0]).toBe(1);
+    expect(f.state[i * f.C + 1 + d1]).toBe(1);
+    const code = code35(table, rule);
+    expect(code.length).toBe(CODE35);
+    fx.tap.codeChannels!.forEach((ch, k) => expect(f.state[i * f.C + ch]).toBe(code[k]));
+    expect(Array.from(code.slice(0, 8)).map((v) => (v > 0 ? 1 : 0))).toEqual(Array.from(table.code(rule).slice(0, 8)));
   });
 
   it('a rule-everywhere model refuses a second tap', () => {

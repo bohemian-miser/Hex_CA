@@ -1,0 +1,61 @@
+# Launch 10: the tap as a one-time event (docs/spectacle-nca-taps.md §4.6). Two arms of nca/strand/train3.py, each
+# its own process on the one L4, both option E at channels 96 / hidden 256 / depth 2 (tap-e2-w's shape), warm-started
+# from tap-e2-w-l3's best.pt (the doc's choice; the consts layout is train2's, so --init loads):
+#   tap-i   --tap impulse: the tap's 59 planes are consts on its cell for one step, then zero (the product)
+#   tap-f   --tap fixed: no tap planes ever; at the tap the host writes the cell's two chord edges and the code's
+#           35-plane form into channels 61-95 (scalar at dirGroups 6) -- the diagnostic arm
+# Targets from nca/strand/sim.py (merged, PR #24): tips one chord per two steps (decision 4), the tile rule's hits
+# and both lines dying as waves (decision 3), absorption at own lines; sim.target_weight's windows (due from
+# on + 2, don't-care from on - 1 and for 2 steps after off). Damage (decision 6): noise on line cells (p 0.3, sigma
+# 0.1-0.3), the collisions and staggered taps of the episodes, and from T2 on a mid-episode tap on 10 % of kept
+# slots. Stages per arm (startup.sh chains them with --init from the previous stage's best.pt and adds --schedule
+# time: the lr, 5e-4, decays x0.3 at 60 % and x0.1 at 85 % of each stage's minutes):
+#   t1l2 45 min   T1 persistence: one strand, one-shot tap, on level 2
+#   t1l3 120      T1 on levels 2 + 3
+#   t2   90       T2 collisions: 2-4 taps of different codes meeting inside the window, a quarter control pairs;
+#                 a third of new slots still T1 (--remix). --hit-min 8: sim's collision draws hit at age 2 (median;
+#                 87 % by age 7 at level 2, 69 % at level 3), before the lines have grown; with the first hit at 8
+#                 or later the median hit is at 13-18 and the lines 18-38 chords long, so the dying waves and the
+#                 fleeing tips are what is trained (measured on the Pi: 14-19 ms a drawn episode, ~2 a T2 iteration)
+#   t3   60       T3 own-line meetings (joins, lines beside each other), the remix third T1 and T2
+#   = 315 min a run + SETUP_MIN 25 = 340 min = 5.67 VM-hours; MAX_HOURS 6 is enough.
+# Cost: ~$0.41/h (g2-standard-4 Spot, L4, disk and address) x 5.67 h = ~$2.32 (the doc's ~$2.3); a Spot reclaim
+# adds a relaunch's setup (~25 min) and at most 500 iterations (--ckpt-every 500: <= ~2 min of t1l2, ~8 of the
+# others), ~$0.25 each. Fallbacks (§4.6): two reclaims in one launch: drop t3 and cut t1l3 to 90.
+# Memory (python -m nca.strand.memprobe --train3 --group L3|L4 --tap impulse|fixed --channels 96 --hidden 256
+# --depth 2 --batch 8 --window 4 20 --last-k 48: CPU peak RSS over one train3 gradient window, saved tensors in
+# brackets), per backprop step at batch 8: level-3 boards (S 37, the largest this launch trains on) 52.5 MB impulse
+# / 50.3 fixed (38.7); level-4 crops (S 42) 76.9 / 71.4 (50.1-50.4), against plan-9's 68-73 (49) for the same net in
+# train2 (train3's interval targets and tap events add ~5 %). At batch 16, window 48: 52.5 x 2 x 48 = 5.0 GB an arm
+# (3.7 by the saved tensors), + pools (256 slots x levels 2 and 3, float32, ~0.15 GB) + a CUDA context (~0.4 GB)
+# = ~5.6 GB an arm, ~11 GB for both of the L4's ~22.5 usable (launch 8's VM ran ~25 % under this method).
+# Quick checks: held-out rules only. legacy + wide at levels 3 and 4, 120 taps each, now under the tap's arm and the
+# speed cap (ideal = 2 x growth + 2); persist (48 level-3 taps rolled to 4 x ideal, the tap long gone); from t2 on,
+# collide (48 sim episodes per level 2 and 3: collisions and controls) and in t3 own (48 per level); the linear and
+# the MLP code probes with byAge. Their rollouts are ~2.1x plan-9's (counted: legacy + wide 1.86x at the doubled
+# ideal, persist and the episode sets ~0.25x more), so expect ~5 min a check where plan-9's took 85-155 s; checks
+# every ~20 min of training: t1l2 every 6000 iterations (plan-9's net ran 0.18 s / iteration at level 2 with three
+# arms), t1l3 every 1200 (1.38 s at level 3), t2 / t3 every 1500 (levels 2 + 3 mixed).
+# Read first (§4.5): q.exit.rate and q.persist.x4 (both move early; the dashboard's default series), I vs F at the
+# first t1l2 check after iteration 0 (did the impulse latch?); q.speed.rate ~0.5; then q.collide.wipe /
+# q.collide.falseWipe once t2 starts, q.own.collateral in t3. The §4.4 bars: T1 persist x4 >= 0.95 x x1 and exact
+# >= plan-9's at the same iteration count on the legacy set; T2 wipe >= 0.9, falseWipe <= 0.02, regrow <= 0.01;
+# T3 collateral <= 0.02.
+# The Pi overfits (docs/spectacle-nca-taps.md §6; one rule, 4 level-2 episodes, ~450 iterations an arm): the impulse
+# latches (3 of 4 episodes on time by 300-350 iterations under the cap; --tap-steps 2: exact 1.0 at 400; the fixed
+# write 450; the held tap 300), so one step stays; if tap-i trails tap-f badly at the first t1l2 check,
+# --tap-steps 2 is the fallback. Persistence held to age 100 in every arm and failed at 300 / 600 (past the pool's
+# ages, which the persist set here stays inside); collisions learned from a T1 start (wipe 0.77-0.86, regrow
+# ~0.3) but did not converge in the Pi's budget.
+# Data: plan-9's (the private bucket's strand-v2.tgz and launch 5's strand.tgz); the warm start from the public run
+# bucket (bucket:runs/tap-e2-w-l3/best.pt, 1.6 MB; note it is that stage's iteration 0, i.e. tap-e2-w-l2's last best:
+# l3 never beat it on the balanced score, while its ckpt.pt, 7.7k l3 iterations on, has the higher right-exit rate
+# 0.90 vs 0.85).
+tap-i | t1l2 | 45  | --module nca.strand.train3 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --init bucket:runs/tap-e2-w-l3/best.pt --tap impulse --stage T1 --levels 2 --eval-levels 3 4 --persist-levels 3 --inputs e --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 6000 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-i | t1l3 | 120 | --module nca.strand.train3 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --tap impulse --stage T1 --levels 2 3 --eval-levels 3 4 --persist-levels 3 --inputs e --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1200 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-i | t2   | 90  | --module nca.strand.train3 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --tap impulse --stage T2 --hit-min 8 --levels 2 3 --eval-levels 3 4 --persist-levels 3 --inputs e --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-i | t3   | 60  | --module nca.strand.train3 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --tap impulse --stage T3 --hit-min 8 --levels 2 3 --eval-levels 3 4 --persist-levels 3 --inputs e --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-f | t1l2 | 45  | --module nca.strand.train3 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --init bucket:runs/tap-e2-w-l3/best.pt --tap fixed --stage T1 --levels 2 --eval-levels 3 4 --persist-levels 3 --inputs e --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 6000 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-f | t1l3 | 120 | --module nca.strand.train3 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --tap fixed --stage T1 --levels 2 3 --eval-levels 3 4 --persist-levels 3 --inputs e --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1200 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-f | t2   | 90  | --module nca.strand.train3 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --tap fixed --stage T2 --hit-min 8 --levels 2 3 --eval-levels 3 4 --persist-levels 3 --inputs e --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half
+tap-f | t3   | 60  | --module nca.strand.train3 --data gs://recipe-lanes-staging-hexca-private/data/strand-v2.tgz --legacy gs://recipe-lanes-staging-hexca-private/data/strand.tgz --tap fixed --stage T3 --hit-min 8 --levels 2 3 --eval-levels 3 4 --persist-levels 3 --inputs e --channels 96 --hidden 256 --depth 2 --last-k 48 --batch 16 --pool-size 256 --iters 1000000 --eval-every 1500 --ckpt-every 500 --eval-n 120 --snap-every 500 --ckpt-pool half

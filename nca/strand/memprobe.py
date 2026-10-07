@@ -9,6 +9,9 @@ over the last min(--last-k, G) steps (train2's --last-k; default 8), backward. I
 give the memory per step (the slope: activations kept for backward) and the rest (the intercept: the largest
 transient); both scale with batch x cells. --eval adds a no-gradient read-out at the eval batch. The GPU adds its context (~0.3-0.5 GB a
 process) and the allocator's slack, and holds the pool states (slots x channels x S^2 floats per level).
+--train3 runs nca/strand/train3.py's window instead (its Runner with the gather plan given, the tap as events,
+sim.py's interval targets [K=4] and its loss), on t2 episodes (collisions) of --group (default L4, the crops; L3 for
+launch 10's levels 2 + 3).
 """
 
 import argparse
@@ -35,10 +38,74 @@ def reset_peak():
         f.write("5")
 
 
+def one3(args):
+    """train3's gradient window (see the module docstring)."""
+    from . import episodes as E
+    from . import train2 as T2
+    from . import train3 as T
+    from .rules import Boards, RuleTable
+
+    torch.set_num_threads(args.threads)
+    tab, bd = RuleTable(), Boards()
+    T.CODES[0] = T2.Codes(tab)
+    rng = np.random.default_rng(0)
+    S = int(bd.hw[args.group].max())
+    cfg = {"tap": args.tap, "tapSteps": 1, "speed": 2, "slack": 2, "early": 1, "channels": args.channels,
+           "control": 0.0, "stagger": 24, "hitMax": 48,
+           "fixedChannels": T.fixed_channels(args.channels, T2.dir_groups_of(args.channels, -1))}
+    gen = T.Generator(tab, bd, cfg, args.group, S)
+    slots = [gen.new_slot(rng, "t2") for _ in range(args.batch)]
+    stack = lambda k: np.stack([s[k] for s in slots])  # noqa: E731
+    model = T2.make_model(args.channels, args.hidden, [-2.0, 2.0], T2.n_inputs(args.inputs), args.depth, args.inputs,
+                          None)
+    with torch.no_grad():
+        model.w2.normal_(0, 0.01)
+    dev = torch.device("cpu")
+    planes = T2.Planes(tab, args.inputs, dev)
+    runner = T.Runner(model, cfg, dev)
+    cs = T.base_consts(planes, stack("geo"))
+    plan = runner.plan(cs, args.batch)
+    evts = T.Events(stack("taps"), runner, planes, S)
+    on = torch.from_numpy(stack("on").astype(np.float32))
+    off = torch.from_numpy(stack("off").astype(np.float32))
+    mk = cs[:, :1]
+    ncell = 6 * mk.sum((1, 2, 3)).clamp(min=1)
+    state = T2.fresh(mk, args.channels)
+    with torch.no_grad():
+        for a in range(2):
+            state = evts.step(state, mk, cs, plan, np.full(args.batch, a))
+    base = status_mb("VmRSS")
+    reset_peak()
+    G, K = args.window, min(args.last_k, args.window)
+    seen, saved = set(), [0]
+
+    def pack(x):
+        st = x.untyped_storage()
+        if st.data_ptr() not in seen:
+            seen.add(st.data_ptr())
+            saved[0] += st.nbytes()
+        return x
+    acc = 0.0
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda x: x):
+        for t in range(G):
+            state = evts.step(state, mk, cs, plan, np.full(args.batch, 2 + t))
+            if t >= G - K:
+                age = torch.full((args.batch, 1, 1, 1, 1), float(t + 3))
+                acc = acc + T.step_loss(state, on, off, age, 2, 1, mk, ncell) / K
+    acc.mean().backward()
+    peak = status_mb("VmHWM")
+    print(json.dumps({"trainer": "train3", "group": args.group, "tap": args.tap, "inputs": args.inputs,
+                      "channels": args.channels, "hidden": args.hidden, "depth": args.depth, "batch": args.batch,
+                      "window": G, "lastK": K, "S": S, "baseMB": round(base, 1), "peakAboveMB": round(peak - base, 1),
+                      "savedMB": round(saved[0] / 2 ** 20, 1), "peakMB": round(peak, 1)}), flush=True)
+
+
 def one(args):
     from . import train2 as T
     from .rules import Boards, RuleTable
 
+    if args.train3:
+        return one3(args)
     torch.set_num_threads(args.threads)
     tab, bd = RuleTable(), Boards()
     codes = T.Codes(tab)
@@ -106,6 +173,9 @@ def main(argv=None):
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--last-k", type=int, default=8, help="train2's --last-k: the loss over this many last steps")
     ap.add_argument("--eval", action="store_true", help="a no-gradient read-out instead of a gradient window")
+    ap.add_argument("--train3", action="store_true", help="train3's window (the module docstring)")
+    ap.add_argument("--group", default="L4", help="--train3: the boards (L2, L3, L4)")
+    ap.add_argument("--tap", default="impulse", help="--train3: the tap mode")
     ap.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
     if args.child:
@@ -116,7 +186,8 @@ def main(argv=None):
         cmd = [sys.executable, "-m", "nca.strand.memprobe", "--child", "--inputs", args.inputs, "--channels",
                str(args.channels), "--hidden", str(args.hidden), "--depth", str(args.depth), "--batch", str(args.batch),
                "--window", str(G), "--threads", str(args.threads), "--last-k", str(args.last_k)] + \
-            (["--eval"] if args.eval else [])
+            (["--eval"] if args.eval else []) + \
+            (["--train3", "--group", args.group, "--tap", args.tap] if args.train3 else [])
         out = subprocess.run(cmd, capture_output=True, text=True, env=dict(os.environ))
         if out.returncode:
             raise SystemExit(out.stderr)

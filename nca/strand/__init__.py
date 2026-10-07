@@ -18,4 +18,14 @@ memprobe  -- `python -m nca.strand.memprobe`: training memory per arm (peak RSS 
 selftest2 -- `python -m nca.strand.selftest2`: data, inputs, targets, oracles, E's equivariance, runs, resume
 export    -- `python -m nca.strand.export CKPT`: a strand checkpoint (v1 or v2) as the strand play page's weights
              (web/strand.html); --board-data, --fixtures: the page's rule table and boards, the TS parity fixtures
+
+v3 (the tap as a one-time event: lines that last, lines that die; docs/spectacle-nca-taps.md, launch 10):
+sim       -- the multi-strand event simulator: taps with times, tips at one chord per two steps, the tile rule's
+             hits and dying waves, absorption, refusals; the targets' interval planes and windows; episode draws
+episodes  -- train3's adapter over sim: a pool slot's taps, its kinds' draws (single / collide / control / own),
+             mid-episode taps
+train3    -- `python -m nca.strand.train3`: --tap impulse | fixed | held, stages T1 / T2 / T3, noise and
+             mid-episode taps as damage, the quick check's persist / speed / collide / own and the MLP code probe
+selftest3 -- `python -m nca.strand.selftest3`: episodes vs sim, the target windows, tap events, the metrics
+             against oracles, runs; --overfit: the doc's §1 Pi overfits
 """
