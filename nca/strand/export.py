@@ -416,9 +416,11 @@ def board_data(tab, bd):
         i = 0
         assert int(bd.mirror[group][i]) in (1, -1)
         geo = bd.board(group, i)
+        tile = bd.tile_index(group, i)
+        assert np.array_equal(tile >= 0, geo >= 0), f"{group}: tile index and geo disagree on the board's cells"
         out[name] = {"level": level, "root": tab.leaf_order[0], "h": int(geo.shape[0]), "w": int(geo.shape[1]),
                      "mirror": int(bd.mirror[group][i]), "tiles": int((geo >= 0).sum()),
-                     "geo": [int(x) for x in geo.ravel()]}
+                     "geo": [int(x) for x in geo.ravel()], "tile": [int(x) for x in tile.ravel()]}
     return out
 
 
@@ -438,6 +440,8 @@ def page_data(data_dir=None):
                       "rules-hex.json and boards.npz (L2 / L3 / L4full, the Delta patch of each level)",
             "conventions": {"dirs": m["conventions"]["dirs_dq_dr"], "pairs": m["conventions"]["pairs"],
                             "geo": "type * 12 + rot * 2 + (mirror < 0), -1 off the board; row = r - r0, col = q - q0",
+                            "tile": "Spectacle's tile index in the patch (buildField({family: 'hex', level, rootTile: "
+                                    "root}), flatten order) of each cell, -1 off the board",
                             "tile_rot": m["conventions"]["tile_rot"], "split": m["conventions"]["split"]},
             "leafOrder": tab.leaf_order, "majors": list(m["conventions"]["majors"]),
             "typeMajors": m["type_majors"], "subsets": subsets,

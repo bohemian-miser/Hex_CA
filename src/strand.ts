@@ -51,6 +51,9 @@ export interface BoardData {
   mirror: number;
   tiles: number;
   geo: number[];
+  /** Spectacle's tile index (in the level's patch, flatten order) per array position, -1 off the board: the map
+   * back to Spectacle's engine (scripts/strand-export.ts; collide.json's boards carry it too). */
+  tile?: number[];
 }
 
 export interface StrandData {
