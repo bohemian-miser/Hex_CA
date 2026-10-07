@@ -22,8 +22,9 @@ around it (target_weight) is what makes it a light cone.
 WHAT HAPPENS (one step t: moves, then dying waves, then taps; the doc's §2 table):
   - A tap (t, cell, chord (d0, d1), rule) starts a line on that chord with two tips, one leaving across d1
     ("ahead"), one across d0 ("behind"). Refused (`accepted` False, nothing drawn) if the cell has no such chord
-    under the rule, holds any chord of another rule (a rival owns its whole tile), or the chord is already drawn
-    under this rule. Rules are unique per player, so the rule IS the identity: same rule = own line.
+    under the rule, holds any chord of another rule (a rival owns its whole tile; a dying one too, below), or the
+    chord is already drawn (or dying) under this rule. Rules are unique per player, so the rule IS the identity:
+    same rule = own line. Not checked: Spectacle's "inside a rival's circuit" (the host's geometry).
   - A tip moves one chord every PERIOD (2) steps (decision 4): chord k from the tap is drawn at t_tap + 2k. Off
     the board or into a cell without its chord: a tail, the tip stops.
   - Into a cell holding a chord of another rule: a HIT (decision 3, the tile rule; Spectacle's `crossingMode:
@@ -36,6 +37,10 @@ WHAT HAPPENS (one step t: moves, then dying waves, then taps; the doc's §2 tabl
     touch end to end are one line, as Spectacle's `join` makes them). It never jumps to another chord of the
     cell (case 9). A tip whose chord the wave erases dies; tips move before waves in a step, so a fleeing tip
     draws until the wave catches it (case 6: 2d steps for a tip d ahead) and those chords go too.
+  - What a wave or hit erases at h LINGERS until h + SLACK (the CA may still show it then): its cell is still a
+    rival's tile (a tip of another rule entering it hits it, and dies; a tap there is refused) and its chord
+    can't be drawn again (a tip of its rule stepping onto it has met the wave head on and dies -- round a loop,
+    the far tip would otherwise run back into the hole the hit made and regrow the line).
   - Onto a chord already drawn under its own rule: ABSORBED, the tip stops and nothing changes (case 4: a join
     at a loose end; the two tips of a loop meeting). Into a cell with another chord of its rule: it draws beside
     it. Two tips of one rule onto one chord on one step: one draws, the other is absorbed.
@@ -60,13 +65,17 @@ OUTPUTS (record arrays; `line` = the index of an accepted tap's line, in `lines`
           2 absorbed, 3 hit, 4 killed: its chord erased), row, col (its last cell), k (its chord's k)
   chords  row, col, a, b (its two edges), line, k (signed chords from the tap: + ahead, - behind), on, off,
           maybe
-  events  t, kind (TAP REFUSE TAIL ABSORB HIT KILL: KINDS), line, row, col, other (HIT: the victim line, -1 for an
-          empty cell (case 3); REFUSE: the tap index)
+  events  t, kind (TAP REFUSE TAIL ABSORB HIT KILL: KINDS), line, row, col, other (HIT: the victim line, one event
+          per victim; -1 nothing drawn on the cell (case 3), -2 nothing drawn but a rival's chord dying there.
+          KILL: -2 the tip met a wave of its rule head on (its next chord was dying); TAP / REFUSE: the tap index)
 
-SWITCHES (for the parity check against Spectacle's engine: python -m nca.strand.sim --parity): wave=0 wipes a hit
-line whole at once (the game's instant `dropPath`); sequential=True resolves moves one tip at a time in the
-engine's order (players by first tap, then lines by tap, ahead tip before behind) instead of all at once. The
-CA is wave=1, sequential=False.
+SWITCHES (for the parity check against Spectacle's engine: python -m nca.strand.sim --parity): wave=0 wipes at once
+(the game's `dropPath`; nothing lingers); sequential=True plays the engine's bookkeeping instead of the CA's: moves
+one tip at a time in its order (players by first tap, paths by tap, forward head before back head), a tap's two
+tips are a path's forward and back heads (its second tap, `tapOwnLine`), a forward head stopping at a tail
+costs the back head that tick's move, a join folds the met path in and hands its far head the joiner's pace,
+and wipes follow paths, not touching lines of one rule. The CA is wave=1, sequential=False; wave=0 with
+sequential=True reproduces Spectacle's engine tick for tick on the parity fixture (400 / 400 episodes).
 
     python -m nca.strand.sim --test        # unit tests (nca/strand/test_sim.py): the walker at double time, ...
     python -m nca.strand.sim --bench       # episodes per second per level and kind (the trainer's data path)
@@ -76,8 +85,6 @@ CA is wave=1, sequential=False.
 from __future__ import annotations
 
 import argparse
-import json
-import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -85,7 +92,7 @@ from typing import NamedTuple, Sequence
 
 import numpy as np
 
-from .walker import DCOL, DROW, PAIR_INDEX, PAIRS, walk
+from .walker import DCOL, DROW, PAIRS, walk
 
 INF = 32767          # "never" (= train.INF)
 PERIOD = 2           # steps per chord a tip grows (decision 4)
@@ -257,6 +264,12 @@ class _Sim:
         self.ln_tips, self.ln_slot = [], []
         self.tp_line, self.tp_side, self.tp_cell, self.tp_out, self.tp_rec, self.tp_k = [], [], [], [], [], []
         self.tp_next, self.tp_alive, self.tp_end, self.tp_why = [], [], [], []
+        # sequential (game) mode only: the engine's heads. A path is a line and the lines it absorbed; heads[path]
+        # = [forward tip, back tip] (-1 none); a tip's path and role (0 forward, 1 back) order its moves
+        self.tp_path, self.tp_role = [], []
+        self.heads = {}
+        self.path_of, self.path_lines = [], {}  # line -> its path; path -> its lines (joins merge them)
+        self.parent = []                         # path -> the path it was merged into (itself while it lives)
         self.due = {}
         self.fronts, self.born = [], []
         self.events = []
@@ -286,7 +299,9 @@ class _Sim:
         return r
 
     def erase(self, r, t, cause_line=-1):
-        """Erase record r at t; kill the tips standing on it. Returns the line it belonged to."""
+        """Erase record r at t (once); kill the tips standing on it. Returns the line it belonged to."""
+        if self.rc_off[r] < INF:
+            return self.rc_line[r]
         self.rc_off[r] = t
         cell = self.rc_cell[r]
         HW = self.HW
@@ -305,13 +320,13 @@ class _Sim:
                 self.kill(tip, t)
         return self.rc_line[r]
 
-    def stop(self, tip, t, why, kind):
+    def stop(self, tip, t, why, kind, other=-1):
         self.tp_alive[tip] = False
         self.tp_end[tip] = t
         self.tp_why[tip] = why
         if kind is not None:
             cell = self.tp_cell[tip]
-            self.events.append((t, kind, self.tp_line[tip], cell // self.W, cell % self.W, -1))
+            self.events.append((t, kind, self.tp_line[tip], cell // self.W, cell % self.W, other))
 
     def kill(self, tip, t):
         """A tip whose chord was erased at t; maybe the chord it could still have drawn inside the window."""
@@ -382,30 +397,37 @@ class _Sim:
                     recs.append(r)
             vs = victims[j] = []
             for r in recs:
-                a, b, code = self.rc_a[r], self.rc_b[r], self.ln_code[self.rc_line[r]]
+                a, b, key = self.rc_a[r], self.rc_b[r], self.key_of(self.rc_line[r])
                 line = self.erase(r, t)
                 if line not in vs:
                     vs.append(line)
-                self.start_wave(j, a, code, t)
-                self.start_wave(j, b, code, t)
+                self.start_wave(j, a, key, t)
+                self.start_wave(j, b, key, t)
         for j in sorted(hits):
             vs = victims[j]
+            empty = -2 if self.cell_dead[j] > t else -1  # nothing drawn: a dying rival's tile, or case 3
             for tip, ein, eout in hits[j]:
                 line = self.tp_line[tip]
-                for v in vs or [-1]:
+                for v in vs or [empty]:
                     self.events.append((t, HIT, line, j // W, j % W, v))
                 self.mark(line, HITTER, t, vs[0] if vs else -1)
                 for v in vs:
                     self.mark(v, VICTIM, t, line)
                 if self.maybe:
                     self.mb.append((j, ein, eout, line, self.tp_k[tip] + self.tp_side[tip], t, t))
-                self.start_wave(j, OPP[self.tp_out[tip]], self.ln_code[line], t)
+                self.start_wave(j, OPP[self.tp_out[tip]], self.key_of(line), t)
 
     def mark(self, line, role, t, by):
         if self.ln_hit[line] == INF:
             self.ln_hit[line] = t
             self.ln_by[line] = by
         self.ln_role[line] |= role
+
+    def key_of(self, line):
+        """What a wave follows: the chords of a rule (the CA: lines of one rule that touch are one line), or, in
+        sequential mode, of an engine path (lines touching end to end stay two paths until one steps onto the
+        other)."""
+        return self.path_of[line] if self.seq else self.ln_code[line]
 
     def start_wave(self, cell, edge, code, t):
         """A wave that erased (or would have erased) the chord at `cell` at t goes out across `edge`."""
@@ -422,7 +444,7 @@ class _Sim:
             return None
         ei = OPP[e]
         r = self.edge_rec[ei * HW + j]
-        if r < 0 or self.ln_code[self.rc_line[r]] != code:
+        if r < 0 or self.key_of(self.rc_line[r]) != code:
             return None
         line = self.erase(r, t)
         if self.ln_hit[line] == INF:
@@ -455,23 +477,25 @@ class _Sim:
         tips = [tp for tp in tips if self.tp_alive[tp] and self.tp_next[tp] == t]
         if not tips:
             return
-        tips.sort(key=lambda tp: (self.ln_slot[self.tp_line[tp]], -self.tp_side[tp]))
         if self.seq:
+            tips.sort(key=lambda tp: (self.ln_slot[self.find(self.tp_path[tp])], self.tp_role[tp]))
             for tip in tips:
-                if not self.tp_alive[tip]:
+                if not self.tp_alive[tip] or self.tp_next[tip] != t:
                     continue
                 nxt = self.peek(tip)
                 if nxt is None:
                     self.stop(tip, t, W_TAIL, TAIL)
+                    self.head_stopped(tip, t)
                 elif nxt[3] == "hit":
                     self.hit({nxt[0]: [(tip, nxt[1], nxt[2])]}, t)
                 elif nxt[3] == "absorb":
-                    self.stop(tip, t, W_ABSORBED, ABSORB)
+                    self.join(tip, nxt[0], nxt[1], t)
                 elif nxt[3] == "dying":
-                    self.stop(tip, t, W_KILLED, KILL)
+                    self.stop(tip, t, W_KILLED, KILL, -2)
                 else:
                     self.advance_tip(tip, nxt[0], nxt[1], nxt[2], t)
             return
+        tips.sort(key=lambda tp: (self.ln_slot[self.tp_line[tp]], -self.tp_side[tp]))
         hits, cands = {}, {}
         for tip in tips:
             nxt = self.peek(tip)
@@ -482,7 +506,7 @@ class _Sim:
             elif nxt[3] == "absorb":
                 self.stop(tip, t, W_ABSORBED, ABSORB)
             elif nxt[3] == "dying":
-                self.stop(tip, t, W_KILLED, KILL)
+                self.stop(tip, t, W_KILLED, KILL, -2)
             else:
                 cands.setdefault(nxt[0], []).append((tip, nxt[1], nxt[2]))
         for j, group in cands.items():
@@ -511,8 +535,10 @@ class _Sim:
             cell = p.row * W + p.col
             if self.ex[code][p.d0 * HW + cell] != p.d1:
                 why = "no such chord"
-            elif self.cell_code[cell] not in (-1, code) or self.cell_dead[cell] > t and self.dead_code[cell] != code:
+            elif self.cell_code[cell] not in (-1, code):
                 why = "a rival's tile"
+            elif self.cell_dead[cell] > t and self.dead_code[cell] != code:
+                why = "a rival's tile, dying"
             elif self.edge_rec[p.d0 * HW + cell] >= 0:
                 why = "your own line"
             elif self.edge_dead[p.d0 * HW + cell] > t:
@@ -532,23 +558,97 @@ class _Sim:
         self.player_lines[code] += 1
         r = self.draw(cell, p.d0, p.d1, line, 0, t)
         self.events.append((t, TAP, line, p.row, p.col, i))
-        tips = []
-        for side, out in ((1, p.d1), (-1, p.d0)):
-            tip = len(self.tp_line)
-            tips.append(tip)
-            self.tp_line.append(line)
-            self.tp_side.append(side)
-            self.tp_cell.append(cell)
-            self.tp_out.append(out)
-            self.tp_rec.append(r)
-            self.tp_k.append(0)
-            self.tp_next.append(INF)
-            self.tp_alive.append(True)
-            self.tp_end.append(INF)
-            self.tp_why.append(GROWING)
-            self.rec_tips.setdefault(r, []).append(tip)
-            self.schedule(tip, t + self.period)
+        tips = [self.new_tip(line, 1, cell, p.d1, r, 0, t + self.period, line, 0),
+                self.new_tip(line, -1, cell, p.d0, r, 0, t + self.period, line, 1)]
+        self.heads[line] = tips[:]
+        self.path_of.append(line)
+        self.path_lines[line] = [line]
+        self.parent.append(line)
         self.ln_tips.append(tips)
+
+    def new_tip(self, line, side, cell, out, rec, k, nxt, path, role):
+        tip = len(self.tp_line)
+        self.tp_line.append(line)
+        self.tp_side.append(side)
+        self.tp_cell.append(cell)
+        self.tp_out.append(out)
+        self.tp_rec.append(rec)
+        self.tp_k.append(k)
+        self.tp_next.append(INF)
+        self.tp_alive.append(True)
+        self.tp_end.append(INF)
+        self.tp_why.append(GROWING)
+        self.tp_path.append(path)
+        self.tp_role.append(role)
+        self.rec_tips.setdefault(rec, []).append(tip)
+        self.schedule(tip, nxt)
+        return tip
+
+    # -- the engine's heads (sequential mode)
+    def find(self, path):
+        while self.parent[path] != path:
+            path = self.parent[path]
+        return path
+
+    def head_stopped(self, tip, t):
+        """A head ran into a tail. The forward head's stop turns the path round (Engine.stop -> turnRound): the
+        back head leads from now on, and loses this tick's move (the path's progress was spent)."""
+        P, role = self.find(self.tp_path[tip]), self.tp_role[tip]
+        h = self.heads[P]
+        if role < 2 and h[role] == tip:
+            h[role] = -1
+        if role == 0 and h[1] >= 0 and self.tp_alive[h[1]]:
+            b = h[0] = h[1]
+            h[1] = -1
+            self.tp_role[b] = 0
+            if self.tp_next[b] == t:
+                self.schedule(b, t + self.period)
+
+    def join(self, tip, j, ein, t):
+        """Engine.meetOwn / join: a head steps onto a chord of its rule. The run of chords it meets is another
+        path (the head's path takes it in: the head carries on from the run's far end, at the head's pace, its
+        move spent; the run's own heads go) or its own path's other end (a circuit closes: both heads stop)."""
+        HW = self.HW
+        P, role = self.find(self.tp_path[tip]), self.tp_role[tip]
+        r = self.edge_rec[ein * HW + j]
+        Q = self.path_of[self.rc_line[r]]
+        cur, e_in, e_out = r, ein, -1
+        while Q != P:  # out to the far end of the met path
+            e_out = self.rc_b[cur] if self.rc_a[cur] == e_in else self.rc_a[cur]
+            n = self.nb[e_out * HW + self.rc_cell[cur]]
+            nxt = self.edge_rec[OPP[e_out] * HW + n] if n >= 0 else -1
+            if nxt < 0 or self.path_of[self.rc_line[nxt]] != Q or nxt == r:
+                break
+            cur, e_in = nxt, OPP[e_out]
+        self.stop(tip, t, W_ABSORBED, ABSORB)
+        h = self.heads[P]
+        if Q == P:  # the path closes on itself
+            for q in h:
+                if q >= 0 and self.tp_alive[q]:
+                    self.stop(q, t, W_ABSORBED, ABSORB)
+            self.heads[P] = [-1, -1]
+            return
+        for q in list(self.rec_tips.get(r, ())):  # the met end's head goes with its path
+            if self.tp_alive[q] and self.tp_out[q] == ein:
+                self.stop(q, t, W_ABSORBED, ABSORB)
+        for line in self.path_lines.pop(Q):  # the met path is now part of this one
+            self.path_of[line] = P
+            self.path_lines[P].append(line)
+        self.parent[Q] = P
+        for q in self.heads.pop(Q, ()):  # its heads go (the far one is taken over below)
+            if q >= 0:
+                self.tp_role[q] = 2
+        far = [q for q in self.rec_tips.get(cur, ()) if self.tp_alive[q] and self.tp_out[q] == e_out]
+        if far:
+            q = far[0]
+            self.tp_path[q], self.tp_role[q] = P, role
+            self.schedule(q, t + self.period)
+        else:  # the far end has no head (a tail): the engine's head is there all the same, and stops next move
+            c, k, line = self.rc_cell[cur], self.rc_k[cur], self.rc_line[cur]
+            side = (1 if k > 0 else -1) if k else (1 if e_out == self.taps[self.ln_tap[line]].d1 else -1)
+            q = self.new_tip(line, side, c, e_out, cur, k, t + self.period, P, role)
+        if role < 2:
+            h[role] = q
 
     # -- the loop
     def run(self, horizon):
@@ -786,7 +886,7 @@ def main(argv=None) -> int:
         from . import test_sim
         bad += test_sim.main([] if args.data is None else ["--data", args.data])
     if args.parity:
-        from .parity_sim import parity
+        from .sim_parity import parity
         bad += parity(args.data, args.collide, show=args.show)
     if args.bench:
         bench(args.data, args.seconds)

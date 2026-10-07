@@ -114,7 +114,8 @@ def invariants(tab, geo, ep, wave):
     for li in range(len(lines)):
         p = taps[lines["tap"][li]]
         mine = real[real["line"] == li]
-        if not (mine["on"] == p.t + 2 * np.abs(mine["k"])).all():
+        sched = p.t + 2 * np.abs(mine["k"])
+        if not ((mine["on"] == sched).all() if wave else (mine["on"] >= sched).all()):  # game: the engine's heads lag
             errs.append(f"line {li}: a chord off the 2|k| schedule")
         st = strand_of(tab, geo, p.rule, p.row, p.col, p.d0, p.d1)
         pos = {(int(r), int(q), int(PAIR_INDEX[a, b])): int(i) for r, q, a, b, i in

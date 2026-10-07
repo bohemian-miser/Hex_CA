@@ -17,6 +17,13 @@
  *   npx tsx scripts/strand-export.ts --rule-table [--out data/strand-v2] [--l4-crops 2048] [--l4-eval-crops 64]
  *       [--parity-big 1556] [--parity-taps 16] [--seed 1] [--crop-radius 8-14] [--spectacle DIR]
  *
+ * With --collide it runs Spectacle's engine on scripted taps of 2-4 players on the L2 / L3 patches and writes
+ * what each player's lines held, tick by tick (collide.json; python -m nca.strand.sim --parity compares; see
+ * mainCollide):
+ *
+ *   npx tsx scripts/strand-export.ts --collide [--out data/strand-v2] [--collide-n 400] [--collide-tmax 40]
+ *       [--seed 1] [--spectacle DIR]
+ *
  * Conventions (identical to nca/hexgrid.py and src/hex.ts):
  *   axial (q, r); array index row = r - r0, col = q - q0 (r0, q0 stored per board, i.e. the
  *   "offset" of hexgrid.py is -r0 / -q0); direction d in 0..5 is src/hex.ts DIRS[d] as (dq, dr):
@@ -1053,6 +1060,302 @@ async function mainV2(args: Record<string, string>, root: string): Promise<void>
 }
 
 // ---------------------------------------------------------------------------------------------
+// --collide: Spectacle's engine on scripted taps, for the multi-strand sim's parity check
+// (docs/spectacle-nca-taps.md §4.3; python -m nca.strand.sim --parity). Writes <out>/collide.json:
+//   knobs     the engine's knobs: normal mode, crossingMode 'tile', mutualCut, overlapOwnLines, maxHeads 12,
+//             one chord per second at any score (speedPerPoint 0, baseStepMs 1000, speedDivisor 1, speedOffset
+//             0), scoreTiles; and, for what the CA does not model: respawnDelayMs 0 (scripted taps), captures and
+//             conversion off (captureOnEnclose, takeEnclosed: out of scope, the doc's case 11), taps inside a
+//             rival's circuit allowed (the host's geometry, not the CA's)
+//   boards    "L2/<root>" / "L3/<root>": the board's geo (type * 12 + rot * 2 + mirror bit, -1 off), h, w (the
+//             same frames as boards.npz)
+//   episodes  board, players (rules as [subset, digit_0 .. digit_8], in the engine's player order), taps
+//             ({t, player, row, col, d0, d1, ok, reason}: a tap at CA step t lands after the engine's t-th tick,
+//             forward head through d1, then a second tap on the same chord grows it from its d0 end too, as a CA
+//             tap grows both ways), chords ([player, row, col, a, b, on, off]: every interval a player's lines
+//             held a chord, in ticks; off -1 = still there at rest), wipes ([tick, owner, by]: a path cut in a
+//             collision), settle (the last tick anything changed), ticks (ticked to)
+// One engine tick = one CA step: the engine runs 500 ms ticks at 1000 ms a chord, so a head steps every second
+// tick, two after its tap, as the sim's tips do. A tap the engine would turn into "extend your own line"
+// (tapOwnLine: the chord is one of the player's lines) is not sent: the sim refuses it, and so is it here.
+
+interface EngStep {
+  tile: number;
+  chord: number;
+  a: Pt;
+  b: Pt;
+}
+interface EngPath {
+  id: number;
+  owner: string;
+  status: string;
+  steps: readonly EngStep[];
+}
+interface EngPlayer {
+  id: string;
+  paths: readonly EngPath[];
+}
+type EngEvent = { t: string; owner?: string; by?: string; path?: number };
+interface EngineLike {
+  players: Map<string, EngPlayer>;
+  addPlayer(id: string, name: string, rule: PlayerRule): EngEvent[];
+  tap(id: string, tile: number, at: Pt): { result: { ok: true; path: number } | { ok: false; reason: string }; events: EngEvent[] };
+  tick(dtMs: number): EngEvent[];
+}
+interface EngineMod {
+  Engine: new (field: Field, knobs: Record<string, unknown>, rng: { next(): number; int(n: number): number }) => EngineLike;
+  DEFAULT_KNOBS: Record<string, unknown>;
+  worldChord(field: Field, table: ChordTable, i: number, c: number): Segment;
+  continuations(field: Field, table: ChordTable, i: number, c: number, head: Pt): readonly unknown[];
+}
+
+async function loadEngine(dir: string): Promise<EngineMod> {
+  const mod = async (p: string): Promise<Record<string, unknown>> =>
+    (await import(pathToFileURL(join(dir, p)).href)) as Record<string, unknown>;
+  const [engine, knobs, strand] = await Promise.all([
+    mod('shared/game/engine.ts'),
+    mod('shared/game/knobs.ts'),
+    mod('shared/game/strand.ts'),
+  ]);
+  return { ...strand, ...knobs, ...engine } as unknown as EngineMod;
+}
+
+const COLLIDE_KNOBS = {
+  mode: 'normal',
+  crossingMode: 'tile',
+  mutualCut: true,
+  overlapOwnLines: true,
+  maxHeads: 12,
+  speedPerPoint: 0,
+  baseStepMs: 1000,
+  speedDivisor: 1,
+  speedOffset: 0,
+  scoreTiles: true,
+  respawnDelayMs: 0,
+  captureOnEnclose: false,
+  takeEnclosed: false,
+  tapInsideRivalCircuits: true,
+};
+
+async function mainCollide(args: Record<string, string>, root: string): Promise<void> {
+  const t0 = performance.now();
+  const spectacleDir = resolve(root, args.spectacle ?? process.env.SPECTACLE_DIR ?? '../Spectacle');
+  const outDir = resolve(root, args.out ?? 'data/strand-v2');
+  const seed = Number(args.seed ?? 1);
+  const nEp = Number(args['collide-n'] ?? 400);
+  const tMax = Number(args['collide-tmax'] ?? 40);
+  const maxTicks = Number(args['collide-ticks'] ?? 4000);
+  const S = await loadSpectacle(spectacleDir);
+  const E = await loadEngine(spectacleDir);
+  const leaf = S.HEX_LEAF_ORDER;
+  const table = ruleTableV2(S);
+  const knobs = { ...E.DEFAULT_KNOBS, ...COLLIDE_KNOBS };
+
+  // Boards: the full L2 / L3 patches, in boards.npz's frames.
+  const boards = new Map<string, Board>();
+  const boardOut: Record<string, { h: number; w: number; geo: number[] }> = {};
+  for (const level of [2, 3]) {
+    for (let ri = 0; ri < leaf.length; ri++) {
+      const b = boardOf(latticeOf(S, S.buildField({ family: 'hex', level, rootTile: leaf[ri] })), level, ri, null);
+      const key = `L${level}/${ri}`;
+      boards.set(key, b);
+      const geo = new Array<number>(b.h * b.w).fill(-1);
+      b.old.forEach((t, i) => {
+        geo[(b.ra[i] - b.r0) * b.w + (b.qa[i] - b.q0)] = b.lat.field.types[t] * 12 + b.g[b.lat.rot[t]] * 2 + (b.mirror < 0 ? 1 : 0);
+      });
+      boardOut[key] = { h: b.h, w: b.w, geo };
+    }
+  }
+
+  const rng = mulberry32((seed * 7919 + 11) >>> 0);
+  const episodes: unknown[] = [];
+  const counts = { taps: 0, refused: 0, ownSkipped: 0, oneWay: 0, wipes: 0, ticks: 0 };
+  for (let ep = 0; ep < nEp; ep++) {
+    const key = `L${rng() < 0.5 ? 2 : 3}/${Math.floor(rng() * leaf.length)}`;
+    const b = boards.get(key)!;
+    const field = b.field;
+    const cellOfTile = (t: number): [number, number] => [b.ra[t] - b.r0, b.qa[t] - b.q0];
+    const dirAt = (t: number, p: Pt): number =>
+      b.g[dirOf(p.x - field.centers[2 * t], p.y - field.centers[2 * t + 1], 2, `chord end on tile ${t}`)];
+
+    // Players: 2-4 distinct rules from the whole kernel (subset uniform, then the rule within it).
+    const nPlayers = 2 + Math.floor(rng() * 3);
+    const rules: { si: number; digits: number[]; rule: PlayerRule; table: ChordTable }[] = [];
+    const seenRule = new Set<string>();
+    while (rules.length < nPlayers) {
+      const si = Math.floor(rng() * table.subsets.length);
+      const sub = table.subsets[si];
+      const digits = digitsOf(sub, Math.floor(rng() * sub.count));
+      const k = keyOfDigits(sub, digits);
+      if (seenRule.has(k)) continue;
+      seenRule.add(k);
+      const rule = ruleOfDigits(sub, digits);
+      rules.push({ si, digits, rule, table: S.chordTableFor(field, rule) });
+    }
+    const chordsOf = (pi: number, t: number): number[] => rules[pi].table.byType[field.types[t]].map((_, c) => c);
+    const anyChord = (pi: number): [number, number] | null => {
+      const all: [number, number][] = [];
+      for (let t = 0; t < field.count; t++) for (const c of chordsOf(pi, t)) all.push([t, c]);
+      return all.length ? all[Math.floor(rng() * all.length)] : null;
+    };
+
+    // Taps: 1-3 per player at random times; after the first, half are aimed at a tile on an earlier tap's
+    // strand (its own, for a join; a rival's, for a hit).
+    type TapRec = { t: number; player: number; tile: number; chord: number };
+    const plan: TapRec[] = [];
+    for (let pi = 0; pi < nPlayers; pi++) {
+      const n = 1 + Math.floor(rng() * 3);
+      for (let j = 0; j < n; j++) {
+        let pick: [number, number] | null = null;
+        if (plan.length && rng() < 0.5) {
+          const src = plan[Math.floor(rng() * plan.length)];
+          const w = S.walkStrand(field, rules[src.player].table, src.tile, src.chord, 1);
+          const s = w.steps[Math.floor(rng() * w.steps.length)];
+          const cs = chordsOf(pi, s.tile);
+          if (cs.length) pick = [s.tile, cs[Math.floor(rng() * cs.length)]];
+        }
+        pick ??= anyChord(pi);
+        if (pick) plan.push({ t: Math.floor(rng() * (tMax + 1)), player: pi, tile: pick[0], chord: pick[1] });
+      }
+    }
+    plan.sort((x, y) => x.t - y.t); // stable: same-time taps keep their order
+
+    // The engine. Its rng only picks a tap's exit end (hex rules have no junctions): set before each tap.
+    let nextVal = 0.25;
+    const engine = new E.Engine(field, knobs, { next: () => nextVal, int: (n) => Math.floor(nextVal * n) });
+    rules.forEach((r, pi) => engine.addPlayer(`p${pi}`, `p${pi}`, r.rule));
+    const tapsOut: Record<string, unknown>[] = [];
+    const wipes: [number, string, string][] = [];
+    const open = new Map<string, number>(); // chord key -> on tick
+    const intervals: [number, number, number, number, number, number, number][] = [];
+    let settle = 0;
+    let ti = 0;
+    let tick = 0;
+    const snapshot = (): void => {
+      const now = new Set<string>();
+      for (const [pid, p] of engine.players) {
+        const pi = Number(pid.slice(1));
+        for (const path of p.paths) {
+          for (const s of path.steps) {
+            const seg = E.worldChord(field, rules[pi].table, s.tile, s.chord);
+            const [r, c] = cellOfTile(s.tile);
+            const da = dirAt(s.tile, seg[0]);
+            const db = dirAt(s.tile, seg[1]);
+            now.add(`${pi},${r},${c},${Math.min(da, db)},${Math.max(da, db)}`);
+          }
+        }
+      }
+      for (const k of now) {
+        if (!open.has(k)) {
+          open.set(k, tick);
+          settle = tick;
+        }
+      }
+      for (const [k, on] of [...open]) {
+        if (now.has(k)) continue;
+        open.delete(k);
+        const [pi, r, c, a, bb] = k.split(',').map(Number);
+        intervals.push([pi, r, c, a, bb, on, tick]);
+        settle = tick;
+      }
+    };
+    const growing = (): boolean => {
+      for (const p of engine.players.values()) for (const q of p.paths) if (q.status === 'growing') return true;
+      return false;
+    };
+    for (; tick <= maxTicks; tick++) {
+      if (tick > 0) {
+        for (const e of engine.tick(500)) {
+          if (e.t === 'wipe' && e.by !== undefined) wipes.push([tick, e.owner!, e.by]);
+        }
+      }
+      for (; ti < plan.length && plan[ti].t <= tick; ti++) {
+        const { t, player, tile, chord } = plan[ti];
+        const pid = `p${player}`;
+        const tab = rules[player].table;
+        const seg = E.worldChord(field, tab, tile, chord);
+        const d0 = dirAt(tile, seg[0]);
+        const d1 = dirAt(tile, seg[1]);
+        const [row, col] = cellOfTile(tile);
+        const rec: Record<string, unknown> = { t, player, row, col, d0, d1, ok: false, reason: '' };
+        tapsOut.push(rec);
+        counts.taps++;
+        const mine = engine.players.get(pid)!.paths.some((q) => q.steps.some((s) => s.tile === tile && s.chord === chord));
+        if (mine) {
+          rec.reason = 'your own line';
+          counts.ownSkipped++;
+          continue;
+        }
+        const at = { x: (seg[0].x + seg[1].x) / 2, y: (seg[0].y + seg[1].y) / 2 };
+        nextVal = 0.75; // exitEnd 1: the forward head leaves through seg[1] = d1
+        const first = engine.tap(pid, tile, at);
+        if (!first.result.ok) {
+          rec.reason = first.result.reason;
+          counts.refused++;
+          continue;
+        }
+        rec.ok = true;
+        // The CA's tap grows both ways: tap the chord again (tapOwnLine: a second head from the start), if
+        // there is anywhere to go behind it.
+        if (E.continuations(field, tab, tile, chord, seg[0]).length > 0) {
+          const second = engine.tap(pid, tile, at);
+          if (!second.result.ok || second.result.path !== first.result.path) {
+            throw new Error(`episode ${ep}: the second tap did not extend the line (${JSON.stringify(second.result)})`);
+          }
+        } else counts.oneWay++;
+      }
+      snapshot();
+      if (ti >= plan.length && !growing()) break;
+    }
+    if (tick > maxTicks) throw new Error(`episode ${ep}: still growing after ${maxTicks} ticks`);
+    for (const [k, on] of open) {
+      const [pi, r, c, a, bb] = k.split(',').map(Number);
+      intervals.push([pi, r, c, a, bb, on, -1]);
+    }
+    intervals.sort((x, y) => x[5] - y[5] || x[0] - y[0] || x[1] - y[1] || x[2] - y[2] || x[3] - y[3]);
+    counts.wipes += wipes.length;
+    counts.ticks += tick;
+    episodes.push({
+      board: key,
+      players: rules.map((r) => [r.si, ...r.digits]),
+      taps: tapsOut,
+      chords: intervals,
+      wipes,
+      settle,
+      ticks: tick,
+    });
+    if (ep % 20 === 0) process.stdout.write(`\rcollide ${ep}/${nEp}   `);
+  }
+  process.stdout.write('\n');
+  let commit = 'unknown';
+  try {
+    commit = execFileSync('git', ['-C', spectacleDir, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  } catch {
+    // not a git checkout
+  }
+  mkdirSync(outDir, { recursive: true });
+  const out = {
+    version: 1,
+    generated: new Date().toISOString(),
+    spectacle: { commit },
+    args: { seed, n: nEp, tMax, maxTicks },
+    knobs: COLLIDE_KNOBS,
+    conventions: {
+      time: 'CA steps = engine ticks of 500 ms at 1000 ms a chord; a tap at t lands after tick t',
+      chords: '[player, row, col, a, b, on, off]: a < b, the chord\'s two edge directions; off -1 = there at rest',
+    },
+    boards: boardOut,
+    episodes,
+  };
+  writeFileSync(join(outDir, 'collide.json'), JSON.stringify(out));
+  console.log(
+    `${nEp} episodes: ${counts.taps} taps (${counts.refused} refused by the engine, ${counts.ownSkipped} on own lines ` +
+      `not sent, ${counts.oneWay} one-way), ${counts.wipes} wipes by collision, ${counts.ticks} ticks; ` +
+      `${((performance.now() - t0) / 1000).toFixed(1)} s -> ${join(outDir, 'collide.json')}`,
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Main.
 
 function parseArgs(argv: string[]): Record<string, string> {
@@ -1078,6 +1381,7 @@ async function main(): Promise<void> {
   const root = resolve(here, '..');
   const args = parseArgs(process.argv.slice(2));
   if (args['rule-table']) return mainV2(args, root);
+  if (args.collide) return mainCollide(args, root);
   const spectacleDir = resolve(root, args.spectacle ?? process.env.SPECTACLE_DIR ?? '../Spectacle');
   const outDir = resolve(root, args.out ?? 'data/strand');
   const taps = Number(args.taps ?? 32);
