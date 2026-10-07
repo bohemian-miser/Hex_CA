@@ -327,3 +327,32 @@ export function walk(ex: Int8Array, board: Board, row: number, col: number, d0: 
     index: seq.map((_, k) => k - behind.length), closed,
   };
 }
+
+/**
+ * Every strand of a rule across the whole board — not just one tap's — each chord walked exactly once (web/
+ * strand.ts's whole-rule pattern overlay). Cost is in proportion to the rule's own chords (a few per tile, via
+ * `walk`'s own one-pass trace), so callers should cache the result keyed on (board, rule) and only recompute
+ * when either changes, same as the trained model's per-tap ground truth already does per tap.
+ */
+export function allStrands(ex: Int8Array, board: Board, limit = 1 << 22): Strand[] {
+  const n = board.h * board.w;
+  const visited = new Uint8Array(n * 6);
+  const out: Strand[] = [];
+  for (let p = 0; p < n; p++) {
+    for (let d0 = 0; d0 < 6; d0++) {
+      if (visited[p * 6 + d0]) continue;
+      const d1 = ex[d0 * n + p];
+      if (d1 < 0) continue;
+      const row = Math.floor(p / board.w);
+      const col = p % board.w;
+      const strand = walk(ex, board, row, col, d0, d1, limit);
+      for (let k = 0; k < strand.rows.length; k++) {
+        const q = strand.rows[k] * board.w + strand.cols[k];
+        visited[q * 6 + strand.ins[k]] = 1;
+        visited[q * 6 + strand.outs[k]] = 1;
+      }
+      out.push(strand);
+    }
+  }
+  return out;
+}

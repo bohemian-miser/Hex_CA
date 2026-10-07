@@ -115,6 +115,8 @@ dl.readout dd { margin: 0; text-align: right; }
 .legend i { display: inline-block; width: 18px; height: 0; border-top: 3px solid var(--fg); }
 .legend i.thin { border-top-width: 1px; opacity: 0.6; }
 .legend i.dash { border-top-style: dashed; border-top-color: var(--stray); }
+.legend i.pattern { border-top-width: 1px; border-top-color: var(--muted); opacity: 0.8; }
+.legend i.pattern.dash { border-top-style: dashed; }
 .legend .sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; border: 1px solid var(--hair); }
 kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair); border-radius: 3px; padding: 0 4px; }
 /* Channel tiles (web/nca.html's): one small board per state channel of the trained model being inspected,
@@ -200,6 +202,7 @@ kbd { font: 11px var(--mono); color: var(--muted); border: 1px solid var(--hair)
         </div>
         <label class="slider" for="speed">Steps/s <input type="range" id="speed" min="1" max="120" value="30"><output id="speedOut">30</output></label>
         <label class="check"><input type="checkbox" id="truth" checked><span>True strands underneath <kbd>T</kbd></span></label>
+        <label class="check"><input type="checkbox" id="pattern" checked title="Every strand the selected rule draws, across the whole board, faint and underneath"><span>Show rule pattern <kbd>P</kbd></span></label>
         <label class="check"><input type="checkbox" id="types" checked><span>Tile types and rotation</span></label>
       </div>
       <div class="group">
