@@ -40,6 +40,9 @@ EPISODES (§4.3-4.4; sim.draw_taps through episodes.draw: taps the host refuses 
 STAGES (--stage; §4.4) set the mix of new slots: T1 all t1; T2 t2 (1 - remix), t1 remix; T3 t3 (1 - remix), t1 and
   t2 remix / 2 each (--remix, default 1/3: each stage re-mixes a third of its slots from the earlier ones);
   --mix t1=.5,t3=.5 overrides it.
+POOL: train2's, with two knobs for how old slots get (§5's "longer pool ages"): --new-share (1/8 of each batch made
+  new) and --no-worst-restart (train2 restarts the batch's worst slot every iteration, so a slot that drifts at an
+  age it was never trained at is reset before it is trained there).
 DAMAGE (decision 6; train2's state / move / edit are gone): --noise P (default 0.3) per kept slot: Gaussian noise
   of sigma U[--noise-sigma] (0.1-0.3) on the hidden channels (13..) of its line cells (cells with an edge due now),
   the target unchanged; --midtap P (default 0 in T1, 0.1 in T2 / T3) per kept slot: a new tap at an age in the
@@ -58,15 +61,15 @@ QUICK CHECK (held-out rules): train2's legacy and wide sets with the tap at age 
   persist  {x1, x2, x4, ratio, n}: a wide set (--persist-n taps per --persist-levels level whose 4 x ideal <=
            --persist-cap)
            rolled to 4 x ideal: exact at 1 x, 2 x, 4 x its own ideal (the tap long gone); ratio = x4 / x1
-  collide  {exact, exactHit, exactCtrl, wipe, falseWipe, regrow, worm, wormMax, n, nHit, byLevel} (--eval-sets
-           collide; default in T2 / T3): --episode-n t2 episodes per --episode-levels level (a --control share of
-           them controls; ideal + 2 S <= --eval-cap), rolled to rest = ideal + 2 S. wipe: of the edges due to go
-           that the model drew while they were due, the share off at ideal (a model that draws nothing has none:
-           None, not 1); falseWipe: of the edges of lines nobody hit that were
-           drawn while due, the share off at rest; regrow: of the wiped edges, the share drawn at any age in (ideal,
-           rest]; worm: chords of hit lines first drawn after the first hit, per episode with a hit (wormMax: the
-           most the targets allow, chords due after the hit less the slack: what a fleeing tip may still lay);
-           exact: the drawing = the targets at ideal
+  collide  {exact, exactHit, exactCtrl, wipe, grown, falseWipe, regrow, worm, wormMax, n, nHit, byLevel}
+           (--eval-sets collide; default in T2 / T3): --episode-n t2 episodes per --episode-levels level (a
+           --control share of them controls; ideal + 2 S <= --eval-cap), rolled to rest = ideal + 2 S. wipe: of
+           the edges due to go that the model drew while they were due, the share off at ideal (a model that draws
+           nothing has none: None, not 1); grown: the share of the doomed edges it drew at all while due;
+           falseWipe: of the edges of lines nobody hit that were drawn while due, the share off at rest; regrow: of
+           the wiped edges, the share drawn at any age in (ideal, rest]; worm: chords of hit lines first drawn
+           after the first hit, per episode with a hit (wormMax: the most the targets allow, chords due after the
+           hit less the slack: what a fleeing tip may still lay); exact: the drawing = the targets at ideal
   own      {exact, collateral, phantom, stray, n} (--eval-sets own; default in T3): t3 episodes. collateral: of the
            union's edges drawn while due, the share off at rest (an own meeting taken for a hit); phantom: the share
            of episodes whose drawing still changes after ideal (a tip still running: the CA has no tip output);
@@ -306,7 +309,8 @@ class Generator:
             kind = "ctrl"
         for _ in range(100):
             i, geo = self.board(rng)
-            sl = E.draw(rng, self.tab, geo, kind, cfg["speed"], cfg["slack"], self.split, cfg["stagger"], cfg["hitMax"])
+            sl = E.draw(rng, self.tab, geo, kind, cfg["speed"], cfg["slack"], self.split, cfg["stagger"], cfg["hitMax"],
+                        hit_min=cfg.get("hitMin", 0))
             if sl is not None:
                 return sl, geo, i
         raise RuntimeError(f"no {kind} episode in 100 boards of {self.group}")
@@ -340,7 +344,8 @@ def overfit_episodes(tab, bd, cfg, K, S, seed):
             i = int(rng.integers(nb))
             geo = T2.pad_geo(bd.board(group, i), S)
             sl = E.draw(rng, tab, geo, kind, cfg["speed"], cfg["slack"], "train", cfg["stagger"], cfg["hitMax"],
-                        rules=rules[:1] if kind != "t2" else rules, tries=3, n=2 if kind == "t2" else None)
+                        rules=rules[:1] if kind != "t2" else rules, tries=3, n=2 if kind == "t2" else None,
+                        hit_min=cfg.get("hitMin", 0))
             if sl is None or not lo <= sl.length <= hi:
                 continue
             key = (i, tuple(tuple(tp) for tp in sl.taps))
@@ -707,7 +712,8 @@ def summarise_episodes(es_list, results, read_names):
                     if exact[:, 0].any() else None
             if hitk.any():  # an overfit of collisions (--stage T2)
                 out.update({"wipe": rnd(1 - cat("Wleft")[hitk].sum() / cat("Wever")[hitk].sum())
-                            if cat("Wever")[hitk].sum() else None, "regrow": sh(cat("Wregrow")[hitk], cat("W")[hitk]),
+                            if cat("Wever")[hitk].sum() else None, "grown": sh(cat("Wever")[hitk], cat("W")[hitk]),
+                            "regrow": sh(cat("Wregrow")[hitk], cat("W")[hitk]),
                             "falseWipe": sh(cat("Vlost"), cat("Vever")), "worm": rnd(cat("worm")[hitk].mean()),
                             "wormMax": rnd(cat("wormMax")[hitk].mean())})
         else:
@@ -717,7 +723,7 @@ def summarise_episodes(es_list, results, read_names):
                 out.update({"exactHit": rnd(exact[hitk, 0].mean()) if hitk.any() else None,
                             "exactCtrl": rnd(exact[ctrl, 0].mean()) if ctrl.any() else None,
                             "wipe": rnd(1 - cat("Wleft")[hitk].sum() / cat("Wever")[hitk].sum())
-                            if cat("Wever")[hitk].sum() else None,
+                            if cat("Wever")[hitk].sum() else None, "grown": sh(cat("Wever")[hitk], cat("W")[hitk]),
                             "falseWipe": sh(cat("Vlost"), cat("Vever")),
                             "regrow": sh(cat("Wregrow")[hitk], cat("W")[hitk]),
                             "worm": rnd(cat("worm")[hitk].mean()) if hitk.any() else None,
@@ -896,7 +902,12 @@ def main(argv=None):
     p.add_argument("--control", type=float, default=0.25, help="t2: share of control pairs (no collision)")
     p.add_argument("--stagger", type=int, default=None, help="later taps by this age (default bptt / 2)")
     p.add_argument("--hit-max", type=int, default=None, help="t2: the first hit by this age (default bptt)")
+    p.add_argument("--hit-min", type=int, default=0, help="t2: the first hit no earlier than this age (sim's collisions "
+                                                          "mostly hit at 2-3, before the lines have grown)")
     p.add_argument("--noise", type=float, default=0.3, help="probability of noise damage per kept slot")
+    p.add_argument("--new-share", type=float, default=0.125, help="share of each batch made new slots (train2's 1/8)")
+    p.add_argument("--no-worst-restart", action="store_true",
+                   help="don't restart the batch's worst slot (train2 does): old, drifting slots stay to be trained")
     p.add_argument("--noise-sigma", type=float, nargs=2, default=[0.1, 0.3], metavar=("LO", "HI"))
     p.add_argument("--midtap", type=float, default=None, help="probability of a new tap per kept slot (default 0 "
                                                                  "in T1, 0.1 in T2 / T3)")
@@ -1030,7 +1041,9 @@ def main(argv=None):
                "stage": args.stage, "remix": args.remix, "mix": stage_mix(args.stage, args.remix, args.mix),
                "control": args.control,
                "stagger": stagger, "hitMax": args.hit_max if args.hit_max is not None else args.bptt,
-               "noise": args.noise, "noiseSigma": list(args.noise_sigma),
+               "hitMin": args.hit_min,
+               "noise": args.noise, "noiseSigma": list(args.noise_sigma), "newShare": args.new_share,
+               "worstRestart": not args.no_worst_restart,
                "midtap": args.midtap if args.midtap is not None else (0.0 if args.stage == "T1" else 0.1),
                "overfit": args.overfit, "overfitSeed": args.overfit_seed, "overfitLen": list(args.overfit_len),
                "stepsMult": list(args.steps_mult), "bptt": args.bptt, "lastK": args.last_k,
@@ -1286,9 +1299,10 @@ def main(argv=None):
             t_ev += time.time() - t_pre
         # ---- the events at the start of the gradient window: new episodes, the worst slot's restart, damage
         cur = np.nan_to_num(P["loss"][idx], nan=-1.0)
-        j_worst = int(cur.argmax())
-        new = set(rng.choice(len(idx), max(1, len(idx) // 8), replace=False).tolist())
-        restart = new | {j_worst}
+        j_worst = int(cur.argmax()) if cfg.get("worstRestart", True) else -1
+        n_new = max(1, int(round(len(idx) * cfg.get("newShare", 0.125)))) if cfg.get("newShare", 0.125) > 0 else 0
+        new = set(rng.choice(len(idx), n_new, replace=False).tolist()) if n_new else set()
+        restart = new | ({j_worst} if j_worst >= 0 else set())
         noisy = []
         for pos, i in enumerate(idx):
             if pos in new:
@@ -1310,8 +1324,9 @@ def main(argv=None):
         cs = base_consts(planes, P["geo"][idx])
         walls = cs[:, :1]
         plan = runner.plan(cs, len(idx))
-        rs = torch.tensor(sorted(restart), device=device)
-        state[rs] = T2.fresh(cs[rs, :1], C)
+        if restart:
+            rs = torch.tensor(sorted(restart), device=device)
+            state[rs] = T2.fresh(cs[rs, :1], C)
         for pos, i in noisy:
             if noise_damage(rng, P, i, pos, state, cfg):
                 kinds["noise"] += 1

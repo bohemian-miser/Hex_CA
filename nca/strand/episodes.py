@@ -81,8 +81,10 @@ def run(tab, geo, taps, period, slack, exits=None):
     return Slot(list(taps), on, off, int(ep.settle), hit, kind, int((~ep.chords["maybe"]).sum()), codes), ep
 
 
-def draw(rng, tab, geo, kind, period, slack, split="train", t_max=24, hit_max=48, rules=None, tries=20, n=None):
-    """A Slot of train3's `kind` (t1 one tap; t2 a collision with its first hit by hit_max; ctrl a control pair;
+def draw(rng, tab, geo, kind, period, slack, split="train", t_max=24, hit_max=48, rules=None, tries=20, n=None,
+         hit_min=0):
+    """A Slot of train3's `kind` (t1 one tap; t2 a collision with its first hit in [hit_min, hit_max]; ctrl a control
+    pair;
     t3 an own meeting: two or more taps that stood) via sim.draw_taps (n taps, or its own count), or None."""
     for _ in range(tries):
         taps = SIM.draw_taps(rng, tab, geo, SIM_KIND[kind], n=n, t_max=t_max, split=split, rules=rules)
@@ -92,7 +94,7 @@ def draw(rng, tab, geo, kind, period, slack, split="train", t_max=24, hit_max=48
             slot, _ = run(tab, geo, taps, period, slack)
         except ValueError:  # an edge with more than K_MAX intervals
             continue
-        if kind == "t2" and not 0 <= slot.hit <= hit_max:
+        if kind == "t2" and not max(0, hit_min) <= slot.hit <= hit_max:
             continue
         if kind == "t3" and (len(slot.taps) < 2 or slot.kind != "t3"):
             continue

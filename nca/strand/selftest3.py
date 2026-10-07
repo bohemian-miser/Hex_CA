@@ -487,20 +487,24 @@ OVERFIT = ["--overfit", "4", "--levels", "2", "--channels", "48", "--dir-groups"
            "--warmup", "50", "--eval-every", "50", "--snap-every", "0", "--no-probe", "--no-gallery"]
 
 
-def overfits(minutes, threads, only=None, stage="T1"):
+def overfits(minutes, threads, only=None, stage="T1", extra=()):
     arms = [("held", ["--tap", "held"]), ("impulse", ["--tap", "impulse"]), ("fixed", ["--tap", "fixed"]),
             ("impulse-nocap", ["--tap", "impulse", "--speed", "1", "--slack", "1", "--early", "-1"]),
             ("held-nocap", ["--tap", "held", "--speed", "1", "--slack", "1", "--early", "-1"]),
             ("fixed-nocap", ["--tap", "fixed", "--speed", "1", "--slack", "1", "--early", "-1"]),
-            ("impulse2", ["--tap", "impulse", "--tap-steps", "2"])]
+            ("impulse2", ["--tap", "impulse", "--tap-steps", "2"]),
+            ("impulse-old", ["--tap", "impulse", "--no-worst-restart", "--new-share", "0.0625"]),
+            ("held-old", ["--tap", "held", "--no-worst-restart", "--new-share", "0.0625"]),
+            ("impulse-init", ["--tap", "impulse", "--init", "runs/pi3-t1-impulse/best.pt"]),
+            ("fixed-init", ["--tap", "fixed", "--init", "runs/pi3-t1-fixed/best.pt"])]
     rows = []
-    for name, extra in arms:
+    for name, extra_arm in arms:
         if only and name not in only:
             continue
         run = f"pi3-{stage.lower()}-{name}"
         if not os.path.isfile(f"runs/{run}/log.jsonl") or not any('"stopped"' in x for x in open(f"runs/{run}/log.jsonl")):
-            T.main(["--name", run, *OVERFIT, *extra, "--stage", stage, "--minutes", str(minutes), "--iters", "100000",
-                    "--threads", str(threads)])
+            T.main(["--name", run, *OVERFIT, *extra_arm, *extra, "--stage", stage, "--minutes", str(minutes),
+                    "--iters", "100000", "--threads", str(threads)])
         lg = log_of(run)
         qs = [(x["iteration"], x["q"]["overfit"]) for x in lg if "q" in x]
         first = lambda key: next((it for it, q in qs if q.get(key) == 1.0), None)  # noqa: E731
@@ -519,10 +523,11 @@ def main():
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--arms", nargs="*", default=None)
     ap.add_argument("--stage", default="T1")
+    ap.add_argument("--extra", nargs=argparse.REMAINDER, default=[], help="more train3 args for every arm")
     ap.add_argument("--only", nargs="*", default=None, help="sections: episodes targets taps oracle runs")
     args = ap.parse_args()
     if args.overfit:
-        overfits(args.minutes, args.threads, args.arms, args.stage)
+        overfits(args.minutes, args.threads, args.arms, args.stage, args.extra)
         return
     torch.set_num_threads(1)
     tab, bd = RuleTable(), Boards()
