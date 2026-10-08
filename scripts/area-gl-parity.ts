@@ -24,8 +24,11 @@ const m = /RESULT (\{.*\})/.exec(dom);
 if (!m) throw new Error(`no result in the page:\n${dom.slice(0, 2000)}`);
 const out = JSON.parse(m[1].replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"'));
 if (out.error) throw new Error(out.error);
-console.log(`renderer: ${out.renderer}, MAX_DRAW_BUFFERS ${out.maxDrawBuffers}`);
+console.log(`renderer: ${out.renderer}, MAX_DRAW_BUFFERS ${out.maxDrawBuffers}; glUsable ${out.picker.usable}, ` +
+  `bestArea is GL: auto ${out.picker.auto}, force ${out.picker.force}, off ${out.picker.off}`);
 console.log('parity (cpuArea vs glArea): board, owners, walls, steps, max |Δ| channel 1 / all channels, fill cells differing (of filled), territory differing');
 for (const p of out.parity) console.log(`  ${p.board} #${p.n}: ${p.owners} owners, walls ${p.walls.join('/')}, ${p.steps} steps: ${p.maxCh1} / ${p.maxAll}, fill ${p.fillDiff} (${p.filled}), territory ${p.terrDiff}`);
+console.log('the settle rule on both (status@flood steps since the walls changed, CPU / GL):');
+for (const r of out.settle) console.log(`  ${r.board} #${r.n}: p1 ${r.p1}; p2 ${r.p2}${r.same1 && r.same2 ? '' : '  <- DIFFERENT'}`);
 console.log('ms per step:');
 for (const t of out.timing) console.log(`  ${t.board} (${t.cells} cells), ${t.owners} owner${t.owners > 1 ? 's' : ''}: GL ${t.glMsPerStep}${t.cpuMsPerStep !== undefined ? `, CPU ${t.cpuMsPerStep}` : ''}`);

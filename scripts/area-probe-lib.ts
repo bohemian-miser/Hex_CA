@@ -7,6 +7,7 @@
 // (nca/evaluate.py's rule).
 
 import type { AreaFrame } from '../src/game/area.js';
+import { rng } from '../src/lines.js';
 import { targets } from '../src/nca.js';
 import { allStrands, Board, DCOL, DROW, RuleTable, type Rule, type Strand } from '../src/strand.js';
 
@@ -31,6 +32,8 @@ export interface Sample {
   tie: number; // second-largest / largest rim region (0 with fewer than two)
   regions: Region[];
   lab: Int32Array; // per board cell, its region (-1 a wall)
+  /** Per strand, its tiles' slots in walking order, and whether it is a loop (for --live growth). */
+  strands: { slots: Int32Array; loop: boolean }[];
 }
 
 /** A strand's ends: true where the line would carry on off the board (false: the next tile has no chord). */
@@ -117,6 +120,9 @@ function sampleBoard(table: RuleTable, board: Board, frame: AreaFrame, rand: () 
     return {
       rule: key, kinds: picked.map((p) => p.kind), walls, wallCells, targets: tg, fillCells, rimRegions: rims.length,
       tie: rims.length >= 2 ? rims[1] / rims[0] : 0, regions: regs, lab,
+      strands: picked.map(({ st }) => ({
+        slots: Int32Array.from(st.rows, (r, t) => frame.slot[board.cellOf[r * board.w + st.cols[t]]]), loop: st.closed,
+      })),
     };
   }
 }
@@ -135,6 +141,8 @@ export function sampleBoards(table: RuleTable, board: Board, frame: AreaFrame, n
 /** What the probe needs of a flood: load a wall picture (from the fresh state), step, read channel 1 (S² slots). */
 export interface Runner {
   load(walls: Uint8Array): void;
+  /** Changes the walls without a reset (a live edit). */
+  edit(walls: Uint8Array): void;
   /** Steps since the last load. */
   readonly steps: number;
   advance(n: number): void;
@@ -159,8 +167,32 @@ export interface Result {
 }
 
 /** The probe of one weights set on one level's boards, read out at mult·R steps for each mult. */
+/**
+ * The walls growing as lines do (§2.3): every strand tapped at once at a random tile, one tile further each way every
+ * `period` flood steps (a loop's two ends meet), as successive wall pictures; the last is the whole picture.
+ */
+export function growth(smp: Sample, S: number, rand: () => number, period = 2): Uint8Array[] {
+  const taps = smp.strands.map((st) => Math.floor(rand() * st.slots.length));
+  const longest = Math.max(...smp.strands.map((st) => st.slots.length));
+  const out: Uint8Array[] = [];
+  for (let g = 0; g < longest; g++) {
+    const w = new Uint8Array(S * S);
+    smp.strands.forEach((st, k) => {
+      const L = st.slots.length;
+      for (let i = 0; i < L; i++) {
+        const d = Math.abs(i - taps[k]);
+        if ((st.loop ? Math.min(d, L - d) : d) <= g) w[st.slots[i]] = 1;
+      }
+    });
+    for (let p = 0; p < period; p++) out.push(w);
+  }
+  return out;
+}
+
+/** The probe of one weights set on one level's boards, read out at mult·R steps for each mult. `live`: the walls
+ * arrive as they grow (`growth`, from a fresh state with none), and the read-outs count from the last tile. */
 export function probe(level: string, weights: string, board: Board, frame: AreaFrame, samples: Sample[], mults: number[],
-  runner: Runner): Result[] {
+  runner: Runner, live?: (smp: Sample) => Uint8Array[]): Result[] {
   const res: Result[] = mults.map((mult) => ({
     level, weights, mult, steps: mult * frame.R, R: frame.R, all: tally(), nontrivial: tally(),
     byBucket: SIZE_BUCKETS.map(tally), byKind: { loops: tally(), claims: tally(), mixed: tally() }, byTie: TIE_BINS.map(tally),
@@ -169,10 +201,18 @@ export function probe(level: string, weights: string, board: Board, frame: AreaF
   const { slot } = frame;
   let stepMs = 0;
   for (const smp of samples) {
-    runner.load(smp.walls);
+    let from = 0;
+    if (live) {
+      runner.load(new Uint8Array(smp.walls.length));
+      for (const w of live(smp)) {
+        runner.edit(w);
+        runner.advance(1);
+      }
+      from = runner.steps;
+    } else runner.load(smp.walls);
     for (let m = 0; m < mults.length; m++) {
       const t0 = performance.now();
-      runner.advance(res[m].steps - runner.steps);
+      runner.advance(from + res[m].steps - runner.steps);
       const ch1 = runner.ch1(); // (timed with the steps: on the GPU, the read is where they finish)
       stepMs += performance.now() - t0;
       let wrong = Infinity;
@@ -249,3 +289,9 @@ export function reportLines(r: Result, verbose: boolean): string[] {
 /** The seed of a level's board stream (so the CPU and GL runs, and every weights set, see the same boards). */
 export const levelSeed = (seed: number, level: string, minFill: number): number =>
   seed * 1000 + Number(level.slice(1)) + (minFill > 0 ? 500 * minFill : 0);
+
+/** --live's growth for a level: its own random stream (the boards are the same with or without it). */
+export function liveWalls(level: string, S: number): (smp: Sample) => Uint8Array[] {
+  const rand = rng(7919 + Number(level.slice(1)));
+  return (smp) => growth(smp, S, rand);
+}

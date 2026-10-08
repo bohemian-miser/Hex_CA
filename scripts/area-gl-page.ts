@@ -4,7 +4,7 @@
 import strandData from '../web/strand-data.json';
 import weightsJson from '../web/nca-weights.json';
 import { CpuArea, type LineChannels } from '../src/game/area.js';
-import { GlArea } from '../src/game/area-gl.js';
+import { bestArea, GlArea, glUsable } from '../src/game/area-gl.js';
 import { rng } from '../src/lines.js';
 import { loadWeights } from '../src/nca.js';
 import { allStrands, Board, DCOL, DROW, RuleTable, type Rule, type StrandData } from '../src/strand.js';
@@ -14,6 +14,8 @@ const data = strandData as unknown as StrandData;
 const table = new RuleTable(data);
 const weights = loadWeights(weightsJson);
 const out: Record<string, unknown> = {};
+/** The bare flood, every step (no settle rule): what the state parity and the timings compare. */
+const RAW = { settlePerR: 0, capPerR: 0 };
 
 function context(): WebGL2RenderingContext {
   const canvas = document.createElement('canvas');
@@ -56,6 +58,10 @@ try {
   const info = gl.getExtension('WEBGL_debug_renderer_info');
   out.renderer = String(info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER));
   out.maxDrawBuffers = gl.getParameter(gl.MAX_DRAW_BUFFERS);
+  // The picker: GL on a hardware renderer (forced on a software one), the CPU when told to stay off.
+  const l2 = new Board(data.boards.l2);
+  out.picker = { usable: glUsable(), auto: bestArea(l2, weights, 1) instanceof GlArea, force: bestArea(l2, weights, 1, 'force') instanceof GlArea,
+    off: bestArea(l2, weights, 1, 'off') instanceof GlArea };
 
   // Parity: the same lines into both layers, read out every 8 steps up to 16 R.
   const parity: unknown[] = [];
@@ -65,8 +71,8 @@ try {
     const rand = rng(17);
     for (let b = 0; b < boardsN; b++) {
       const ln = lines(board, owners, rand);
-      const cpu = new CpuArea(board, weights, owners);
-      const glA = new GlArea(gl, board, weights, owners);
+      const cpu = new CpuArea(board, weights, owners, RAW);
+      const glA = new GlArea(gl, board, weights, owners, RAW);
       cpu.update(ln, ln.cells);
       glA.update(ln, ln.cells);
       const { R, S } = cpu.frame;
@@ -101,12 +107,43 @@ try {
   }
   out.parity = parity;
 
+  // The settle rule on both layers (AreaOptions defaults): the same boards must fall asleep at the same step, in the
+  // same way, with the same fill.
+  const settle: unknown[] = [];
+  for (const [name, boardsN] of [['l2', 12], ['l3', Number(params.get('l3') ?? 3)]] as [string, number][]) {
+    const board = new Board(data.boards[name]);
+    const rand = rng(29);
+    for (let b = 0; b < boardsN; b++) {
+      const ln = lines(board, 2, rand);
+      const cpu = new CpuArea(board, weights, 2);
+      const glA = new GlArea(gl, board, weights, 2);
+      cpu.update(ln, ln.cells);
+      glA.update(ln, ln.cells);
+      const limit = 80 * cpu.frame.R;
+      let steps = 0;
+      while ((cpu.settling() || glA.settling()) && steps < limit) { cpu.step(4); glA.step(4); steps += 4; }
+      const row: Record<string, unknown> = { board: name, n: b };
+      for (let p = 1; p <= 2; p++) {
+        const a = cpu.settle[p - 1];
+        const g = glA.settle[p - 1];
+        const fa = cpu.fill(p);
+        const fg = glA.fill(p);
+        let diff = 0;
+        for (let i = 0; i < fa.length; i++) if (fa[i] !== fg[i]) diff++;
+        row[`p${p}`] = `${cpu.status(p)}@${a.sinceWall} / ${glA.status(p)}@${g.sinceWall}, fill ${fa.reduce((x, v) => x + v, 0)}, differing ${diff}`;
+        row[`same${p}`] = cpu.status(p) === glA.status(p) && a.sinceWall === g.sinceWall && diff === 0;
+      }
+      settle.push(row);
+    }
+  }
+  out.settle = settle;
+
   // ms per step: one player (and four) with a few lines, after a warm-up; readPixels to wait for the GPU.
   const timing: unknown[] = [];
   for (const name of ['l2', 'l3', 'l4']) {
     const board = new Board(data.boards[name]);
     for (const owners of [1, 4]) {
-      const glA = new GlArea(gl, board, weights, owners);
+      const glA = new GlArea(gl, board, weights, owners, RAW);
       const ln = lines(board, owners, rng(3));
       glA.update(ln, ln.cells);
       glA.step(4);
@@ -118,7 +155,7 @@ try {
       const ms = (performance.now() - t0) / n;
       const row: Record<string, unknown> = { board: name, cells: board.n, owners, glMsPerStep: +ms.toFixed(3) };
       if (owners === 1) {
-        const cpu = new CpuArea(board, weights, 1);
+        const cpu = new CpuArea(board, weights, 1, RAW);
         cpu.update(ln, ln.cells);
         cpu.step(2);
         const m = name === 'l4' ? 4 : name === 'l3' ? 20 : 100;

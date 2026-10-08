@@ -303,9 +303,10 @@ export class Game {
     this.read();
   }
 
-  /** Whether the flood is still settling (it has steps owed, or a wall changed within its settle time). */
+  /** Whether the flood is still settling. The area layers here decide per player (settled or capped floods sleep:
+   * src/game/area.ts's AreaOptions); another layer: a wall changed within the last SETTLE_PER_R·R flood steps. */
   settling(): boolean {
-    return this.quiet < SETTLE_PER_R * this.floodR;
+    return this.area.settling ? this.area.settling() : this.quiet < SETTLE_PER_R * this.floodR;
   }
 
   private lineStep(): void {
@@ -417,7 +418,8 @@ export class Game {
     this.sinceRead = 0;
     let raw = this.area.territory();
     if (this.knobs.convert && this.convertInside()) raw = this.area.territory();
-    if (this.floodSteps !== this.rawAt) {
+    // A sleeping flood's readout no longer moves, so two reads agree without a flood step between them.
+    if (this.floodSteps !== this.rawAt || !this.settling()) {
       [this.rawBefore, this.rawNow] = [this.rawNow, this.rawBefore];
       this.rawAt = this.floodSteps;
     }

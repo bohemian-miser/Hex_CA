@@ -5,7 +5,8 @@
 
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { areaFrame, CpuArea, cpuArea, territoryOf, type LineChannels } from '../src/game/area.js';
+import { areaFrame, CpuArea, cpuArea, Settle, territoryOf, type LineChannels } from '../src/game/area.js';
+import { Game } from '../src/game/host.js';
 import { LineCA } from '../src/game/line-ca.js';
 import { rng } from '../src/lines.js';
 import { hexDist, loadWeights, NEIGHBOURS, targets } from '../src/nca.js';
@@ -16,6 +17,8 @@ const data = readJson('../web/strand-data.json') as StrandData;
 const table = new RuleTable(data);
 const weights = loadWeights(readJson('../web/nca-weights.json'));
 const boards = Object.fromEntries(Object.entries(data.boards).map(([k, b]) => [k, new Board(b)]));
+/** The bare flood, stepped every time (no re-flood, no sleeping): for the tests about the flood itself. */
+const RAW = { settlePerR: 0, capPerR: 0, refreshPerR: 0 };
 
 /** §4.1's LineCA channels, owner and D, drawn by hand. */
 class StubLines implements LineChannels {
@@ -204,7 +207,7 @@ describe('the fill on strand loops at level 2', () => {
     // the rim into near-even sides may fill more than one of them (the model's near-tie weakness, §3.3 (i)); the
     // exact count bounds how often a board is off at all.
     const b = boards.l2;
-    const area = new CpuArea(b, weights, 1);
+    const area = new CpuArea(b, weights, 1, RAW);
     const lines = new StubLines(b);
     const { S, R, slot, mask } = area.frame;
     const rand = rng(5);
@@ -253,7 +256,7 @@ describe('territory', () => {
     // fill is the centre and player 1's ring; the centre is inside both.
     const r = 4;
     const b = hexBoard(r);
-    const area = cpuArea(b, weights, 2);
+    const area = cpuArea(b, weights, 2, RAW);
     const lines = new StubLines(b);
     const centre = ring(b, r, 0);
     const r1 = ring(b, r, 1);
@@ -287,7 +290,7 @@ describe('territory', () => {
     // rim-to-rim strand through (2, 8) boxes in cell (3, 7). Here: the ring round the centre, drawn as tiles.
     const r = 3;
     const b = hexBoard(r);
-    const area = cpuArea(b, weights, 1);
+    const area = cpuArea(b, weights, 1, RAW);
     const lines = new StubLines(b);
     area.update(lines, lines.cells(1, ring(b, r, 1)));
     area.step(16 * areaFrame(b).R);
@@ -321,5 +324,122 @@ describe('dormant floods', () => {
     expect(area.ncas.map((n) => n.steps)).toEqual([0, 5, 0]);
     expect(area.fill(1).every((v) => v === 0)).toBe(true);
     expect(area.ncas[0].state.every((v) => v === 0)).toBe(true);
+  });
+});
+
+describe('the settle rule (AreaOptions): live, re-flood, settled, capped', () => {
+  const f = (...v: number[]) => Uint8Array.from(v);
+
+  it('Settle: a fill that holds settles; one that keeps changing caps on its core', () => {
+    const st = new Settle(3, 8, 32, 0, 4);
+    st.wake();
+    for (const fill of [f(1, 0, 0), f(1, 0, 0), f(1, 0, 0)]) { st.advanced(4); expect(st.look(fill)).toBe(false); }
+    expect(st.asleep).toBe(true); // quiet 8 after the change at the first look
+    expect(st.capped).toBe(false);
+    expect(Array.from(st.frozen!)).toEqual([1, 0, 0]);
+    st.wake();
+    expect(st.asleep).toBe(false);
+    for (let k = 0; !st.asleep; k++) { st.advanced(4); st.look(k % 2 ? f(1, 1, 0) : f(1, 0, 1)); }
+    expect(st.capped).toBe(true);
+    expect(st.sinceRun).toBe(32);
+    expect(Array.from(st.frozen!)).toEqual([1, 0, 0]); // filled at every look from step 8 on
+  });
+
+  it('Settle: the re-flood starts once the walls have been quiet, showing the live fill until the fresh one settles', () => {
+    const st = new Settle(2, 8, 0, 12, 4);
+    st.wake();
+    st.advanced(4);
+    expect(st.look(f(1, 1))).toBe(false); // live
+    st.advanced(4);
+    expect(st.look(f(1, 1))).toBe(false);
+    st.advanced(4);
+    expect(st.look(f(1, 1))).toBe(true); // 12 quiet steps: reset the flood now
+    expect(st.fresh).toBe(true);
+    expect(Array.from(st.frozen!)).toEqual([1, 1]);
+    for (const fill of [f(0, 0), f(0, 1), f(0, 1), f(0, 1)]) { st.advanced(4); st.look(fill); }
+    expect(st.asleep).toBe(true);
+    expect(Array.from(st.frozen!)).toEqual([0, 1]);
+  });
+
+  it('a level-2 flood goes live → refreshing → settled, stops stepping, reads the fresh flood, and wakes on a wall change', () => {
+    const b = boards.l2;
+    const area = new CpuArea(b, weights, 1);
+    const bare = new CpuArea(b, weights, 1, RAW);
+    const lines = new StubLines(b);
+    const rand = rng(41);
+    let loop: Strand | undefined;
+    while (!loop) {
+      const loops = allStrands(table.exits(randomRule(rand), b), b).filter((s) => s.closed && s.rows.length >= 8);
+      loop = loops[0];
+    }
+    const drawn = lines.strand(1, loop);
+    area.update(lines, drawn);
+    const seen: string[] = [];
+    let live: Uint8Array = new Uint8Array(0);
+    for (let k = 0; k < 2000 && area.settling(); k++) {
+      if (area.status(1) === 'live') live = area.fill(1);
+      area.step(1);
+      if (seen[seen.length - 1] !== area.status(1)) seen.push(area.status(1));
+    }
+    expect(seen).toEqual(['live', 'refreshing', 'settled']);
+    const st = area.settle[0];
+    const nca = area.ncas[0];
+    // The re-flood is the bare flood from the fresh state: same steps, same fill.
+    bare.update(lines, drawn);
+    bare.step(nca.steps);
+    expect(Array.from(area.fill(1))).toEqual(Array.from(bare.fill(1)));
+    expect(st.sinceRun).toBe(nca.steps);
+    expect(st.sinceWall - st.sinceRun).toBe(Math.ceil((2 * area.frame.R) / 4) * 4); // the first look 2 R after the change
+    const at = nca.steps;
+    area.step(50);
+    expect(nca.steps).toBe(at); // asleep
+    expect(live.length).toBe(b.n);
+    // A wall change: live again, from where it was (no reset), and stepping.
+    area.update(lines, lines.wipe(drawn.slice(0, 1)));
+    expect(area.status(1)).toBe('live');
+    area.step(3);
+    expect(nca.steps).toBe(at + 3);
+  });
+
+  it('only players whose floods still run are stepped', () => {
+    const b = boards.l2;
+    const area = new CpuArea(b, weights, 2);
+    const lines = new StubLines(b);
+    area.update(lines, lines.cells(1, [0, 1, 2]));
+    area.update(lines, lines.cells(2, [40, 41]));
+    while (area.status(1) !== 'settled' && area.settle[0].sinceWall < 5000) area.step(4);
+    expect(area.status(1)).toBe('settled');
+    area.update(lines, lines.cells(2, [42]));
+    const s1 = area.ncas[0].steps;
+    const s2 = area.ncas[1].steps;
+    area.step(8);
+    expect(area.ncas[0].steps).toBe(s1);
+    expect(area.ncas[1].steps).toBe(s2 + 8);
+  });
+
+  it('agent C\'s near-tie game (l2): a flood grown with its walls fills every side; the re-flood settles on an oracle answer', () => {
+    // A (128·000000001) closes a 41-chord loop round B's line (258·010010000), which converts: A's 41 walls cut the
+    // rim into three regions of 7 cells, a three-way tie (each answer fills two of them and the enclosed cell, 15).
+    // The live flood swings between one answer and all three sides (22) for thousands of steps, with a 30 R
+    // plateau on 22; fresh on the same walls it settles on an answer.
+    const play = (options: Partial<typeof RAW>) => {
+      const area = new CpuArea(boards.l2, weights, 8, options);
+      const g = new Game(boards.l2, table, weights, area, { stepMs: 50 });
+      const a = g.addPlayer('A', table.parse('128·000000001') as Rule);
+      const b = g.addPlayer('B', table.parse('258·010010000') as Rule);
+      const cell = (row: number, col: number) => boards.l2.cellOf[row * boards.l2.w + col];
+      expect(g.tapChord(b, cell(3, 7), 4, 5)).toBeNull();
+      let t = 0;
+      while (t < 1500) g.tick((t += 50));
+      expect(g.tapChord(a, cell(0, 5), 4, 5)).toBeNull();
+      while (t < 30000) g.tick((t += 50));
+      expect(g.settling()).toBe(false);
+      const nca = area.ncas[a - 1];
+      const tg = targets(nca.walls, nca.R, nca.mask);
+      const fill = area.fill(a);
+      return { status: area.status(a), filled: fill.reduce((x, v) => x + v, 0), exact: tg.some((t) => fill.every((v, i) => v === t[area.frame.slot[i]])) };
+    };
+    expect(play({})).toEqual({ status: 'settled', filled: 15, exact: true });
+    expect(play({ refreshPerR: 0 })).toEqual({ status: 'settled', filled: 22, exact: false }); // without the re-flood
   });
 });

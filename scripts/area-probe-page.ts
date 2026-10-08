@@ -8,12 +8,14 @@ import { GlArea } from '../src/game/area-gl.js';
 import { rng } from '../src/lines.js';
 import { loadWeights } from '../src/nca.js';
 import { Board, RuleTable, type StrandData } from '../src/strand.js';
-import { describeSamples, levelSeed, probe, reportLines, sampleBoards, type Result, type Runner } from './area-probe-lib.js';
+import { describeSamples, liveWalls, levelSeed, probe, reportLines, sampleBoards, type Result, type Runner } from './area-probe-lib.js';
 
 interface Options { levels: string[]; counts: Record<string, number>; mults: number[]; seed: number; minFill: number;
-  verbose: boolean; weights: { name: string; json: unknown }[] }
+  verbose: boolean; live: boolean; weights: { name: string; json: unknown }[] }
 const opts = (window as unknown as { PROBE: Options }).PROBE;
 const out: { error?: string; renderer?: string; lines: string[]; results: Result[] } = { lines: [], results: [] };
+/** The bare flood: no settle rule, so it runs every step the probe asks for (AreaOptions). */
+const RAW = { settlePerR: 0, capPerR: 0 };
 
 /** GlArea (one player) as the probe's runner: a load wipes the old walls (the flood resets) and draws the new. */
 function glRunner(area: GlArea, board: Board): Runner {
@@ -27,6 +29,14 @@ function glRunner(area: GlArea, board: Board): Runner {
       area.update({ ch }, all);
       for (let i = 0; i < board.n; i++) if (walls[area.frame.slot[i]]) { ch.owner[i] = 1; ch.D[i] = 1; }
       area.update({ ch }, all);
+    },
+    edit(walls) {
+      const changed: number[] = [];
+      for (let i = 0; i < board.n; i++) {
+        const v = walls[area.frame.slot[i]] ? 1 : 0;
+        if (ch.D[i] !== v) { ch.owner[i] = v; ch.D[i] = v; changed.push(i); }
+      }
+      area.update({ ch }, Int32Array.from(changed));
     },
     get steps() { return area.steps(1); },
     advance(n) { area.step(n); },
@@ -47,7 +57,8 @@ try {
     const samples = sampleBoards(table, board, frame, opts.counts[level], rng(levelSeed(opts.seed, level, opts.minFill)), opts.minFill);
     out.lines.push('', describeSamples(level, board, frame, samples));
     for (const { name, json } of opts.weights) {
-      const res = probe(level, name, board, frame, samples, opts.mults, glRunner(new GlArea(gl, board, loadWeights(json), 1), board));
+      const res = probe(level, name, board, frame, samples, opts.mults, glRunner(new GlArea(gl, board, loadWeights(json), 1, RAW), board),
+        opts.live ? liveWalls(level, frame.S) : undefined);
       for (const r of res) out.lines.push(...reportLines(r, opts.verbose));
       out.results.push(...res);
     }

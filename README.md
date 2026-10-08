@@ -201,7 +201,8 @@ src/game/       the hybrid game (docs/spectacle-ca-hybrid.md): host.ts, the refe
 web/            the demo page (page.html + main.ts), the trained NCA's page (nca.html + nca.ts), the strand
                 page (strand.html + strand.ts) and the game (game.html + game.ts), bundled by scripts/build-web.ts
 scripts/bench.ts  settle steps / ms / µs-per-update at three field sizes
-scripts/area-probe.ts  the flood on strand walls (loops, rim-to-rim claims) against the oracle, levels 2-4 (--gl: on WebGL2)
+scripts/area-probe.ts  the flood on strand walls (loops, rim-to-rim claims) against the oracle, levels 2-4 (--gl: on WebGL2;
+                --live: the walls grown in under a running flood)
 scripts/area-gl-parity.ts  glArea against cpuArea in headless Chromium, and both layers' ms per step
 .github/        CI on pull requests; build and deploy to Pages from main
 ```
@@ -395,8 +396,8 @@ lines (leaving and rejoining). Score = the tiles your lines are on + the tiles y
 steadied so a settling flood does not flicker it. A rival's line wholly inside your area for a moment turns into your
 rule's chords (Spectacle's Normal-mode conversion). Knobs: growth until a line stops or a few chords per tap
 (`fuel`), one-way taps, scoring the fill, conversion, speed, flood steps per line step; boards are Spectacle's hex
-levels 2-4 (the flood is ~30-50 ms a step per player at level 3 on a Pi's CPU, ~23 on its GPU, so areas fill in over
-seconds there). `?map=l2|l3|l4`, `?rules=<rule>,<rule>` (one per seat), `?gl=0|1` (flood on the CPU / WebGL2 always).
+levels 2-4 (the flood is ~20-25 ms a step per player at level 3 on a Pi's CPU, ~23 on its GPU, so areas fill in over
+seconds there; a player's flood stops once its fill has settled, and runs again when their lines change). `?map=l2|l3|l4`, `?rules=<rule>,<rule>` (one per seat), `?gl=0|1` (flood on the CPU / WebGL2 always).
 
 **Parity** (`docs/spectacle-ca-hybrid.md` §5.1). The line CA is checked in two ways. First, against Spectacle's own
 engine on 400 scripted collision games: they agree at rest on 327. Second, against the strand simulator's CA mode
