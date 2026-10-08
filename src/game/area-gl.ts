@@ -14,7 +14,7 @@
 
 import type { Board } from '../strand.js';
 import type { NCAWeights } from '../nca.js';
-import { areaFrame, cpuArea, territoryOf, type AreaFrame, type AreaLayer, type LineChannels } from './area.js';
+import { cpuArea, FloodLayer, type AreaLayer, type AreaOptions } from './area.js';
 
 /** The 7 taps as (drow, dcol), src/nca.ts's order (kernel index k = (drow + 1)·3 + dcol + 1). */
 const TAPS: ReadonlyArray<readonly [number, number]> = [[-1, 0], [-1, 1], [0, -1], [0, 0], [0, 1], [1, -1], [1, 0]];
@@ -117,7 +117,6 @@ interface Player {
   wall: Uint8Array; // S², 255 = wall
   wallTex: WebGLTexture;
   dirty: boolean;
-  walls: number;
   steps: number;
 }
 
@@ -137,9 +136,7 @@ export function glUsable(allowSoftware = false): boolean {
   }
 }
 
-export class GlArea implements AreaLayer {
-  readonly frame: AreaFrame;
-  readonly lineOwner: Int32Array;
+export class GlArea extends FloodLayer {
   readonly G: number;
   readonly C: number;
   private readonly passes: Pass[];
@@ -152,8 +149,8 @@ export class GlArea implements AreaLayer {
   private readonly vao: WebGLVertexArrayObject;
   private readonly readBuf: Float32Array;
 
-  constructor(readonly gl: WebGL2RenderingContext, readonly board: Board, w: NCAWeights, readonly owners: number) {
-    if (!Number.isInteger(owners) || owners < 1 || owners > 15) throw new RangeError(`area: owners must be 1..15, got ${owners}`);
+  constructor(readonly gl: WebGL2RenderingContext, board: Board, w: NCAWeights, owners: number, options: Partial<AreaOptions> = {}) {
+    super(board, owners, options);
     if (w.perception !== 'taps' || w.consts.length !== 1 || w.consts[0] !== 'mask' || w.fireRate !== 1) {
       throw new Error('area-gl: only taps-perception weights with the mask const and fireRate 1');
     }
@@ -163,9 +160,7 @@ export class GlArea implements AreaLayer {
     const G = (this.G = Math.ceil(C / 4));
     const K = 1;
     const CK = C + K;
-    this.frame = areaFrame(board);
     const S = this.frame.S;
-    this.lineOwner = new Int32Array(board.n);
     this.clamp = w.clamp ?? [-3.4e38, 3.4e38];
 
     // w1: per hidden unit, 7·G state texels (tap t, group g → x[t·G + g]), two mask texels (taps 0-3, 4-6), b1.
@@ -223,7 +218,7 @@ export class GlArea implements AreaLayer {
         return f;
       });
       const wall = new Uint8Array(S * S);
-      this.players.push({ tex, fbo, readFbo, cur: 0, wall, wallTex: byteTex(gl, S, wall), dirty: false, walls: 0, steps: 0 });
+      this.players.push({ tex, fbo, readFbo, cur: 0, wall, wallTex: byteTex(gl, S, wall), dirty: false, steps: 0 });
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     for (const pl of this.players) this.clear(pl);
@@ -244,28 +239,16 @@ export class GlArea implements AreaLayer {
     pl.steps = 0;
   }
 
-  update(lines: LineChannels, changed: Int32Array): void {
-    const { owner, D } = lines.ch;
-    const { slot } = this.frame;
-    for (let k = 0; k < changed.length; k++) {
-      const c = changed[k];
-      const o = D[c] !== 0 ? owner[c] : 0;
-      if (o < 0 || o > this.owners) throw new RangeError(`area: owner ${o} on cell ${c}, but the layer has ${this.owners}`);
-      const was = this.lineOwner[c];
-      if (o === was) continue;
-      this.lineOwner[c] = o;
-      if (was) this.setWall(was, slot[c], 0);
-      if (o) this.setWall(o, slot[c], 1);
-    }
-  }
-
-  private setWall(p: number, s: number, v: 0 | 1): void {
+  protected setWallAt(p: number, s: number, v: 0 | 1): boolean {
     const pl = this.players[p - 1];
-    if ((pl.wall[s] ? 1 : 0) === v) return;
+    if ((pl.wall[s] ? 1 : 0) === v) return false;
     pl.wall[s] = v ? 255 : 0;
     pl.dirty = true;
-    pl.walls += v ? 1 : -1;
-    if (pl.walls === 0) this.clear(pl); // dormant, as cpuArea
+    return true;
+  }
+
+  protected resetFlood(p: number): void {
+    this.clear(this.players[p - 1]);
   }
 
   private upload(pl: Player): void {
@@ -277,7 +260,7 @@ export class GlArea implements AreaLayer {
     pl.dirty = false;
   }
 
-  step(n = 1): void {
+  protected runFlood(p: number, n: number): void {
     const gl = this.gl;
     const S = this.frame.S;
     const G = this.G;
@@ -285,35 +268,33 @@ export class GlArea implements AreaLayer {
     gl.disable(gl.BLEND);
     gl.disable(gl.DEPTH_TEST);
     gl.bindVertexArray(this.vao);
-    for (const pl of this.players) {
-      if (pl.walls === 0) continue;
-      this.upload(pl);
-      for (let s = 0; s < n; s++) {
-        const src = pl.tex[pl.cur];
-        const dst = 1 - pl.cur;
-        for (let k = 0; k < this.passes.length; k++) {
-          const pass = this.passes[k];
-          gl.useProgram(pass.prog);
-          gl.bindFramebuffer(gl.FRAMEBUFFER, pl.fbo[dst][k]);
-          for (let g = 0; g < G; g++) {
-            gl.activeTexture(gl.TEXTURE0 + g);
-            gl.bindTexture(gl.TEXTURE_2D, src[g]);
-            gl.uniform1i(pass.uS[g], g);
-          }
-          const units: [WebGLTexture, WebGLUniformLocation | null][] = [[pl.wallTex, pass.uWall], [this.maskTex, pass.uMask], [this.w1Tex, pass.uW1], [this.w2Tex, pass.uW2]];
-          units.forEach(([tex, loc], j) => {
-            gl.activeTexture(gl.TEXTURE0 + G + j);
-            gl.bindTexture(gl.TEXTURE_2D, tex);
-            gl.uniform1i(loc, G + j);
-          });
-          gl.uniform4fv(pass.uB2, this.b2);
-          gl.uniform2f(pass.uClamp, this.clamp[0], this.clamp[1]);
-          gl.uniform1i(pass.uSide, S);
-          gl.drawArrays(gl.TRIANGLES, 0, 3);
+    const pl = this.players[p - 1];
+    this.upload(pl);
+    for (let s = 0; s < n; s++) {
+      const src = pl.tex[pl.cur];
+      const dst = 1 - pl.cur;
+      for (let k = 0; k < this.passes.length; k++) {
+        const pass = this.passes[k];
+        gl.useProgram(pass.prog);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, pl.fbo[dst][k]);
+        for (let g = 0; g < G; g++) {
+          gl.activeTexture(gl.TEXTURE0 + g);
+          gl.bindTexture(gl.TEXTURE_2D, src[g]);
+          gl.uniform1i(pass.uS[g], g);
         }
-        pl.cur = dst;
-        pl.steps++;
+        const units: [WebGLTexture, WebGLUniformLocation | null][] = [[pl.wallTex, pass.uWall], [this.maskTex, pass.uMask], [this.w1Tex, pass.uW1], [this.w2Tex, pass.uW2]];
+        units.forEach(([tex, loc], j) => {
+          gl.activeTexture(gl.TEXTURE0 + G + j);
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.uniform1i(loc, G + j);
+        });
+        gl.uniform4fv(pass.uB2, this.b2);
+        gl.uniform2f(pass.uClamp, this.clamp[0], this.clamp[1]);
+        gl.uniform1i(pass.uSide, S);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
       }
+      pl.cur = dst;
+      pl.steps++;
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.bindVertexArray(null);
@@ -355,36 +336,32 @@ export class GlArea implements AreaLayer {
     return out;
   }
 
-  fill(owner: number): Uint8Array {
-    if (!Number.isInteger(owner) || owner < 1 || owner > this.owners) throw new RangeError(`area: no owner ${owner}`);
+  protected readFill(p: number): Uint8Array {
     const out = new Uint8Array(this.board.n);
-    if (this.players[owner - 1].walls === 0) return out;
-    const buf = this.readGroup0(owner);
+    const buf = this.readGroup0(p);
     const { slot } = this.frame;
     for (let i = 0; i < out.length; i++) out[i] = buf[slot[i] * 4 + 1] > 0.5 ? 1 : 0;
     return out;
   }
-
-  territory(): Int8Array {
-    return territoryOf(this.lineOwner, (p) => this.fill(p), this.owners);
-  }
 }
 
-export function glArea(gl: WebGL2RenderingContext, board: Board, weights: NCAWeights, owners: number): AreaLayer {
-  return new GlArea(gl, board, weights, owners);
+export function glArea(gl: WebGL2RenderingContext, board: Board, weights: NCAWeights, owners: number,
+  options: Partial<AreaOptions> = {}): AreaLayer {
+  return new GlArea(gl, board, weights, owners, options);
 }
 
 /** glArea on a canvas of its own when `glUsable()`, else cpuArea (or when the GL layer cannot be built). `gl`:
  * 'auto' (the default), 'force' (software renderers too, for checks) or 'off'. */
-export function bestArea(board: Board, weights: NCAWeights, owners: number, gl: 'auto' | 'force' | 'off' = 'auto'): AreaLayer {
+export function bestArea(board: Board, weights: NCAWeights, owners: number, gl: 'auto' | 'force' | 'off' = 'auto',
+  options: Partial<AreaOptions> = {}): AreaLayer {
   if (gl !== 'off' && glUsable(gl === 'force')) {
     try {
       const canvas = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(1, 1) : document.createElement('canvas');
       const ctx = canvas.getContext('webgl2') as WebGL2RenderingContext | null;
-      if (ctx) return new GlArea(ctx, board, weights, owners);
+      if (ctx) return new GlArea(ctx, board, weights, owners, options);
     } catch {
       // fall through to the CPU
     }
   }
-  return cpuArea(board, weights, owners);
+  return cpuArea(board, weights, owners, options);
 }

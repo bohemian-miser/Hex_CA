@@ -274,6 +274,32 @@ runs `floodPerStep` flood steps per line step (default 1, raised while the frame
 at level 3 a closure fills in 10-25 s of line time at 20 line steps/s, visibly spreading — the owner's "the NCA will help
 flip tiles as you go". Growth itself never waits on the flood.
 
+**Measured (2026-10-08; B's follow-up).** The flood's hidden channels move a lot every step even when its fill is still
+(median |Δ| 0.02-0.4 per cell per step at l2), so nothing settles cell by cell: a flood can only be put to sleep whole,
+on its readout. Fresh on the probe's boards (§3.6) the readout settles quickly — its last change is within ~2.6 R at l3
+— and stopping a flood once its fill has held for 8 R keeps its 32 R answer on 64/64 l3 boards and 198/200 at l2.
+
+History matters, sometimes. With the walls grown in tile by tile under a running flood (`area-probe --live`), l2 exact
+falls from 0.995 to 0.985 and the misses include over-claims (every side of a tie filled, or the larger side) where a
+fresh flood's misses fill neither side; l3 non-trivial is 0.950 grown, 0.940 fresh, misses of the same kind. The case
+that showed it is agent C's l2 game (`tests/area.test.ts`, "agent C's near-tie game"): A on `128·000000001` closes a
+41-chord loop round B's `258·010010000` line, which converts. A's 41 walls cut the rim into three regions of 7 cells, a
+three-way tie (each answer fills 15). The flood that grew with those walls holds 22 — every side — for 30 R, then swings
+between that and one answer for thousands of steps; fresh on the same walls it holds an answer from step 126.
+
+So the area layer (`src/game/area.ts`, `AreaOptions`) runs a player's flood live while their walls change (the fill
+spreads as you go); 2 R after they stop, it floods again from the fresh state, showing the live fill until the fresh one
+has settled; once the fresh fill has held for 8 R the flood sleeps, and if it has not settled by 64 R it sleeps on its
+core (the cells it filled at every look from 8 R on). A wall change wakes it. The host asks the layer (`settling()`)
+instead of its own 16 R rule. On C's game A now settles on an answer (15 cells) at flood step 279; without the re-flood
+it settles on 22. `glArea` runs the same rule: on 15 two-player boards (l2, l3) both layers sleep at the same step with
+the same fill.
+
+A sleeping flood costs nothing, but in bot games (taps every 0.9-4 s, l2) a player's walls are seldom quiet for long:
+the flood work fell by about 3 %. The step itself is faster: `HexNCA` now computes the hidden layer four cells at a time
+(each weight read once for four), bit-identical and 1.6× the one-cell loop on the Pi (l3: 25 against 40 ms a step,
+measured side by side).
+
 ### 3.6 Quality, and a small cloud plan (optional)
 
 What the model has seen: closed blobs/polygons/rings, random-walk strokes, 1-3 rim-to-rim bridges (thickened), spirals,
@@ -290,21 +316,22 @@ l3 S 39 / R 19, l4 S 103 / R 51, so 16 R is 112 / 304 / 816 steps, not §3.5's f
 on every board cell, walls included. Most such boards fill nothing (loops of 3-4 tiles: 67 % at l2, 73 % at l3), so a second
 set keeps only boards that fill at least one cell, and a third only those that fill 64 or more.
 
-| set (16 R; 8 R is the same at l3) | l2 | l3 |
-|---|---|---|
-| the doc's: 200 boards | 0.995 ± 0.010 (non-trivial 0.985, n 67) | **0.985 ± 0.017** (non-trivial 0.944, n 54) |
-| fill ≥ 1 cell: 100 boards | — | 0.940 ± 0.047 |
-| fill ≥ 64 cells: 24 boards | — | 0.542 |
+| set (16 R; 8 R is the same at l3 and l4) | l2 | l3 | l4 (24 boards, on `glArea`) |
+|---|---|---|---|
+| the doc's: 200 boards | 0.995 ± 0.010 (non-trivial 0.985, n 67) | **0.985 ± 0.017** (non-trivial 0.944, n 54) | 1.000 (5 non-trivial, ≤ 16 cells) |
+| fill ≥ 1 cell: 100 boards | — | 0.940 ± 0.047 | 0.958 (23/24) |
+| fill ≥ 64 cells: 24 boards | — | 0.542 | — |
 
 At level 3, by filled cells (the first two sets): 1-63 cells 1.000 (131/131), 64+ 0.61 (14/23). By how even the rim
 split is (2nd-largest / largest rim region, all three sets): under 0.25, 0.99 (144/145); 0.25 or more, 0.21 (5/24).
 Every miss is a board with two or more rim regions, and the ones inspected region by region (all 11 of the 64+ set) are
 all the same: one whole rim region that the oracle fills is left empty — never a wrong side, a filled wall or a partial
 fill — on a near-even split (ratio 0.83-1.0 in ten, 0.33 in one), most often rule `01346·000000001`'s claims, which cut
-level 3 nearly in half. That is decision 3's near-tie weakness, erring towards filling nothing. The spiral fine-tunes
-are no better: `sa-r6816sp` ties on the doc's l3 set (0.985) and is a little worse elsewhere (0.990 at l2, 0.930 on the
-l3 non-trivial set); `sb-r6816sp`'s `best.pt` is `fb-r6816nt` itself (its best was iteration 0). **Verdict: no
-fine-tune; B3 skipped, the shipped weights stay.** The CPU and GL runs score the 64+ set identically, board for board.
+level 3 nearly in half. The one l4 miss is the same: an 805-cell rim region of a claim pair left empty (ratio 0.31).
+That is decision 3's near-tie weakness, erring towards filling nothing. The spiral fine-tunes are no better:
+`sa-r6816sp` ties on the doc's l3 set (0.985) and is a little worse elsewhere (0.990 at l2, 0.930 on the l3 non-trivial
+set); `sb-r6816sp`'s `best.pt` is `fb-r6816nt` itself (its best was iteration 0). **Verdict: no fine-tune; B3 skipped,
+the shipped weights stay.** The CPU and GL runs score the 64+ set identically, board for board.
 
 Otherwise (≤ $2 of the ~$5): `nca/data.py` kind `strand` — walls rendered from `nca/strand/walker.py` + `rules.py` on the
 l2/l3 fields and l4 crops (1-3 loops or claims of one rule), 30 % of new pool boards, `--mask-mix` with the whole l3 field;
@@ -406,7 +433,7 @@ layer); `w1` is (7·6 + 3) × 256 RGBA32F texels: the state taps, then the mask'
 an R8 wall texture, so a wall edit counts at the very next step. After any change the whole wall texture (S² bytes) is
 uploaded again on the next step. The K players run as K passes, and reads are `readPixels` of group 0 (RGBA32F).
 `bestArea()` picks GL on a hardware renderer and `cpuArea` otherwise. Parity was checked in headless Chromium on the Pi
-5's V3D 7.1 (ANGLE → GLES 3.1): after 16 R steps on two-player strand boards (8 at l2, 1 at l3), channel 1 is within
+5's V3D 7.1 (ANGLE → GLES 3.1): after 16 R steps on two-player strand boards (8 at l2, 3 at l3), channel 1 is within
 2e-6 of `cpuArea` and every channel within 1e-4, with identical fills and territory. The probe's l3 64+ set scores the
 same board for board on both.
 
@@ -414,11 +441,13 @@ ms per flood step on the Pi 5:
 
 | | l2 | l3 | l4 |
 |---|---|---|---|
-| V3D, 1 player | 3.3 | 23 | 140 |
-| V3D, 4 players (all four) | 10 | 58 | 425 |
-| `cpuArea`, 1 player, one core | 4.2 | 31 | ~250 (363 measured on a busy Pi) |
+| V3D, 1 player | 3.3-4.1 | 23-24 | 128-140 |
+| V3D, 4 players (all four) | 10-12 | 58-95 | 425-514 |
+| `cpuArea`, 1 player, one core, one-cell loop (before) | 4.2 | 31 | ~250 (363 measured on a busy Pi) |
+| `cpuArea`, the four-cell kernel (§3.5), Chromium / Node | 2.6 / 3.4 | 19 / 25 | 156 / 198 |
 
-The CPU costs 63 µs per cell-step on an idle Pi, about 95 when it is busy. The V3D is a phone-class GPU, likely limited
+The CPU took 63 µs per cell-step on an idle Pi with the one-cell loop (about 95 when it is busy), 40-50 with the
+four-cell one; so on the Pi the CPU now matches the V3D at l2-l3 and trails it only at l4. The V3D is a phone-class GPU, likely limited
 by texture fetches (44 weight texels per hidden unit, per cell); a desktop GPU was not measured.
 
 ## 5. Test plan

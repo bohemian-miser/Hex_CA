@@ -5,7 +5,7 @@
 //
 //   npx tsx scripts/area-probe.ts [--levels l2,l3,l4] [--n 200] [--n-l4 24] [--mults 8,16] [--seed 1]
 //                                 [--weights name=path ...] [--json out.json] [--dry] [--nontrivial] [--min-fill N]
-//                                 [--verbose] [--gl [--chromium path]]
+//                                 [--verbose] [--gl [--chromium path]] [--live]
 //
 // Default weights: web/nca-weights.json (fb-r6816nt). Every weights set sees the same boards. --gl runs the flood
 // with src/game/area-gl.ts in headless Chromium (scripts/area-probe-page.ts) instead of HexNCA in Node: the same
@@ -20,7 +20,7 @@ import { areaFrame } from '../src/game/area.js';
 import { rng } from '../src/lines.js';
 import { HexNCA, loadWeights } from '../src/nca.js';
 import { Board, RuleTable, type StrandData } from '../src/strand.js';
-import { describeSamples, levelSeed, probe, reportLines, sampleBoards, type Result, type Runner } from './area-probe-lib.js';
+import { describeSamples, liveWalls, levelSeed, probe, reportLines, sampleBoards, type Result, type Runner } from './area-probe-lib.js';
 
 function arg(name: string, def: string): string {
   const i = process.argv.indexOf(`--${name}`);
@@ -42,6 +42,9 @@ const dry = process.argv.includes('--dry'); // sample the boards and print their
 const minFill = process.argv.includes('--nontrivial') ? Math.max(1, Number(arg('min-fill', '1'))) : Number(arg('min-fill', '0'));
 const verbose = process.argv.includes('--verbose'); // every miss, region by region
 const gl = process.argv.includes('--gl');
+// The walls grow in as lines do (scripts/area-probe-lib.ts's growth), from a fresh flood with none; reads count from
+// the last tile. Without it, the whole picture is painted on a fresh flood.
+const live = process.argv.includes('--live');
 const weightArgs = args('weights').length ? args('weights') : ['fb-r6816nt=web/nca-weights.json'];
 const weightJson = weightArgs.map((s) => {
   const [name, path] = s.includes('=') ? s.split('=') : [s, s];
@@ -56,6 +59,7 @@ const table = new RuleTable(data);
 function cpuRunner(nca: HexNCA): Runner {
   return {
     load(walls) { for (const s of nca.cells) nca.setWall(s, walls[s] as 0 | 1); nca.reset(); },
+    edit(walls) { for (const s of nca.cells) nca.setWall(s, walls[s] as 0 | 1); },
     get steps() { return nca.steps; },
     advance(n) { nca.step(n); },
     ch1: () => nca.channel(1),
@@ -67,7 +71,7 @@ if (gl && !dry) {
   // The same probe in Chromium: the page gets the options and weights from a script beside it.
   const res = await build({ entryPoints: ['scripts/area-probe-page.ts'], bundle: true, format: 'iife', write: false, target: 'es2020' });
   const dir = mkdtempSync(join(tmpdir(), 'area-probe-'));
-  writeFileSync(join(dir, 'probe.js'), `window.PROBE = ${JSON.stringify({ levels, counts, mults, seed, minFill, verbose, weights: weightJson })};`);
+  writeFileSync(join(dir, 'probe.js'), `window.PROBE = ${JSON.stringify({ levels, counts, mults, seed, minFill, verbose, live, weights: weightJson })};`);
   writeFileSync(join(dir, 'index.html'), '<!doctype html><html><body><script src="probe.js"></script><script>' +
     `${res.outputFiles[0].text.replace(/<\/script/g, '<\\/script')}</script></body></html>`);
   const dom = execFileSync(arg('chromium', process.env.CHROMIUM ?? 'chromium'),
@@ -89,10 +93,11 @@ if (gl && !dry) {
     console.log(`\n${describeSamples(level, board, frame, samples)}`);
     if (dry) continue;
     for (const { name, json } of weightJson) {
-      const res = probe(level, name, board, frame, samples, mults, cpuRunner(new HexNCA(loadWeights(json), frame.R, frame.mask)));
+      const grow = live ? liveWalls(level, frame.S) : undefined;
+      const res = probe(level, name, board, frame, samples, mults, cpuRunner(new HexNCA(loadWeights(json), frame.R, frame.mask)), grow);
       for (const r of res) for (const line of reportLines(r, verbose)) console.log(line);
       results.push(...res);
     }
   }
 }
-if (jsonOut) writeFileSync(jsonOut, JSON.stringify({ seed, mults, minFill, gl, results }, null, 1));
+if (jsonOut) writeFileSync(jsonOut, JSON.stringify({ seed, mults, minFill, gl, live, results }, null, 1));

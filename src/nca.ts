@@ -88,6 +88,8 @@ const TAPS: ReadonlyArray<readonly [number, number]> = [
 const tapK = ([dr, dc]: readonly [number, number]) => (dr + 1) * 3 + (dc + 1);
 /** Index of the self tap ([0, 0]) within TAPS: always on board, so a cell's pool always has at least this one value. */
 const SELF_TAP = TAPS.findIndex(([dr, dc]) => dr === 0 && dc === 0);
+/** Cells per block in HexNCA's stepBlocks (its kernel is written for four). */
+const BLOCK = 4;
 
 export const side = (R: number): number => 2 * R + 1;
 
@@ -296,6 +298,9 @@ export class HexNCA {
   private readonly x: Float64Array;
   /** The hidden units' dot products for one cell, before bias and relu. */
   private readonly z: Float64Array;
+  /** `x` and `z` for a block of BLOCK cells (stepBlocks). */
+  private readonly xb: Float64Array;
+  private readonly zb: Float64Array;
   private readonly d: Float64Array;
   /** Per-channel max/min scratch for the pool features (length 0 when `perception` is 'taps'). */
   private readonly pmax: Float64Array;
@@ -387,6 +392,8 @@ export class HexNCA {
     this.b2 = w.b2;
     this.x = new Float64Array(W);
     this.z = new Float64Array(H8);
+    this.xb = new Float64Array(BLOCK * W);
+    this.zb = new Float64Array(BLOCK * H8);
     this.d = new Float64Array(C);
     this.pmax = new Float64Array(PW > 0 ? C : 0);
     this.pmin = new Float64Array(PW > 0 ? C : 0);
@@ -414,6 +421,10 @@ export class HexNCA {
   }
 
   step(n = 1): void {
+    if (this.fireRate >= 1) {
+      this.stepBlocks(n);
+      return;
+    }
     const C = this.channels;
     const H = this.hidden;
     const N = this.N;
@@ -501,6 +512,117 @@ export class HexNCA {
           dst[c * N + i] = v;
         }
         dst[i] = walls[i];
+      }
+      this.state = dst;
+      this.next = src;
+      this.steps++;
+    }
+  }
+
+  /**
+   * `step` when every cell fires (fireRate 1, the shipped weights): the hidden layer's dot products for BLOCK cells
+   * at once, four units by four cells, so each weight is read once for four cells (about 1.8× faster in V8 on a
+   * Pi 5). Every unit still sums its features in the same order from 0, in doubles, so the state is bit-identical to
+   * the one-cell loop's. The last block repeats its last cell and drops the copies.
+   */
+  private stepBlocks(n: number): void {
+    const C = this.channels;
+    const H = this.hidden;
+    const N = this.N;
+    const T = TAPS.length;
+    const TC = T * C;
+    const PW = this.poolWidth;
+    const { cells, taps, bias, w1r, w2t, b2, walls, xb, zb, d, pmax, pmin } = this;
+    const H8 = this.z.length;
+    const W = TC + PW;
+    const M = cells.length;
+    const lo = this.clamp ? this.clamp[0] : -Infinity;
+    const hi = this.clamp ? this.clamp[1] : Infinity;
+    for (let s = 0; s < n; s++) {
+      const src = this.state;
+      const dst = this.next;
+      for (let c0 = 0; c0 < M; c0 += BLOCK) {
+        for (let b = 0; b < BLOCK; b++) {
+          const ci = Math.min(c0 + b, M - 1);
+          const xo = b * W;
+          for (let t = 0; t < T; t++) {
+            const j = taps[ci * T + t];
+            const base = xo + t * C;
+            if (j < 0) for (let c = 0; c < C; c++) xb[base + c] = 0;
+            else for (let c = 0; c < C; c++) xb[base + c] = src[c * N + j];
+          }
+          if (PW > 0) {
+            const selfBase = xo + SELF_TAP * C;
+            for (let c = 0; c < C; c++) pmax[c] = pmin[c] = xb[selfBase + c];
+            for (let t = 0; t < T; t++) {
+              if (t === SELF_TAP || taps[ci * T + t] < 0) continue;
+              const base = xo + t * C;
+              for (let c = 0; c < C; c++) {
+                const v = xb[base + c];
+                if (v > pmax[c]) pmax[c] = v;
+                if (v < pmin[c]) pmin[c] = v;
+              }
+            }
+            for (let c = 0; c < C; c++) {
+              xb[xo + TC + c] = pmax[c];
+              xb[xo + TC + C + c] = pmin[c];
+            }
+          }
+        }
+        const x0 = 0;
+        const x1 = W;
+        const x2 = 2 * W;
+        const x3 = 3 * W;
+        for (let u = 0; u < H8; u += 8) {
+          const wb = (u >> 3) * W * 8;
+          for (let half = 0; half < 8; half += 4) {
+            let a00 = 0, a01 = 0, a02 = 0, a03 = 0, a10 = 0, a11 = 0, a12 = 0, a13 = 0;
+            let a20 = 0, a21 = 0, a22 = 0, a23 = 0, a30 = 0, a31 = 0, a32 = 0, a33 = 0;
+            for (let f = 0, wo = wb + half; f < W; f++, wo += 8) {
+              const w0 = w1r[wo];
+              const w1 = w1r[wo + 1];
+              const w2 = w1r[wo + 2];
+              const w3 = w1r[wo + 3];
+              const y0 = xb[x0 + f];
+              const y1 = xb[x1 + f];
+              const y2 = xb[x2 + f];
+              const y3 = xb[x3 + f];
+              a00 += w0 * y0; a01 += w1 * y0; a02 += w2 * y0; a03 += w3 * y0;
+              a10 += w0 * y1; a11 += w1 * y1; a12 += w2 * y1; a13 += w3 * y1;
+              a20 += w0 * y2; a21 += w1 * y2; a22 += w2 * y2; a23 += w3 * y2;
+              a30 += w0 * y3; a31 += w1 * y3; a32 += w2 * y3; a33 += w3 * y3;
+            }
+            let zo = u + half;
+            zb[zo] = a00; zb[zo + 1] = a01; zb[zo + 2] = a02; zb[zo + 3] = a03;
+            zo += H8;
+            zb[zo] = a10; zb[zo + 1] = a11; zb[zo + 2] = a12; zb[zo + 3] = a13;
+            zo += H8;
+            zb[zo] = a20; zb[zo + 1] = a21; zb[zo + 2] = a22; zb[zo + 3] = a23;
+            zo += H8;
+            zb[zo] = a30; zb[zo + 1] = a31; zb[zo + 2] = a32; zb[zo + 3] = a33;
+          }
+        }
+        for (let b = 0; b < BLOCK && c0 + b < M; b++) {
+          const ci = c0 + b;
+          const i = cells[ci];
+          for (let o = 0; o < C; o++) d[o] = b2[o];
+          const bOff = ci * H;
+          const zo = b * H8;
+          for (let u = 0; u < H; u++) {
+            const a = bias[bOff + u] + zb[zo + u];
+            if (a > 0) {
+              const w2Off = u * C;
+              for (let o = 0; o < C; o++) d[o] += w2t[w2Off + o] * a;
+            }
+          }
+          for (let c = 0; c < C; c++) {
+            let v = src[c * N + i] + d[c];
+            if (v < lo) v = lo;
+            else if (v > hi) v = hi;
+            dst[c * N + i] = v;
+          }
+          dst[i] = walls[i];
+        }
       }
       this.state = dst;
       this.next = src;
