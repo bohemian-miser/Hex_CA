@@ -196,8 +196,8 @@ tests/          vitest: oracle, fill, fuzz, overshoot, engine, field, garbage, r
 src/strand.ts   Spectacle's strand rules on its hex fields: rule table, split, rendering, walker
 src/strand-nca.ts  the trained strand NCAs (FrameNCA, StrandNCA, v1) in TypeScript
 src/draw.ts     hex drawing and pointer maths the pages share (fit, cell under a point, chord ranking, tiles)
-src/game/       the hybrid game (docs/spectacle-ca-hybrid.md): host.ts, the referee; area.ts, the area layer (one
-                flood per player, cpuArea); area-gl.ts, the same on WebGL2 (glArea); stubs/ until the line CA lands
+src/game/       the hybrid game (docs/spectacle-ca-hybrid.md): host.ts, the referee; line-ca.ts, the line CA; area.ts,
+                the area layer (one flood per player, cpuArea); area-gl.ts, the same on WebGL2 (glArea)
 web/            the demo page (page.html + main.ts), the trained NCA's page (nca.html + nca.ts), the strand
                 page (strand.html + strand.ts) and the game (game.html + game.ts), bundled by scripts/build-web.ts
 scripts/bench.ts  settle steps / ms / µs-per-update at three field sizes

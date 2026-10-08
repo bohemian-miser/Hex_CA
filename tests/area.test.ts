@@ -1,10 +1,12 @@
 // The area layer (src/game/area.ts, docs/spectacle-ca-hybrid.md §3 and §5 "Area"): the frame, walls from the line
 // CA's channels, the fill against the oracle on strand loops, territory with contested cells, and the pocket.
-// The line CA here is a stub of §4.1's `LineCA.ch` (owner and D only), drawn straight from `allStrands`.
+// Most cases draw lines with a stub of §4.1's `LineCA.ch` (owner and D only) straight from `allStrands`; one plays
+// the real line CA (src/game/line-ca.ts) and follows its `changed()`.
 
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { areaFrame, CpuArea, cpuArea, territoryOf, type LineChannels } from '../src/game/area.js';
+import { LineCA } from '../src/game/line-ca.js';
 import { rng } from '../src/lines.js';
 import { hexDist, loadWeights, NEIGHBOURS, targets } from '../src/nca.js';
 import { allStrands, Board, DCOL, DROW, RuleTable, type BoardData, type Rule, type Strand, type StrandData } from '../src/strand.js';
@@ -146,6 +148,44 @@ describe('walls from the line channels', () => {
     for (let k = 0; k < drawn.length; k += 2) area.update(lines, lines.wipe(drawn[k]));
     area.update(lines, Int32Array.from({ length: b.n }, (_, i) => i));
     check();
+  });
+
+  it('follow the real line CA through taps, growth, hits and wipes, one changed() at a time', () => {
+    const b = boards.l3;
+    const lc = new LineCA(b, table);
+    const view: LineChannels = lc; // the line CA is what update() takes
+    const area = new CpuArea(b, weights, 3);
+    const rand = rng(23);
+    const rules = [1, 2, 3].map((p) => lc.addRule(randomRule(rand), p));
+    let hits = 0;
+    let wiped = 0;
+    for (let step = 0; step < 400; step++) {
+      if (step % 15 === 0) {
+        for (const r of rules) {
+          for (let tries = 0; tries < 40; tries++) {
+            const cell = Math.floor(rand() * b.n);
+            const d0 = Math.floor(rand() * 6);
+            const d1 = lc.pt(r, cell, d0);
+            if (d1 >= 0 && lc.tap({ cell, d0, d1, rule: r }) === null) break;
+          }
+        }
+      }
+      const before = lc.ch.D.reduce((a, v) => a + (v ? 1 : 0), 0);
+      lc.step();
+      const after = lc.ch.D.reduce((a, v) => a + (v ? 1 : 0), 0);
+      if (after < before) wiped++;
+      for (let i = 0; i < b.n; i++) if (lc.ch.H[i]) hits++;
+      area.update(view, lc.changed());
+      for (let p = 1; p <= 3; p++) {
+        let wrong = 0;
+        for (let i = 0; i < b.n; i++) {
+          if (area.ncas[p - 1].walls[area.frame.slot[i]] !== (lc.ch.D[i] !== 0 && lc.ch.owner[i] === p ? 1 : 0)) wrong++;
+        }
+        expect(wrong).toBe(0);
+      }
+    }
+    expect(hits).toBeGreaterThan(0); // the game happened: lines met and were wiped
+    expect(wiped).toBeGreaterThan(0);
   });
 
   it('refuses an owner the layer has no flood for', () => {
