@@ -1,12 +1,15 @@
 // The hybrid game's page (web/game.html, docs/spectacle-ca-hybrid.md): Spectacle on one of its hex fields, the
-// lines a hand-written local CA (src/game/line-ca.ts), each player's area the trained flood fill (src/game/area.ts),
-// refereed by src/game/host.ts. Players sit at this screen (select one, tap for them); each has a rule, sticky
-// across visits. ?map=l2|l3|l4, ?rules=<describeRule>,<describeRule>,… (one per seat), ?theme=light|dark.
+// lines a hand-written local CA (src/game/line-ca.ts), each player's area the trained flood fill (src/game/area.ts,
+// on the GPU where there is a hardware WebGL2: src/game/area-gl.ts), refereed by src/game/host.ts. Players sit at
+// this screen (select one, tap for them) or are bots (src/game/bot.ts); each has a rule, sticky across visits.
+// ?map=l2|l3|l4, ?rules=<describeRule>,<describeRule>,… (one per seat), ?theme=light|dark, ?gl=0 (the flood on the
+// CPU) or ?gl=1 (on WebGL2 even in a software renderer).
 
 import dataJson from './strand-data.json';
 import weightsJson from './nca-weights.json';
 import { allStrands, Board, PAIRS, RuleTable, type Rule, type Strand, type StrandData } from '../src/strand.js';
 import { loadWeights, type HexNCA } from '../src/nca.js';
+import { bestArea } from '../src/game/area-gl.js';
 import {
   axialAt, bounds, centreOf, cssRgb, drawTiles, edgeMid, fitGeom, hexPath, strandPaths, strokePattern, type Geom,
 } from '../src/draw.js';
@@ -37,6 +40,8 @@ const SPARK_MS = { hit: 700, closed: 1100, tap: 380, refused: 520, convert: 1300
 const SUPER_REFIT_STEPS = 50;
 const SUPER_RGB_STEP = 8;
 const params = new URLSearchParams(location.search);
+/** Where the flood runs: 'auto' (WebGL2 on a hardware renderer, else the CPU), ?gl=1 'force', ?gl=0 'off'. */
+const GL_MODE = params.get('gl') === '1' ? 'force' : params.get('gl') === '0' ? 'off' : 'auto';
 
 const theme = params.get('theme');
 if (theme === 'light' || theme === 'dark') document.documentElement.dataset.theme = theme;
@@ -141,7 +146,8 @@ const seatOf = (owner: number) => owner - 1;
  * gets a new random rule). */
 function newGame(): void {
   board = boardOf(mapId);
-  game = new Game(board, table, weights, undefined, gameKnobs());
+  game = new Game(board, table, weights, bestArea(board, weights, MAX_SEATS, GL_MODE), gameKnobs());
+  floodCache = null;
   seats.forEach((s, i) => {
     let owner = game.addPlayer(s.name, s.rule, s.bot);
     if (owner < 0) {
@@ -298,13 +304,35 @@ interface ChannelView { id: string; name: string; colour(i: number): readonly [n
  * or one channel's id, large. */
 let shown = 'game';
 
-/** The selected seat's flood network and the board-cell → its slot map, if the area layer exposes them. */
-function floodOf(owner: number): { nca: HexNCA; slot: Int32Array } | null {
-  const a = game.area as unknown as { ncas?: HexNCA[]; slot?: Int32Array; frame?: { slot: Int32Array } };
-  const nca = a.ncas?.[owner - 1];
-  const slot = a.frame?.slot ?? a.slot;
-  return nca && slot ? { nca, slot } : null;
+/** One player's flood as the views read it: C channels, each over the area frame's S² slots (`slot` maps a board
+ * cell to its slot), and the steps it has run. */
+interface Flood { channels: number; channel(c: number): Float32Array; slot: Int32Array; steps: number }
+let floodCache: { key: string; flood: Flood | null } | null = null;
+
+/** A player's flood network, from the CPU layer's HexNCAs or read back from the GPU layer (a sync, so once per
+ * flood step at most), or null if the area layer exposes neither. */
+function floodOf(owner: number): Flood | null {
+  const key = `${owner}|${game.floodSteps}|${game.steps}`;
+  if (floodCache && floodCache.key === key) return floodCache.flood;
+  const a = game.area as unknown as {
+    ncas?: HexNCA[]; frame?: { slot: Int32Array; S: number }; C?: number;
+    readState?(owner: number): Float32Array; steps?(owner: number): number;
+  };
+  let flood: Flood | null = null;
+  if (a.frame && a.ncas?.[owner - 1]) {
+    const nca = a.ncas[owner - 1];
+    flood = { channels: nca.channels, channel: (c) => nca.channel(c), slot: a.frame.slot, steps: nca.steps };
+  } else if (a.frame && a.readState && a.C) {
+    const N = a.frame.S * a.frame.S;
+    const st = a.readState(owner);
+    flood = { channels: a.C, channel: (c) => st.subarray(c * N, (c + 1) * N), slot: a.frame.slot, steps: a.steps?.(owner) ?? 0 };
+  }
+  floodCache = { key, flood };
+  return flood;
 }
+
+/** Where the flood runs, for the readout. */
+const floodWhere = () => ((game.area as unknown as { gl?: unknown }).gl ? 'GPU (WebGL2)' : 'CPU');
 
 const popcount = (v: number) => { let k = 0; for (; v; v &= v - 1) k++; return k; };
 
@@ -341,8 +369,8 @@ function floodViews(): ChannelView[] {
   if (!f) return [];
   const rp = ramps(colours.cell, colours.flood, colours.neg, colours.pos);
   const out: ChannelView[] = [];
-  for (let c = 0; c < f.nca.channels; c++) {
-    const v = f.nca.channel(c);
+  for (let c = 0; c < f.channels; c++) {
+    const v = f.channel(c);
     out.push({
       id: `nca${c}`, name: c === 0 ? 'wall' : c === 1 ? 'fill' : 'hidden',
       colour: (i) => rp.div[divLevel(v[f.slot[i]], CLAMP_LO, CLAMP_HI) + LEVELS],
@@ -380,16 +408,16 @@ function superColours(): ((i: number) => [number, number, number]) | null {
   const owner = ownerOf(selected);
   const f = floodOf(owner);
   if (!f) return null;
-  const sel = superChannels(f.nca.channels);
-  const chans = sel.map((c) => f.nca.channel(c));
+  const sel = superChannels(f.channels);
+  const chans = sel.map((c) => f.channel(c));
   const bg = cssRgb(colours.cell);
   if (!sel.length) return () => bg;
   const snap = (x: number) => Math.max(0, Math.min(255, Math.round(x / SUPER_RGB_STEP) * SUPER_RGB_STEP));
   if (superMode === 'pca') {
-    if (!superBasis || superFor !== owner || f.nca.steps - superFitAt >= SUPER_REFIT_STEPS || f.nca.steps < superFitAt) {
+    if (!superBasis || superFor !== owner || f.steps - superFitAt >= SUPER_REFIT_STEPS || f.steps < superFitAt) {
       const cells = Int32Array.from({ length: board.n }, (_, i) => i);
       superBasis = fitPca3((i, k) => chans[k][f.slot[i]], sel.length, cells, superFor === owner ? superBasis ?? undefined : undefined);
-      superFitAt = f.nca.steps;
+      superFitAt = f.steps;
       superFor = owner;
     }
     const basis = superBasis;
@@ -799,12 +827,13 @@ function readout(): void {
     ['Flood steps', `${game.floodSteps.toLocaleString()}${game.settling() ? '' : ' (settled)'}`],
     ['Flood steps/s', playing ? String(floodPerSec) : '–'],
     ['ms/flood step', floodMs ? floodMs.toFixed(1) : '–'],
+    ['Flood runs on', floodWhere()],
     ['Tiles', board.n.toLocaleString()],
   ];
   $('readout').innerHTML = rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
   const s = seats[selected];
   const slow = floodMs > 60
-    ? ` <span class="warn">The flood is ${Math.round(floodMs)} ms a step here (a network on every tile, per player, on this browser's main thread), so areas fill in slowly.</span>`
+    ? ` <span class="warn">The flood is ${Math.round(floodMs)} ms a step here (a network on every tile, per player, ${floodWhere() === 'CPU' ? "on this browser's main thread: no hardware WebGL2 here" : 'on the GPU'}), so areas fill in slowly.</span>`
     : '';
   $('status').innerHTML = (notice || `Tap a tile to start a line of <b>${escapeHtml(s.name)}</b>'s rule (${table.describe(s.rule)}) at the chord nearest your tap.`) + slow;
 }
@@ -817,7 +846,7 @@ function legend(): void {
       `<span><i class="dot" style="background:${colours.wave}"></i>a wipe wave</span>`,
       '<span><i class="sw" style="background:var(--contest)"></i>contested</span>',
     ].concat(showPattern && shown === 'game' ? [`<span><i class="thin"></i>${table.describe(seats[selected].rule)}'s pattern</span>`] : [])
-    : [`<span>Board: <b>${escapeHtml(tiles.get(shown)?.name.textContent ?? shown)}</b>, the lines thin on top</span>`];
+    : [`<span><span>Board: <b>${escapeHtml(tiles.get(shown)?.name.textContent ?? shown)}</b>, the lines thin on top</span></span>`];
   if (shown === 'super') {
     items.unshift(superMode === 'pca'
       ? `<span>${escapeHtml(seats[selected].name)}'s flood, ${superScope === 'hidden' ? 'hidden channels' : superScope === 'all' ? 'every channel' : 'every channel but fill'}: PCA's top 3 directions → <b>red</b>/<b>green</b>/<b>blue</b>.</span>`

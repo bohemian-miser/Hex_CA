@@ -386,13 +386,17 @@ exact v4/v5/v6 recipes — but nothing shipped uses them now.
 ## Spectacle as a CA: the game
 
 **Play:** https://bohemian-miser.github.io/Hex_CA/game.html. The design is `docs/spectacle-ca-hybrid.md`: the
-lines are a hand-written local CA (every edge, chord, collision and wipe decided by a tile from itself and its six
-neighbours), and each player's area is the trained flood fill with that player's lines as its walls. Players sit
-at one screen: select one (keys 1-8) and tap for them; each has a rule of their own, sticky across visits. Score =
-the tiles your lines are on + the tiles your flood fills for you alone. Knobs: growth until a line stops or a few
-chords per tap (`fuel`), one-way taps, speed, flood steps per line step; boards are Spectacle's hex levels 2-4
-(the flood is ~30-50 ms a step per player at level 3 on a Pi's CPU, so areas fill in over seconds there).
-`?map=l2|l3|l4`, `?rules=<rule>,<rule>` (one per seat).
+lines are a hand-written local CA (`src/game/line-ca.ts`: every edge, chord, collision and wipe decided by a tile
+from itself and its six neighbours), and each player's area is the trained flood fill with that player's lines as its
+walls (`src/game/area.ts`, on WebGL2 where there is a hardware renderer: `area-gl.ts`). Players sit at one screen —
+select one (keys 1-8) and tap for them — or are bots (`src/game/bot.ts`: it weighs its rule's strands by the tiles
+and area they would take). Each player has a rule of their own, sticky across visits; a new rule wipes that player's
+lines (leaving and rejoining). Score = the tiles your lines are on + the tiles your flood fills for you alone,
+steadied so a settling flood does not flicker it. A rival's line wholly inside your area for a moment turns into your
+rule's chords (Spectacle's Normal-mode conversion). Knobs: growth until a line stops or a few chords per tap
+(`fuel`), one-way taps, scoring the fill, conversion, speed, flood steps per line step; boards are Spectacle's hex
+levels 2-4 (the flood is ~30-50 ms a step per player at level 3 on a Pi's CPU, ~23 on its GPU, so areas fill in over
+seconds there). `?map=l2|l3|l4`, `?rules=<rule>,<rule>` (one per seat), `?gl=0|1` (flood on the CPU / WebGL2 always).
 
 **Parity** (`docs/spectacle-ca-hybrid.md` §5.1). The line CA is checked in two ways. First, against Spectacle's own
 engine on 400 scripted collision games: they agree at rest on 327. Second, against the strand simulator's CA mode
