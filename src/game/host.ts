@@ -11,7 +11,7 @@ import { Board, PAIRS, RuleTable, type Rule } from '../strand.js';
 import type { NCAWeights } from '../nca.js';
 import { axialAt, edgeMid, rankChords, unitCentre } from '../draw.js';
 import { DEFAULT_LINE_KNOBS, LineCA, type LineKnobs, type Refusal } from './stubs/line-ca.js';
-import { cpuArea, type AreaLayer } from './stubs/area.js';
+import { cpuArea, type AreaLayer } from './area.js';
 
 export type { LineKnobs, Refusal };
 

@@ -187,12 +187,14 @@ describe('the fill on strand loops at level 2', () => {
         for (let i = 0; i < b.n; i++) if (fill[i] !== t[slot[i]]) wrong++;
         best = Math.min(best, wrong);
       }
+      let bad = 0; // filled walls, cells no acceptable answer fills, non-zero off-board state
       for (let i = 0; i < b.n; i++) {
-        if (lines.ch.D[i]) expect(fill[i]).toBe(0);
-        if (fill[i]) expect(tg.some((t) => t[slot[i]])).toBe(true);
+        if (lines.ch.D[i] && fill[i]) bad++;
+        if (fill[i] && !tg.some((t) => t[slot[i]])) bad++;
       }
       const nca = area.ncas[0];
-      for (let s = 0; s < S * S; s++) if (!mask[s]) for (let c = 0; c < nca.channels; c++) expect(nca.state[c * nca.N + s]).toBe(0);
+      for (let s = 0; s < S * S; s++) if (!mask[s]) for (let c = 0; c < nca.channels; c++) if (nca.state[c * nca.N + s] !== 0) bad++;
+      expect(bad).toBe(0);
       if (best === 0) exact++;
       if (tg[0].some((v) => v)) enclosing++;
       tested++;
@@ -202,7 +204,7 @@ describe('the fill on strand loops at level 2', () => {
     }
     expect(enclosing).toBeGreaterThan(5); // not only loops round nothing
     expect(exact).toBeGreaterThanOrEqual(48);
-  });
+  }, 240_000); // ~6,000 flood steps at level 2: ~25 s on an idle Pi 5, more on a busy one
 });
 
 describe('territory', () => {
