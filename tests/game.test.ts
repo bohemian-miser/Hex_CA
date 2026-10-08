@@ -1,6 +1,7 @@
 // The game host (src/game/host.ts, docs/spectacle-ca-hybrid.md §5 "Game"): a scripted two-player game replays
-// byte for byte; respawn blocks taps for respawnMs; score = line tiles + sole fill at every read; taps land on
-// the nearest chord and are refused in Spectacle's order.
+// byte for byte; respawn blocks taps for respawnMs; score = line tiles + sole fill (steadied: a fill tile changes
+// hands when two reads agree); taps land on the nearest chord and are refused in Spectacle's order; a rival's line
+// inside your fill converts (v1.1).
 
 import { describe, expect, it } from 'vitest';
 import dataJson from '../web/strand-data.json';
@@ -138,28 +139,80 @@ describe('the game host', () => {
     expect(g.tapChord(b, ...free)).not.toBe('respawn');
   });
 
-  it('scores line tiles plus the tiles the flood fills for one player alone, at every read', () => {
-    const { g, a, b } = twoPlayers();
+  it('scores line tiles plus the tiles the flood fills for one player alone', () => {
+    const { g, a, b } = twoPlayers({ convert: false });
     const taps = [...chords(g, a).filter((_, k) => k % 11 === 3).slice(0, 4).map((c) => [a, ...c]),
       ...chords(g, b).filter((_, k) => k % 13 === 5).slice(0, 4).map((c) => [b, ...c])];
+    /** What the fills say now: line tiles to their owner, else the one player who fills it. */
+    const raw = () => {
+      const fills = [a, b].map((o) => g.area.fill(o));
+      const { owner, D } = g.lines.ch;
+      return Int8Array.from({ length: l2.n }, (_, c) => (D[c] && owner[c] ? owner[c]
+        : fills[0][c] && fills[1][c] ? -1 : fills[0][c] ? a : fills[1][c] ? b : 0));
+    };
     let t = 0;
+    let shown = Int8Array.from(g.territory());
+    let changes = 0;
     for (let k = 0; k < 300; k++) {
       if (k % 30 === 0 && taps.length) {
         const [o, c, d0, d1] = taps.shift()!;
         g.tapChord(o, c, d0, d1);
       }
       g.tick((t += 50));
-      const fills = [a, b].map((o) => g.area.fill(o));
-      const want = new Int32Array(3);
+      // at every read: the score counts the territory shown; a line tile is its owner's at once; a fill tile only
+      // ever changes to what the fills say now
+      const now = raw();
+      const terr = g.territory();
+      const sc = g.scores();
+      for (const o of [a, b]) expect(sc[o]).toBe(terr.reduce((n, x) => n + (x === o ? 1 : 0), 0));
       const { owner, D } = g.lines.ch;
       for (let c = 0; c < l2.n; c++) {
-        if (D[c] && owner[c]) want[owner[c]]++;
-        else if (fills[0][c] && !fills[1][c]) want[a]++;
-        else if (fills[1][c] && !fills[0][c]) want[b]++;
+        if (D[c] && owner[c]) expect(terr[c]).toBe(owner[c]);
+        else if (terr[c] !== shown[c]) {
+          expect(terr[c]).toBe(now[c]);
+          changes++;
+        }
       }
-      const sc = g.scores();
-      expect([sc[a], sc[b]]).toEqual([want[a], want[b]]);
+      shown = Int8Array.from(terr);
     }
+    expect(changes).toBeGreaterThan(0);
+    // settled, the score is exactly line tiles + sole fill
+    while (g.settling()) g.tick((t += 50));
+    g.tick((t += 50));
+    g.tick((t += 50));
+    const want = raw();
+    expect(Array.from(g.territory())).toEqual(Array.from(want));
+    for (const o of [a, b]) expect(g.scores()[o]).toBe(want.reduce((n, x) => n + (x === o ? 1 : 0), 0));
+  });
+
+  it('converts a rival line wholly inside your fill into your own chords (v1.1)', () => {
+    const g = new Game(l2, table, weights, undefined, { stepMs: 50 });
+    const a = g.addPlayer('A', rule('128·000000001'));
+    const b = g.addPlayer('B', rule('258·010010000'));
+    const cell = (row: number, col: number) => l2.cellOf[row * l2.w + col];
+    // B's line first, inside where A's loop will run; then A's loop round it.
+    expect(g.tapChord(b, cell(3, 7), 4, 5)).toBeNull();
+    let t = run(g, 0, 1500);
+    const hers = Array.from({ length: l2.n }, (_, c) => c).filter((c) => g.lines.ch.owner[c] === b && g.lines.ch.D[c]);
+    expect(hers.length).toBeGreaterThan(2);
+    expect(g.tapChord(a, cell(0, 5), 4, 5)).toBeNull();
+    const converted = new Set<number>();
+    for (let k = 0; k < 1200 && converted.size === 0; k++) {
+      g.tick((t += 50));
+      for (const e of g.drain()) if (e.kind === 'convert') { expect(e.owner).toBe(a); converted.add(e.cell); }
+    }
+    expect([...converted].sort((x, y) => x - y)).toEqual(hers);
+    expect(g.lines.lineTiles(b)).toBe(0);
+    const { owner, D, T } = g.lines.ch;
+    for (const c of hers) {
+      expect(T[c]).toBe(0);
+      if (D[c]) expect(owner[c]).toBe(a);
+    }
+    // A scores them (as its line tiles or its fill) once the flood has settled round them
+    while (g.settling()) g.tick((t += 50));
+    g.tick((t += 50));
+    g.tick((t += 50));
+    for (const c of hers) expect(g.territory()[c]).toBe(a);
   });
 
   it('replays a scripted two-player game byte for byte', () => {
