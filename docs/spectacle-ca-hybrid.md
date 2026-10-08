@@ -284,6 +284,28 @@ chords), many loops of one owner side by side, corridors one cell wide between p
 (rule, tap) loops and claims from `allStrands`/`walk` on l2/l3/l4, 1-3 per board, one owner; run the shipped weights to 16 R;
 exact against `targets()`; per level and per enclosed-size bucket. ≥ 0.95 at level 3 → skip the fine-tune.
 
+**Measured (B1, 2026-10-08; `scripts/area-probe.ts`, the shipped `fb-r6816nt`).** A board is 1-3 strands of one uniformly
+random rule, each a loop or a claim (an open strand whose two ends both run off the board), in §3.1's frame (l2 S 15 / R 7,
+l3 S 39 / R 19, l4 S 103 / R 51, so 16 R is 112 / 304 / 816 steps, not §3.5's field R); exact = equal to one of `targets()`
+on every board cell, walls included. Most such boards fill nothing (loops of 3-4 tiles: 67 % at l2, 73 % at l3), so a second
+set keeps only boards that fill at least one cell, and a third only those that fill 64 or more.
+
+| set (16 R; 8 R is the same at l3) | l2 | l3 |
+|---|---|---|
+| the doc's: 200 boards | 0.995 ± 0.010 (non-trivial 0.985, n 67) | **0.985 ± 0.017** (non-trivial 0.944, n 54) |
+| fill ≥ 1 cell: 100 boards | — | 0.940 ± 0.047 |
+| fill ≥ 64 cells: 24 boards | — | 0.542 |
+
+At level 3, by filled cells (the first two sets): 1-63 cells 1.000 (131/131), 64+ 0.61 (14/23). By how even the rim
+split is (2nd-largest / largest rim region, all three sets): under 0.25, 0.99 (144/145); 0.25 or more, 0.21 (5/24).
+Every miss is a board with two or more rim regions, and the ones inspected region by region (all 11 of the 64+ set) are
+all the same: one whole rim region that the oracle fills is left empty — never a wrong side, a filled wall or a partial
+fill — on a near-even split (ratio 0.83-1.0 in ten, 0.33 in one), most often rule `01346·000000001`'s claims, which cut
+level 3 nearly in half. That is decision 3's near-tie weakness, erring towards filling nothing. The spiral fine-tunes
+are no better: `sa-r6816sp` ties on the doc's l3 set (0.985) and is a little worse elsewhere (0.990 at l2, 0.930 on the
+l3 non-trivial set); `sb-r6816sp`'s `best.pt` is `fb-r6816nt` itself (its best was iteration 0). **Verdict: no
+fine-tune; B3 skipped, the shipped weights stay.** The CPU and GL runs score the 64+ set identically, board for board.
+
 Otherwise (≤ $2 of the ~$5): `nca/data.py` kind `strand` — walls rendered from `nca/strand/walker.py` + `rules.py` on the
 l2/l3 fields and l4 crops (1-3 loops or claims of one rule), 30 % of new pool boards, `--mask-mix` with the whole l3 field;
 one plan line, 90 min from `bucket:runs/fb-r6816nt/best.pt` at `--lr 5e-5 --R 8 12 16 24`; `evaluate` with a `strand` set;
@@ -377,6 +399,27 @@ faster-settling fill (the hand CA's O(D) gate, or a multi-scale model) — out o
 K passes; read-back of channel 1 once per `scoreEvery` steps (`readPixels` of one R8 texture). Software renderers
 (SwiftShader on CI and this sandbox) are detected on a throwaway canvas and fall back to `cpuArea`, as Spectacle's
 `tiles-gl.ts` does. Parity with `cpuArea` to 1e-4 on the thresholded fill.
+
+**Measured (B4, 2026-10-08; `src/game/area-gl.ts`, `scripts/area-gl-parity.ts`).** Built as above, except: one pass
+writes all six groups when `MAX_DRAW_BUFFERS` ≥ 6 (otherwise as many passes as it needs, each one recomputing the hidden
+layer); `w1` is (7·6 + 3) × 256 RGBA32F texels: the state taps, then the mask's 7 taps, then b1. Channel 0 is read from
+an R8 wall texture, so a wall edit counts at the very next step. After any change the whole wall texture (S² bytes) is
+uploaded again on the next step. The K players run as K passes, and reads are `readPixels` of group 0 (RGBA32F).
+`bestArea()` picks GL on a hardware renderer and `cpuArea` otherwise. Parity was checked in headless Chromium on the Pi
+5's V3D 7.1 (ANGLE → GLES 3.1): after 16 R steps on two-player strand boards (8 at l2, 1 at l3), channel 1 is within
+2e-6 of `cpuArea` and every channel within 1e-4, with identical fills and territory. The probe's l3 64+ set scores the
+same board for board on both.
+
+ms per flood step on the Pi 5:
+
+| | l2 | l3 | l4 |
+|---|---|---|---|
+| V3D, 1 player | 3.3 | 23 | 140 |
+| V3D, 4 players (all four) | 10 | 58 | 425 |
+| `cpuArea`, 1 player, one core | 4.2 | 31 | ~250 (363 measured on a busy Pi) |
+
+The CPU costs 63 µs per cell-step on an idle Pi, about 95 when it is busy. The V3D is a phone-class GPU, likely limited
+by texture fetches (44 weight texels per hidden unit, per cell); a desktop GPU was not measured.
 
 ## 5. Test plan
 
